@@ -21,93 +21,48 @@ namespace {
 constexpr int kWindowWidth = 1280;
 constexpr int kWindowHeight = 720;
 constexpr int kMaxFramesInFlight = 2;
-constexpr std::size_t kMaxOverlayVertexCount = 1048576;
+constexpr std::size_t kMaxOverlayVertexCount = 4194304;
 constexpr float kMoveSpeed = 60.0f;
 constexpr float kMouseSensitivity = 0.08f;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr const char* kWindowTitle = "VulkanVoxel";
-constexpr float kOverlayPixelSize = 3.0f;
+constexpr float kOverlayGlyphScale = 1.0f;
 constexpr float kOverlayMargin = 16.0f;
 constexpr float kOverlayLineGap = 8.0f;
 
-using GlyphRows = std::array<std::uint8_t, 7>;
-
-GlyphRows GetGlyph(char c) {
-    switch (c) {
-    case 'A': return {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
-    case 'B': return {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E};
-    case 'C': return {0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F};
-    case 'D': return {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E};
-    case 'E': return {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F};
-    case 'F': return {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10};
-    case 'G': return {0x0F, 0x10, 0x10, 0x13, 0x11, 0x11, 0x0F};
-    case 'H': return {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
-    case 'I': return {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E};
-    case 'J': return {0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E};
-    case 'K': return {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11};
-    case 'L': return {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F};
-    case 'M': return {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11};
-    case 'N': return {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11};
-    case 'O': return {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
-    case 'P': return {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10};
-    case 'Q': return {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D};
-    case 'R': return {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11};
-    case 'S': return {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E};
-    case 'T': return {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
-    case 'U': return {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
-    case 'V': return {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04};
-    case 'W': return {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A};
-    case 'X': return {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11};
-    case 'Y': return {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04};
-    case 'Z': return {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F};
-    case '0': return {0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F};
-    case '1': return {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E};
-    case '2': return {0x1F, 0x01, 0x01, 0x1F, 0x10, 0x10, 0x1F};
-    case '3': return {0x1F, 0x01, 0x01, 0x0F, 0x01, 0x01, 0x1F};
-    case '4': return {0x11, 0x11, 0x11, 0x1F, 0x01, 0x01, 0x01};
-    case '5': return {0x1F, 0x10, 0x10, 0x1F, 0x01, 0x01, 0x1F};
-    case '6': return {0x1F, 0x10, 0x10, 0x1F, 0x11, 0x11, 0x1F};
-    case '7': return {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08};
-    case '8': return {0x1F, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x1F};
-    case '9': return {0x1F, 0x11, 0x11, 0x1F, 0x01, 0x01, 0x1F};
-    case '[': return {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E};
-    case ']': return {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E};
-    case '/': return {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10};
-    case '-': return {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00};
-    case '.': return {0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06};
-    case ':': return {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00};
-    case ' ': return {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-    default:  return {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-    }
+bool HasOverlayGlyph(const std::array<FontGlyphBitmap, 128>& glyphs, char c) {
+    const unsigned char code = static_cast<unsigned char>(c);
+    return code < glyphs.size() && glyphs[code].valid;
 }
 
-bool IsSupportedOverlayChar(char c) {
-    return (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') ||
-           c == ' ' || c == ':' || c == '.' || c == '[' || c == ']' || c == '/' || c == '-';
-}
-
-std::string SanitizeOverlayText(const std::string& text) {
+std::string SanitizeOverlayText(const std::string& text, const std::array<FontGlyphBitmap, 128>& glyphs) {
     std::string result;
     result.reserve(text.size());
 
     for (unsigned char c : text) {
         const char upper = static_cast<char>(std::toupper(c));
-        result.push_back(IsSupportedOverlayChar(upper) ? upper : ' ');
+        if (HasOverlayGlyph(glyphs, upper)) {
+            result.push_back(upper);
+        } else if (HasOverlayGlyph(glyphs, static_cast<char>(c))) {
+            result.push_back(static_cast<char>(c));
+        } else {
+            result.push_back(' ');
+        }
     }
 
     return result;
 }
 
-float GetOverlayTextWidth(const std::string& text, float pixelSize) {
-    const float glyphWidth = 5.0f * pixelSize;
-    const float glyphSpacing = pixelSize;
-    if (text.empty()) {
-        return 0.0f;
+float GetOverlayTextWidth(const std::string& text, const std::array<FontGlyphBitmap, 128>& glyphs, float scale) {
+    float width = 0.0f;
+    for (char c : text) {
+        const unsigned char code = static_cast<unsigned char>(c);
+        if (code >= glyphs.size() || !glyphs[code].valid) {
+            continue;
+        }
+        width += static_cast<float>(glyphs[code].advance) * scale;
     }
-
-    return static_cast<float>(text.size()) * glyphWidth +
-           static_cast<float>(text.size() - 1) * glyphSpacing;
+    return width;
 }
 
 void AppendOverlayQuad(
@@ -116,6 +71,10 @@ void AppendOverlayQuad(
     float topPixels,
     float rightPixels,
     float bottomPixels,
+    float uvLeft,
+    float uvTop,
+    float uvRight,
+    float uvBottom,
     float red,
     float green,
     float blue,
@@ -126,62 +85,62 @@ void AppendOverlayQuad(
     const float top = (topPixels / static_cast<float>(extent.height)) * 2.0f - 1.0f;
     const float bottom = (bottomPixels / static_cast<float>(extent.height)) * 2.0f - 1.0f;
 
-    const OverlayVertex v0{{left, top}, {red, green, blue}};
-    const OverlayVertex v1{{right, top}, {red, green, blue}};
-    const OverlayVertex v2{{right, bottom}, {red, green, blue}};
-    const OverlayVertex v3{{left, bottom}, {red, green, blue}};
+    const OverlayVertex topLeft{{left, top}, {uvLeft, uvTop}, {red, green, blue}};
+    const OverlayVertex topRight{{right, top}, {uvRight, uvTop}, {red, green, blue}};
+    const OverlayVertex bottomRight{{right, bottom}, {uvRight, uvBottom}, {red, green, blue}};
+    const OverlayVertex bottomLeft{{left, bottom}, {uvLeft, uvBottom}, {red, green, blue}};
 
-    vertices.push_back(v0);
-    vertices.push_back(v1);
-    vertices.push_back(v2);
-    vertices.push_back(v0);
-    vertices.push_back(v2);
-    vertices.push_back(v3);
+    vertices.push_back(topLeft);
+    vertices.push_back(topRight);
+    vertices.push_back(bottomRight);
+    vertices.push_back(topLeft);
+    vertices.push_back(bottomRight);
+    vertices.push_back(bottomLeft);
 }
 
 void AppendGlyph(
     std::vector<OverlayVertex>& vertices,
-    char c,
+    const FontGlyphBitmap& glyph,
     float startX,
     float startY,
-    float pixelSize,
+    float scale,
     float red,
     float green,
     float blue,
     const VkExtent2D& extent
 ) {
-    const GlyphRows rows = GetGlyph(c);
-
-    for (std::size_t y = 0; y < rows.size(); ++y) {
-        for (int x = 0; x < 5; ++x) {
-            const std::uint8_t mask = static_cast<std::uint8_t>(1u << (4 - x));
-            if ((rows[y] & mask) == 0) {
-                continue;
-            }
-
-            const float left = startX + static_cast<float>(x) * pixelSize;
-            const float top = startY + static_cast<float>(y) * pixelSize;
-            AppendOverlayQuad(
-                vertices,
-                left,
-                top,
-                left + pixelSize,
-                top + pixelSize,
-                red,
-                green,
-                blue,
-                extent
-            );
-        }
+    if (!glyph.valid || glyph.width <= 0 || glyph.height <= 0) {
+        return;
     }
+
+    const float left = startX + static_cast<float>(glyph.offsetX) * scale;
+    const float top = startY + static_cast<float>(glyph.offsetY) * scale;
+    const float right = left + static_cast<float>(glyph.width) * scale;
+    const float bottom = top + static_cast<float>(glyph.height) * scale;
+
+    AppendOverlayQuad(
+        vertices,
+        left,
+        top,
+        right,
+        bottom,
+        glyph.u0,
+        glyph.v0,
+        glyph.u1,
+        glyph.v1,
+        red,
+        green,
+        blue,
+        extent
+    );
 }
 
 void AppendOutlinedGlyph(
     std::vector<OverlayVertex>& vertices,
-    char c,
+    const FontGlyphBitmap& glyph,
     float startX,
     float startY,
-    float pixelSize,
+    float scale,
     const VkExtent2D& extent
 ) {
     constexpr std::array<Vec2, 8> outlineOffsets = {{
@@ -198,10 +157,10 @@ void AppendOutlinedGlyph(
     for (const Vec2& offset : outlineOffsets) {
         AppendGlyph(
             vertices,
-            c,
-            startX + offset.x * pixelSize,
-            startY + offset.y * pixelSize,
-            pixelSize,
+            glyph,
+            startX + offset.x * scale,
+            startY + offset.y * scale,
+            scale,
             0.0f,
             0.0f,
             0.0f,
@@ -209,24 +168,28 @@ void AppendOutlinedGlyph(
         );
     }
 
-    AppendGlyph(vertices, c, startX, startY, pixelSize, 1.0f, 1.0f, 1.0f, extent);
+    AppendGlyph(vertices, glyph, startX, startY, scale, 1.0f, 1.0f, 1.0f, extent);
 }
 
 void AppendOutlinedText(
     std::vector<OverlayVertex>& vertices,
+    const std::array<FontGlyphBitmap, 128>& glyphs,
     const std::string& text,
     float startX,
     float startY,
-    float pixelSize,
+    float scale,
     const VkExtent2D& extent
 ) {
-    const float glyphWidth = 5.0f * pixelSize;
-    const float glyphSpacing = pixelSize;
     float cursorX = startX;
 
     for (char c : text) {
-        AppendOutlinedGlyph(vertices, c, cursorX, startY, pixelSize, extent);
-        cursorX += glyphWidth + glyphSpacing;
+        const unsigned char code = static_cast<unsigned char>(c);
+        if (code >= glyphs.size() || !glyphs[code].valid) {
+            continue;
+        }
+
+        AppendOutlinedGlyph(vertices, glyphs[code], cursorX, startY, scale, extent);
+        cursorX += static_cast<float>(glyphs[code].advance) * scale;
     }
 }
 
@@ -322,7 +285,9 @@ void VulkanVoxelApp::InitVulkan() {
     CreateTextureImage();
     CreateTextureImageView();
     CreateTextureSampler();
+    LoadOverlayFont();
     BuildWorldMesh();
+    StartWorldMeshWorker();
     CreateOverlayBuffer();
     CreateUniformBuffers();
     CreateDescriptorPool();
@@ -343,6 +308,7 @@ void VulkanVoxelApp::MainLoop() {
 
         glfwPollEvents();
         ProcessInput(deltaTime);
+        ConsumeCompletedWorldMesh();
         UpdateOverlayText(deltaTime);
         DrawFrame();
     }
@@ -353,6 +319,8 @@ void VulkanVoxelApp::MainLoop() {
 }
 
 void VulkanVoxelApp::Cleanup() {
+    StopWorldMeshWorker();
+
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
 
@@ -395,15 +363,22 @@ void VulkanVoxelApp::Cleanup() {
         if (overlayVertexBufferMemory_ != VK_NULL_HANDLE) {
             vkFreeMemory(device_, overlayVertexBufferMemory_, nullptr);
         }
-        if (worldVertexBuffer_ != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device_, worldVertexBuffer_, nullptr);
-        }
-        if (worldVertexBufferMemory_ != VK_NULL_HANDLE) {
-            vkFreeMemory(device_, worldVertexBufferMemory_, nullptr);
-        }
+        DestroyWorldMeshBuffers();
 
         if (textureSampler_ != VK_NULL_HANDLE) {
             vkDestroySampler(device_, textureSampler_, nullptr);
+        }
+        if (overlayFontSampler_ != VK_NULL_HANDLE) {
+            vkDestroySampler(device_, overlayFontSampler_, nullptr);
+        }
+        if (overlayFontImageView_ != VK_NULL_HANDLE) {
+            vkDestroyImageView(device_, overlayFontImageView_, nullptr);
+        }
+        if (overlayFontImage_ != VK_NULL_HANDLE) {
+            vkDestroyImage(device_, overlayFontImage_, nullptr);
+        }
+        if (overlayFontImageMemory_ != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, overlayFontImageMemory_, nullptr);
         }
         if (textureImageView_ != VK_NULL_HANDLE) {
             vkDestroyImageView(device_, textureImageView_, nullptr);
@@ -522,6 +497,12 @@ void VulkanVoxelApp::RecreateSwapChain() {
     RebuildOverlayVertices();
     overlayDirty_ = false;
     UploadOverlayVertices();
+
+    lastMeshChunkX_ = -1;
+    lastMeshChunkZ_ = -1;
+    lastMeshYawBucket_ = -1;
+    lastMeshPitchBucket_ = -1;
+    RequestWorldMeshBuild();
 }
 
 void VulkanVoxelApp::ToggleFullscreen() {
@@ -628,6 +609,8 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
     cameraPosition_.x = std::clamp(cameraPosition_.x, 0.0f, static_cast<float>(kWorldSizeX));
     cameraPosition_.y = std::clamp(cameraPosition_.y, 1.0f, static_cast<float>(kWorldSizeY - 1));
     cameraPosition_.z = std::clamp(cameraPosition_.z, 0.0f, static_cast<float>(kWorldSizeZ));
+
+    UpdateWorldMeshIfNeeded();
 }
 
 Vec3 VulkanVoxelApp::GetForwardVector() const {
@@ -654,6 +637,26 @@ Vec3 VulkanVoxelApp::GetHorizontalForwardVector() const {
 
 Vec3 VulkanVoxelApp::GetRightVector() const {
     return Normalize(Cross(GetHorizontalForwardVector(), {0.0f, 1.0f, 0.0f}));
+}
+
+void VulkanVoxelApp::UpdateWorldMeshIfNeeded() {
+    const int chunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
+    const int chunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
+    const int yawBucket = static_cast<int>(std::floor(cameraYaw_));
+    const int pitchBucket = static_cast<int>(std::floor(cameraPitch_));
+
+    if (chunkX == lastMeshChunkX_ &&
+        chunkZ == lastMeshChunkZ_ &&
+        yawBucket == lastMeshYawBucket_ &&
+        pitchBucket == lastMeshPitchBucket_) {
+        return;
+    }
+
+    lastMeshChunkX_ = chunkX;
+    lastMeshChunkZ_ = chunkZ;
+    lastMeshYawBucket_ = yawBucket;
+    lastMeshPitchBucket_ = pitchBucket;
+    RequestWorldMeshBuild();
 }
 
 void VulkanVoxelApp::UpdateOverlayText(float deltaTime) {
@@ -756,9 +759,8 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     const int chunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
     const int chunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
     const int subChunk = std::clamp(static_cast<int>(cameraPosition_.y) / kSubChunkSize, 0, kSubChunkCountY - 1);
-    const Vec3 forward = GetForwardVector();
-    const std::uint32_t faceCount = worldVertexCount_ / 6;
-    const std::uint32_t triangleCount = worldVertexCount_ / 3;
+    const std::uint32_t faceCount = worldIndexCount_ / 6;
+    const std::uint32_t triangleCount = worldIndexCount_ / 3;
     std::vector<std::string> leftLines;
     std::vector<std::string> rightLines;
 
@@ -774,16 +776,15 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
         " Z " + FormatFloat(cameraPosition_.z, 2)
     );
     leftLines.push_back(
-        "LOOK: X " + FormatFloat(forward.x, 2) +
-        " Y " + FormatFloat(forward.y, 2) +
-        " Z " + FormatFloat(forward.z, 2)
+        "ROT: YAW " + FormatFloat(cameraYaw_, 2) +
+        " PITCH " + FormatFloat(cameraPitch_, 2)
     );
     leftLines.push_back(
         "CHUNK: X " + std::to_string(chunkX) +
         " Z " + std::to_string(chunkZ) +
         " SUB: " + std::to_string(subChunk)
     );
-    leftLines.push_back("LOADED CHUNKS: " + std::to_string(world_.GetLoadedChunkCount()));
+    leftLines.push_back("LOADED CHUNKS: " + std::to_string(loadedChunkCount_));
     leftLines.push_back("FACE COUNT: " + std::to_string(faceCount));
 
     rightLines.push_back("GPU: " + gpuName_);
@@ -807,33 +808,35 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
 
     float leftY = kOverlayMargin;
     for (const std::string& rawLine : leftLines) {
-        const std::string line = SanitizeOverlayText(rawLine);
+        const std::string line = SanitizeOverlayText(rawLine, overlayFontGlyphs_);
         AppendOutlinedText(
             overlayVertices_,
+            overlayFontGlyphs_,
             line,
             kOverlayMargin,
             leftY,
-            kOverlayPixelSize,
+            kOverlayGlyphScale,
             swapChainExtent_
         );
-        leftY += 7.0f * kOverlayPixelSize + kOverlayLineGap;
+        leftY += static_cast<float>(overlayFontLineHeight_) * kOverlayGlyphScale + kOverlayLineGap;
     }
 
     float rightY = kOverlayMargin;
     for (const std::string& rawLine : rightLines) {
-        const std::string line = SanitizeOverlayText(rawLine);
+        const std::string line = SanitizeOverlayText(rawLine, overlayFontGlyphs_);
         const float startX = static_cast<float>(swapChainExtent_.width) -
                              kOverlayMargin -
-                             GetOverlayTextWidth(line, kOverlayPixelSize);
+                             GetOverlayTextWidth(line, overlayFontGlyphs_, kOverlayGlyphScale);
         AppendOutlinedText(
             overlayVertices_,
+            overlayFontGlyphs_,
             line,
             startX,
             rightY,
-            kOverlayPixelSize,
+            kOverlayGlyphScale,
             swapChainExtent_
         );
-        rightY += 7.0f * kOverlayPixelSize + kOverlayLineGap;
+        rightY += static_cast<float>(overlayFontLineHeight_) * kOverlayGlyphScale + kOverlayLineGap;
     }
 
     if (overlayVertices_.size() > kMaxOverlayVertexCount) {

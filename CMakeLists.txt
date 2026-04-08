@@ -86,6 +86,7 @@ target_link_libraries(VulkanVoxel
         Vulkan::Vulkan
         dxgi
         advapi32
+        gdi32
         windowscodecs
         ole32
 )

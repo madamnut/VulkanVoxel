@@ -3,9 +3,11 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <dxgi1_4.h>
+#include <wingdi.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -21,7 +23,8 @@
 namespace {
 
 constexpr int kMaxFramesInFlight = 2;
-constexpr std::size_t kMaxOverlayVertexCount = 1048576;
+constexpr std::size_t kMaxOverlayVertexCount = 4194304;
+constexpr float kWorldVerticalFovDegrees = 70.0f;
 
 struct LoadedImage {
     std::uint32_t width = 0;
@@ -131,6 +134,16 @@ LoadedImage LoadImageRgba(const std::string& path) {
     );
 
     return image;
+}
+
+std::wstring GuessFontFaceName(const std::filesystem::path& path) {
+    std::wstring faceName = path.stem().wstring();
+    for (wchar_t& c : faceName) {
+        if (c == L'_' || c == L'-') {
+            c = L' ';
+        }
+    }
+    return faceName;
 }
 
 }  // namespace
@@ -247,26 +260,210 @@ void VulkanVoxelApp::CreateTextureSampler() {
     }
 }
 
-void VulkanVoxelApp::BuildWorldMesh() {
-    std::vector<WorldVertex> vertices;
-    world_.BuildVisibleMesh(
-        kWorldChunkCountX / 2,
-        kWorldChunkCountZ / 2,
-        kWorldChunkCountX / 2,
-        vertices
-    );
-
-    worldVertexCount_ = static_cast<std::uint32_t>(vertices.size());
-    if (worldVertexCount_ == 0) {
-        throw std::runtime_error("World mesh is empty.");
+void VulkanVoxelApp::LoadOverlayFont() {
+    const std::filesystem::path fontPath = std::filesystem::path(ASSET_DIR) / "assets" / "fonts" / "VCR_OSD_MONO.ttf";
+    if (!std::filesystem::exists(fontPath)) {
+        throw std::runtime_error("Font file not found. Expected assets/fonts/VCR_OSD_MONO.ttf");
     }
 
-    const VkDeviceSize bufferSize = sizeof(WorldVertex) * static_cast<VkDeviceSize>(vertices.size());
+    const std::wstring widePath = ToWide(fontPath.string());
+    if (AddFontResourceExW(widePath.c_str(), FR_PRIVATE, nullptr) == 0) {
+        throw std::runtime_error("Failed to load overlay font file.");
+    }
+
+    const std::wstring faceName = GuessFontFaceName(fontPath);
+    const int fontHeight = 20;
+    const int padding = 4;
+
+    HDC glyphDc = CreateCompatibleDC(nullptr);
+    if (glyphDc == nullptr) {
+        RemoveFontResourceExW(widePath.c_str(), FR_PRIVATE, nullptr);
+        throw std::runtime_error("Failed to create font device context.");
+    }
+
+    HFONT font = CreateFontW(
+        -fontHeight,
+        0,
+        0,
+        0,
+        FW_NORMAL,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_TT_ONLY_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY,
+        FF_DONTCARE,
+        faceName.c_str()
+    );
+    if (font == nullptr) {
+        DeleteDC(glyphDc);
+        RemoveFontResourceExW(widePath.c_str(), FR_PRIVATE, nullptr);
+        throw std::runtime_error("Failed to create overlay font.");
+    }
+
+    const HGDIOBJ oldFont = SelectObject(glyphDc, font);
+    SetTextColor(glyphDc, RGB(255, 255, 255));
+    SetBkColor(glyphDc, RGB(0, 0, 0));
+    SetBkMode(glyphDc, OPAQUE);
+
+    TEXTMETRICW metrics{};
+    if (GetTextMetricsW(glyphDc, &metrics) == 0) {
+        SelectObject(glyphDc, oldFont);
+        DeleteObject(font);
+        DeleteDC(glyphDc);
+        RemoveFontResourceExW(widePath.c_str(), FR_PRIVATE, nullptr);
+        throw std::runtime_error("Failed to read overlay font metrics.");
+    }
+
+    overlayFontLineHeight_ = metrics.tmHeight;
+    for (FontGlyphBitmap& glyph : overlayFontGlyphs_) {
+        glyph = {};
+    }
+
+    for (unsigned int code = 32; code < 127; ++code) {
+        const wchar_t ch = static_cast<wchar_t>(code);
+        SIZE size{};
+        if (GetTextExtentPoint32W(glyphDc, &ch, 1, &size) == 0) {
+            continue;
+        }
+
+        FontGlyphBitmap glyph{};
+        glyph.advance = std::max(size.cx, metrics.tmAveCharWidth / 2);
+        glyph.valid = true;
+
+        if (ch == L' ') {
+            overlayFontGlyphs_[code] = std::move(glyph);
+            continue;
+        }
+
+        const int bitmapWidth = std::max(static_cast<int>(size.cx) + padding * 2 + 8, 8);
+        const int bitmapHeight = std::max(static_cast<int>(metrics.tmHeight) + padding * 2 + 8, 8);
+
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmapInfo.bmiHeader.biWidth = bitmapWidth;
+        bitmapInfo.bmiHeader.biHeight = -bitmapHeight;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(glyphDc, &bitmapInfo, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (bitmap == nullptr || bits == nullptr) {
+            continue;
+        }
+
+        const HGDIOBJ oldBitmap = SelectObject(glyphDc, bitmap);
+        PatBlt(glyphDc, 0, 0, bitmapWidth, bitmapHeight, BLACKNESS);
+        TextOutW(glyphDc, padding, padding, &ch, 1);
+
+        auto* pixels = static_cast<const std::uint8_t*>(bits);
+        int minX = bitmapWidth;
+        int minY = bitmapHeight;
+        int maxX = -1;
+        int maxY = -1;
+
+        for (int y = 0; y < bitmapHeight; ++y) {
+            for (int x = 0; x < bitmapWidth; ++x) {
+                const std::size_t index = static_cast<std::size_t>((y * bitmapWidth + x) * 4);
+                const std::uint8_t alpha = std::max({pixels[index + 0], pixels[index + 1], pixels[index + 2]});
+                if (alpha == 0) {
+                    continue;
+                }
+
+                minX = std::min(minX, x);
+                minY = std::min(minY, y);
+                maxX = std::max(maxX, x);
+                maxY = std::max(maxY, y);
+            }
+        }
+
+        if (maxX >= minX && maxY >= minY) {
+            glyph.width = maxX - minX + 1;
+            glyph.height = maxY - minY + 1;
+            glyph.offsetX = minX - padding;
+            glyph.offsetY = minY - padding;
+            glyph.alpha.resize(static_cast<std::size_t>(glyph.width * glyph.height));
+
+            for (int y = 0; y < glyph.height; ++y) {
+                for (int x = 0; x < glyph.width; ++x) {
+                    const int sourceX = minX + x;
+                    const int sourceY = minY + y;
+                    const std::size_t sourceIndex = static_cast<std::size_t>((sourceY * bitmapWidth + sourceX) * 4);
+                    const std::uint8_t alpha = std::max({
+                        pixels[sourceIndex + 0],
+                        pixels[sourceIndex + 1],
+                        pixels[sourceIndex + 2]
+                    });
+                    glyph.alpha[static_cast<std::size_t>(y * glyph.width + x)] = alpha;
+                }
+            }
+        }
+
+        overlayFontGlyphs_[code] = std::move(glyph);
+        SelectObject(glyphDc, oldBitmap);
+        DeleteObject(bitmap);
+    }
+
+    SelectObject(glyphDc, oldFont);
+    DeleteObject(font);
+    DeleteDC(glyphDc);
+    RemoveFontResourceExW(widePath.c_str(), FR_PRIVATE, nullptr);
+
+    constexpr int atlasWidth = 1024;
+    constexpr int atlasHeight = 1024;
+    constexpr int atlasPadding = 2;
+
+    std::vector<std::uint8_t> atlasPixels(static_cast<std::size_t>(atlasWidth * atlasHeight), 0);
+    int cursorX = atlasPadding;
+    int cursorY = atlasPadding;
+    int rowHeight = 0;
+
+    for (unsigned int code = 32; code < 127; ++code) {
+        FontGlyphBitmap& glyph = overlayFontGlyphs_[code];
+        if (!glyph.valid || glyph.width <= 0 || glyph.height <= 0) {
+            continue;
+        }
+
+        if (cursorX + glyph.width + atlasPadding > atlasWidth) {
+            cursorX = atlasPadding;
+            cursorY += rowHeight + atlasPadding;
+            rowHeight = 0;
+        }
+
+        if (cursorY + glyph.height + atlasPadding > atlasHeight) {
+            throw std::runtime_error("Overlay font atlas is too small.");
+        }
+
+        for (int y = 0; y < glyph.height; ++y) {
+            const std::size_t srcOffset = static_cast<std::size_t>(y * glyph.width);
+            const std::size_t dstOffset = static_cast<std::size_t>((cursorY + y) * atlasWidth + cursorX);
+            std::memcpy(
+                atlasPixels.data() + dstOffset,
+                glyph.alpha.data() + srcOffset,
+                static_cast<std::size_t>(glyph.width)
+            );
+        }
+
+        glyph.u0 = static_cast<float>(cursorX) / static_cast<float>(atlasWidth);
+        glyph.v0 = static_cast<float>(cursorY) / static_cast<float>(atlasHeight);
+        glyph.u1 = static_cast<float>(cursorX + glyph.width) / static_cast<float>(atlasWidth);
+        glyph.v1 = static_cast<float>(cursorY + glyph.height) / static_cast<float>(atlasHeight);
+        glyph.alpha.clear();
+        glyph.alpha.shrink_to_fit();
+
+        cursorX += glyph.width + atlasPadding;
+        rowHeight = std::max(rowHeight, glyph.height);
+    }
+
+    const VkDeviceSize atlasSize = static_cast<VkDeviceSize>(atlasPixels.size());
 
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
     CreateBuffer(
-        bufferSize,
+        atlasSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         stagingBuffer,
@@ -274,25 +471,308 @@ void VulkanVoxelApp::BuildWorldMesh() {
     );
 
     void* mappedData = nullptr;
-    if (vkMapMemory(device_, stagingBufferMemory, 0, bufferSize, 0, &mappedData) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to map world staging buffer.");
+    if (vkMapMemory(device_, stagingBufferMemory, 0, atlasSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map overlay font staging buffer.");
     }
-
-    std::memcpy(mappedData, vertices.data(), static_cast<std::size_t>(bufferSize));
+    std::memcpy(mappedData, atlasPixels.data(), atlasPixels.size());
     vkUnmapMemory(device_, stagingBufferMemory);
 
+    CreateImage(
+        atlasWidth,
+        atlasHeight,
+        VK_FORMAT_R8_UNORM,
+        VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        overlayFontImage_,
+        overlayFontImageMemory_
+    );
+
+    TransitionImageLayout(
+        overlayFontImage_,
+        VK_FORMAT_R8_UNORM,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    );
+    CopyBufferToImage(stagingBuffer, overlayFontImage_, atlasWidth, atlasHeight);
+    TransitionImageLayout(
+        overlayFontImage_,
+        VK_FORMAT_R8_UNORM,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    );
+
+    vkDestroyBuffer(device_, stagingBuffer, nullptr);
+    vkFreeMemory(device_, stagingBufferMemory, nullptr);
+
+    overlayFontImageView_ = CreateImageView(overlayFontImage_, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+
+    if (vkCreateSampler(device_, &samplerInfo, nullptr, &overlayFontSampler_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create overlay font sampler.");
+    }
+}
+
+void VulkanVoxelApp::DestroyWorldMeshBuffers() {
+    if (worldIndexBuffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, worldIndexBuffer_, nullptr);
+        worldIndexBuffer_ = VK_NULL_HANDLE;
+    }
+    if (worldIndexBufferMemory_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, worldIndexBufferMemory_, nullptr);
+        worldIndexBufferMemory_ = VK_NULL_HANDLE;
+    }
+    if (worldVertexBuffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, worldVertexBuffer_, nullptr);
+        worldVertexBuffer_ = VK_NULL_HANDLE;
+    }
+    if (worldVertexBufferMemory_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, worldVertexBufferMemory_, nullptr);
+        worldVertexBufferMemory_ = VK_NULL_HANDLE;
+    }
+
+    worldVertexCount_ = 0;
+    worldIndexCount_ = 0;
+}
+
+WorldMeshData VulkanVoxelApp::BuildWorldMeshData(
+    int centerChunkX,
+    int centerChunkZ,
+    const Vec3& cameraPosition,
+    const Vec3& cameraForward,
+    float aspectRatio
+) {
+    WorldMeshData mesh;
+    world_.BuildVisibleMesh(
+        centerChunkX,
+        centerChunkZ,
+        std::max(kWorldChunkCountX, kWorldChunkCountZ),
+        cameraPosition,
+        cameraForward,
+        kWorldVerticalFovDegrees,
+        aspectRatio,
+        mesh
+    );
+    return mesh;
+}
+
+void VulkanVoxelApp::UploadWorldMesh(const WorldMeshData& mesh) {
+    if (device_ == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (!inFlightFences_.empty()) {
+        vkWaitForFences(
+            device_,
+            static_cast<std::uint32_t>(inFlightFences_.size()),
+            inFlightFences_.data(),
+            VK_TRUE,
+            UINT64_MAX
+        );
+    }
+
+    DestroyWorldMeshBuffers();
+    loadedChunkCount_ = mesh.loadedChunkCount;
+
+    if (mesh.vertices.empty() || mesh.indices.empty()) {
+        return;
+    }
+
+    const VkDeviceSize vertexBufferSize = sizeof(WorldVertex) * static_cast<VkDeviceSize>(mesh.vertices.size());
+    const VkDeviceSize indexBufferSize = sizeof(std::uint32_t) * static_cast<VkDeviceSize>(mesh.indices.size());
+
+    VkBuffer vertexStagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory vertexStagingMemory = VK_NULL_HANDLE;
     CreateBuffer(
-        bufferSize,
+        vertexBufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        vertexStagingBuffer,
+        vertexStagingMemory
+    );
+
+    void* mappedData = nullptr;
+    if (vkMapMemory(device_, vertexStagingMemory, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map world vertex staging buffer.");
+    }
+    std::memcpy(mappedData, mesh.vertices.data(), static_cast<std::size_t>(vertexBufferSize));
+    vkUnmapMemory(device_, vertexStagingMemory);
+
+    CreateBuffer(
+        vertexBufferSize,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         worldVertexBuffer_,
         worldVertexBufferMemory_
     );
+    CopyBuffer(vertexStagingBuffer, worldVertexBuffer_, vertexBufferSize);
 
-    CopyBuffer(stagingBuffer, worldVertexBuffer_, bufferSize);
+    vkDestroyBuffer(device_, vertexStagingBuffer, nullptr);
+    vkFreeMemory(device_, vertexStagingMemory, nullptr);
 
-    vkDestroyBuffer(device_, stagingBuffer, nullptr);
-    vkFreeMemory(device_, stagingBufferMemory, nullptr);
+    VkBuffer indexStagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory indexStagingMemory = VK_NULL_HANDLE;
+    CreateBuffer(
+        indexBufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        indexStagingBuffer,
+        indexStagingMemory
+    );
+
+    if (vkMapMemory(device_, indexStagingMemory, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map world index staging buffer.");
+    }
+    std::memcpy(mappedData, mesh.indices.data(), static_cast<std::size_t>(indexBufferSize));
+    vkUnmapMemory(device_, indexStagingMemory);
+
+    CreateBuffer(
+        indexBufferSize,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        worldIndexBuffer_,
+        worldIndexBufferMemory_
+    );
+    CopyBuffer(indexStagingBuffer, worldIndexBuffer_, indexBufferSize);
+
+    vkDestroyBuffer(device_, indexStagingBuffer, nullptr);
+    vkFreeMemory(device_, indexStagingMemory, nullptr);
+
+    worldVertexCount_ = static_cast<std::uint32_t>(mesh.vertices.size());
+    worldIndexCount_ = static_cast<std::uint32_t>(mesh.indices.size());
+}
+
+void VulkanVoxelApp::BuildWorldMesh() {
+    const int centerChunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
+    const int centerChunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
+    const float aspectRatio = swapChainExtent_.height > 0
+        ? static_cast<float>(swapChainExtent_.width) / static_cast<float>(swapChainExtent_.height)
+        : (16.0f / 9.0f);
+    const WorldMeshData mesh = BuildWorldMeshData(
+        centerChunkX,
+        centerChunkZ,
+        cameraPosition_,
+        GetForwardVector(),
+        aspectRatio
+    );
+    UploadWorldMesh(mesh);
+}
+
+void VulkanVoxelApp::RequestWorldMeshBuild() {
+    if (!worldMeshWorkerRunning_) {
+        return;
+    }
+
+    WorldMeshBuildRequest request{};
+    request.centerChunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
+    request.centerChunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
+    request.cameraPosition = cameraPosition_;
+    request.cameraForward = GetForwardVector();
+    request.aspectRatio = swapChainExtent_.height > 0
+        ? static_cast<float>(swapChainExtent_.width) / static_cast<float>(swapChainExtent_.height)
+        : (16.0f / 9.0f);
+
+    {
+        std::lock_guard lock(worldMeshWorkerMutex_);
+        request.serial = ++nextWorldMeshRequestSerial_;
+        pendingWorldMeshRequest_ = request;
+        worldMeshRequestPending_ = true;
+    }
+
+    worldMeshWorkerCv_.notify_one();
+}
+
+void VulkanVoxelApp::StartWorldMeshWorker() {
+    if (worldMeshWorkerRunning_) {
+        return;
+    }
+
+    worldMeshWorkerRunning_ = true;
+    worldMeshWorkerThread_ = std::thread([this]() {
+        for (;;) {
+            WorldMeshBuildRequest request{};
+
+            {
+                std::unique_lock lock(worldMeshWorkerMutex_);
+                worldMeshWorkerCv_.wait(lock, [this]() {
+                    return !worldMeshWorkerRunning_ || worldMeshRequestPending_;
+                });
+
+                if (!worldMeshWorkerRunning_) {
+                    return;
+                }
+
+                request = pendingWorldMeshRequest_;
+                worldMeshRequestPending_ = false;
+            }
+
+            WorldMeshData mesh = BuildWorldMeshData(
+                request.centerChunkX,
+                request.centerChunkZ,
+                request.cameraPosition,
+                request.cameraForward,
+                request.aspectRatio
+            );
+
+            {
+                std::lock_guard lock(worldMeshWorkerMutex_);
+                if (request.serial < nextWorldMeshRequestSerial_) {
+                    continue;
+                }
+
+                completedWorldMesh_ = std::move(mesh);
+                completedWorldMeshSerial_ = request.serial;
+            }
+        }
+    });
+}
+
+void VulkanVoxelApp::StopWorldMeshWorker() {
+    {
+        std::lock_guard lock(worldMeshWorkerMutex_);
+        worldMeshWorkerRunning_ = false;
+        worldMeshRequestPending_ = false;
+    }
+
+    worldMeshWorkerCv_.notify_all();
+
+    if (worldMeshWorkerThread_.joinable()) {
+        worldMeshWorkerThread_.join();
+    }
+}
+
+void VulkanVoxelApp::ConsumeCompletedWorldMesh() {
+    std::optional<WorldMeshData> mesh;
+    std::uint64_t serial = 0;
+
+    {
+        std::lock_guard lock(worldMeshWorkerMutex_);
+        if (!completedWorldMesh_.has_value() || completedWorldMeshSerial_ <= uploadedWorldMeshSerial_) {
+            return;
+        }
+
+        serial = completedWorldMeshSerial_;
+        mesh = std::move(completedWorldMesh_);
+        completedWorldMesh_.reset();
+    }
+
+    UploadWorldMesh(*mesh);
+    uploadedWorldMeshSerial_ = serial;
 }
 
 void VulkanVoxelApp::CreateOverlayBuffer() {
@@ -325,15 +805,15 @@ void VulkanVoxelApp::CreateUniformBuffers() {
 
 void VulkanVoxelApp::CreateDescriptorPool() {
     const std::array<VkDescriptorPoolSize, 2> poolSizes = {{
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight * 2},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 2},
     }};
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = kMaxFramesInFlight;
+    poolInfo.maxSets = kMaxFramesInFlight * 2;
 
     if (vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create descriptor pool.");
@@ -352,6 +832,11 @@ void VulkanVoxelApp::CreateDescriptorSets() {
     descriptorSets_.resize(kMaxFramesInFlight);
     if (vkAllocateDescriptorSets(device_, &allocInfo, descriptorSets_.data()) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate descriptor sets.");
+    }
+
+    overlayDescriptorSets_.resize(kMaxFramesInFlight);
+    if (vkAllocateDescriptorSets(device_, &allocInfo, overlayDescriptorSets_.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate overlay descriptor sets.");
     }
 
     for (std::size_t i = 0; i < descriptorSets_.size(); ++i) {
@@ -385,6 +870,34 @@ void VulkanVoxelApp::CreateDescriptorSets() {
             device_,
             static_cast<std::uint32_t>(descriptorWrites.size()),
             descriptorWrites.data(),
+            0,
+            nullptr
+        );
+
+        VkDescriptorImageInfo overlayImageInfo{};
+        overlayImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        overlayImageInfo.imageView = overlayFontImageView_;
+        overlayImageInfo.sampler = overlayFontSampler_;
+
+        std::array<VkWriteDescriptorSet, 2> overlayWrites{};
+        overlayWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        overlayWrites[0].dstSet = overlayDescriptorSets_[i];
+        overlayWrites[0].dstBinding = 0;
+        overlayWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        overlayWrites[0].descriptorCount = 1;
+        overlayWrites[0].pBufferInfo = &bufferInfo;
+
+        overlayWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        overlayWrites[1].dstSet = overlayDescriptorSets_[i];
+        overlayWrites[1].dstBinding = 1;
+        overlayWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        overlayWrites[1].descriptorCount = 1;
+        overlayWrites[1].pImageInfo = &overlayImageInfo;
+
+        vkUpdateDescriptorSets(
+            device_,
+            static_cast<std::uint32_t>(overlayWrites.size()),
+            overlayWrites.data(),
             0,
             nullptr
         );

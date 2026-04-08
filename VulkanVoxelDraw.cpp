@@ -148,7 +148,7 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
 
     drawCallCount_ = 0;
 
-    if (worldVertexCount_ > 0) {
+    if (worldVertexCount_ > 0 && worldIndexCount_ > 0) {
         const VkBuffer worldVertexBuffers[] = {worldVertexBuffer_};
         const VkDeviceSize worldOffsets[] = {0};
 
@@ -164,7 +164,8 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
             nullptr
         );
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, worldVertexBuffers, worldOffsets);
-        vkCmdDraw(commandBuffer, worldVertexCount_, 1, 0, 0);
+        vkCmdBindIndexBuffer(commandBuffer, worldIndexBuffer_, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(commandBuffer, worldIndexCount_, 1, 0, 0, 0);
         ++drawCallCount_;
     }
 
@@ -173,6 +174,16 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
         const VkDeviceSize overlayOffsets[] = {0};
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            overlayPipelineLayout_,
+            0,
+            1,
+            &overlayDescriptorSets_[currentFrame_],
+            0,
+            nullptr
+        );
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, overlayVertexBuffers, overlayOffsets);
         vkCmdDraw(commandBuffer, overlayVertexCount_, 1, 0, 0);
         ++drawCallCount_;

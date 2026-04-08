@@ -376,8 +376,8 @@ void VulkanVoxelApp::CreatePipelines() {
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
-    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -458,15 +458,19 @@ void VulkanVoxelApp::CreatePipelines() {
     overlayBindingDescription.stride = sizeof(OverlayVertex);
     overlayBindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    std::array<VkVertexInputAttributeDescription, 2> overlayAttributes{};
+    std::array<VkVertexInputAttributeDescription, 3> overlayAttributes{};
     overlayAttributes[0].binding = 0;
     overlayAttributes[0].location = 0;
     overlayAttributes[0].format = VK_FORMAT_R32G32_SFLOAT;
     overlayAttributes[0].offset = offsetof(OverlayVertex, position);
     overlayAttributes[1].binding = 0;
     overlayAttributes[1].location = 1;
-    overlayAttributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-    overlayAttributes[1].offset = offsetof(OverlayVertex, color);
+    overlayAttributes[1].format = VK_FORMAT_R32G32_SFLOAT;
+    overlayAttributes[1].offset = offsetof(OverlayVertex, uv);
+    overlayAttributes[2].binding = 0;
+    overlayAttributes[2].location = 2;
+    overlayAttributes[2].format = VK_FORMAT_R32G32B32_SFLOAT;
+    overlayAttributes[2].offset = offsetof(OverlayVertex, color);
 
     VkPipelineVertexInputStateCreateInfo overlayVertexInput{};
     overlayVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -474,6 +478,9 @@ void VulkanVoxelApp::CreatePipelines() {
     overlayVertexInput.pVertexBindingDescriptions = &overlayBindingDescription;
     overlayVertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(overlayAttributes.size());
     overlayVertexInput.pVertexAttributeDescriptions = overlayAttributes.data();
+
+    VkPipelineRasterizationStateCreateInfo overlayRasterizer = rasterizer;
+    overlayRasterizer.cullMode = VK_CULL_MODE_NONE;
 
     VkPipelineDepthStencilStateCreateInfo overlayDepthStencil{};
     overlayDepthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -484,6 +491,8 @@ void VulkanVoxelApp::CreatePipelines() {
 
     VkPipelineLayoutCreateInfo overlayLayoutInfo{};
     overlayLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    overlayLayoutInfo.setLayoutCount = 1;
+    overlayLayoutInfo.pSetLayouts = &descriptorSetLayout_;
 
     if (vkCreatePipelineLayout(device_, &overlayLayoutInfo, nullptr, &overlayPipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create overlay pipeline layout.");
@@ -496,7 +505,7 @@ void VulkanVoxelApp::CreatePipelines() {
     overlayPipelineInfo.pVertexInputState = &overlayVertexInput;
     overlayPipelineInfo.pInputAssemblyState = &inputAssembly;
     overlayPipelineInfo.pViewportState = &viewportState;
-    overlayPipelineInfo.pRasterizationState = &rasterizer;
+    overlayPipelineInfo.pRasterizationState = &overlayRasterizer;
     overlayPipelineInfo.pMultisampleState = &multisampling;
     overlayPipelineInfo.pDepthStencilState = &overlayDepthStencil;
     overlayPipelineInfo.pColorBlendState = &colorBlending;

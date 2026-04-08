@@ -7,10 +7,14 @@
 #include "VoxelWorld.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
+#include <array>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct QueueFamilyIndices {
@@ -44,6 +48,7 @@ private:
     Vec3 GetForwardVector() const;
     Vec3 GetHorizontalForwardVector() const;
     Vec3 GetRightVector() const;
+    void UpdateWorldMeshIfNeeded();
     void ToggleFullscreen();
     void CleanupSwapChain();
     void RecreateSwapChain();
@@ -61,7 +66,21 @@ private:
     void CreateTextureImage();
     void CreateTextureImageView();
     void CreateTextureSampler();
+    void LoadOverlayFont();
     void BuildWorldMesh();
+    void RequestWorldMeshBuild();
+    void StartWorldMeshWorker();
+    void StopWorldMeshWorker();
+    void ConsumeCompletedWorldMesh();
+    WorldMeshData BuildWorldMeshData(
+        int centerChunkX,
+        int centerChunkZ,
+        const Vec3& cameraPosition,
+        const Vec3& cameraForward,
+        float aspectRatio
+    );
+    void UploadWorldMesh(const WorldMeshData& mesh);
+    void DestroyWorldMeshBuffers();
     void CreateOverlayBuffer();
     void CreateUniformBuffers();
     void CreateDescriptorPool();
@@ -160,10 +179,17 @@ private:
     VkDeviceMemory textureImageMemory_ = VK_NULL_HANDLE;
     VkImageView textureImageView_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
+    VkImage overlayFontImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory overlayFontImageMemory_ = VK_NULL_HANDLE;
+    VkImageView overlayFontImageView_ = VK_NULL_HANDLE;
+    VkSampler overlayFontSampler_ = VK_NULL_HANDLE;
 
     VkBuffer worldVertexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory worldVertexBufferMemory_ = VK_NULL_HANDLE;
     std::uint32_t worldVertexCount_ = 0;
+    VkBuffer worldIndexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory worldIndexBufferMemory_ = VK_NULL_HANDLE;
+    std::uint32_t worldIndexCount_ = 0;
 
     VkBuffer overlayVertexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory overlayVertexBufferMemory_ = VK_NULL_HANDLE;
@@ -175,6 +201,7 @@ private:
     std::vector<VkDeviceMemory> uniformBuffersMemory_;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> descriptorSets_;
+    std::vector<VkDescriptorSet> overlayDescriptorSets_;
 
     std::vector<VkFramebuffer> swapChainFramebuffers_;
 
@@ -209,6 +236,11 @@ private:
     double currentFrameTimeMs_ = 0.0;
     double fpsAccumulatorSeconds_ = 0.0;
     double overlayRefreshAccumulatorSeconds_ = 0.0;
+    std::size_t loadedChunkCount_ = 0;
+    int lastMeshChunkX_ = -1;
+    int lastMeshChunkZ_ = -1;
+    int lastMeshYawBucket_ = -1;
+    int lastMeshPitchBucket_ = -1;
     std::uint64_t totalRamBytes_ = 0;
     std::uint64_t usedRamBytes_ = 0;
     std::uint64_t totalVramBytes_ = 0;
@@ -219,4 +251,26 @@ private:
     std::string driverVersionString_;
     std::string rendererName_ = "VULKAN";
     std::string presentModeString_ = "FIFO";
+    std::array<FontGlyphBitmap, 128> overlayFontGlyphs_{};
+    int overlayFontLineHeight_ = 0;
+
+    struct WorldMeshBuildRequest {
+        int centerChunkX = 0;
+        int centerChunkZ = 0;
+        Vec3 cameraPosition{};
+        Vec3 cameraForward{};
+        float aspectRatio = 16.0f / 9.0f;
+        std::uint64_t serial = 0;
+    };
+
+    std::thread worldMeshWorkerThread_;
+    std::mutex worldMeshWorkerMutex_;
+    std::condition_variable worldMeshWorkerCv_;
+    bool worldMeshWorkerRunning_ = false;
+    bool worldMeshRequestPending_ = false;
+    std::uint64_t nextWorldMeshRequestSerial_ = 0;
+    std::uint64_t completedWorldMeshSerial_ = 0;
+    std::uint64_t uploadedWorldMeshSerial_ = 0;
+    WorldMeshBuildRequest pendingWorldMeshRequest_{};
+    std::optional<WorldMeshData> completedWorldMesh_;
 };
