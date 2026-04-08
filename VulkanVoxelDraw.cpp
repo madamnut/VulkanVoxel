@@ -26,6 +26,14 @@ void VulkanVoxelApp::DrawFrame() {
         overlayDirty_ = false;
     }
 
+    vkWaitForFences(
+        device_,
+        static_cast<std::uint32_t>(inFlightFences_.size()),
+        inFlightFences_.data(),
+        VK_TRUE,
+        UINT64_MAX
+    );
+    UpdatePlayerRenderMesh();
     UpdateUniformBuffer(static_cast<std::uint32_t>(currentFrame_));
 
     std::uint32_t imageIndex = 0;
@@ -97,10 +105,12 @@ void VulkanVoxelApp::UpdateUniformBuffer(std::uint32_t frameIndex) {
 
     const float aspect = static_cast<float>(swapChainExtent_.width) /
                          static_cast<float>(swapChainExtent_.height);
+    const Vec3 renderCameraPosition = GetRenderCameraPosition();
+    const Vec3 renderCameraForward = GetRenderCameraForward();
     const Mat4 projection = Perspective(70.0f * kPi / 180.0f, aspect, 0.1f, 2048.0f);
     const Mat4 view = LookAt(
-        cameraPosition_,
-        cameraPosition_ + GetForwardVector(),
+        renderCameraPosition,
+        renderCameraPosition + renderCameraForward,
         {0.0f, 1.0f, 0.0f}
     );
     ubo.viewProj = Multiply(projection, view);
@@ -166,6 +176,67 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, worldVertexBuffers, worldOffsets);
         vkCmdBindIndexBuffer(commandBuffer, worldIndexBuffer_, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(commandBuffer, worldIndexCount_, 1, 0, 0, 0);
+        ++drawCallCount_;
+    }
+
+    if (playerVertexCount_ > 0 && playerIndexCount_ > 0) {
+        const VkBuffer playerVertexBuffers[] = {playerVertexBuffer_};
+        const VkDeviceSize playerOffsets[] = {0};
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            worldPipelineLayout_,
+            0,
+            1,
+            &playerDescriptorSets_[currentFrame_],
+            0,
+            nullptr
+        );
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, playerVertexBuffers, playerOffsets);
+        vkCmdBindIndexBuffer(commandBuffer, playerIndexBuffer_, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(commandBuffer, playerIndexCount_, 1, 0, 0, 0);
+        ++drawCallCount_;
+    }
+
+    if (selectionVertexCount_ > 0) {
+        const VkBuffer selectionVertexBuffers[] = {selectionVertexBuffer_};
+        const VkDeviceSize selectionOffsets[] = {0};
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selectionPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            selectionPipelineLayout_,
+            0,
+            1,
+            &descriptorSets_[currentFrame_],
+            0,
+            nullptr
+        );
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, selectionVertexBuffers, selectionOffsets);
+        vkCmdDraw(commandBuffer, selectionVertexCount_, 1, 0, 0);
+        ++drawCallCount_;
+    }
+
+    if (entityColliderVertexCount_ > 0) {
+        const VkBuffer entityColliderVertexBuffers[] = {entityColliderVertexBuffer_};
+        const VkDeviceSize entityColliderOffsets[] = {0};
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selectionPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            selectionPipelineLayout_,
+            0,
+            1,
+            &descriptorSets_[currentFrame_],
+            0,
+            nullptr
+        );
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, entityColliderVertexBuffers, entityColliderOffsets);
+        vkCmdDraw(commandBuffer, entityColliderVertexCount_, 1, 0, 0);
         ++drawCallCount_;
     }
 

@@ -7,6 +7,14 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kFrustumPaddingDegrees = 8.0f;
+constexpr int kFaceNeighborOffsets[6][3] = {
+    {0, 1, 0},
+    {0, -1, 0},
+    {0, 0, -1},
+    {0, 0, 1},
+    {-1, 0, 0},
+    {1, 0, 0},
+};
 
 void AppendQuad(
     WorldMeshData& mesh,
@@ -63,65 +71,103 @@ int VoxelWorld::GetSubChunkBlockIndex(int localX, int localY, int localZ) {
     return localY * kSubChunkSize * kSubChunkSize + localZ * kSubChunkSize + localX;
 }
 
+std::size_t VoxelWorld::GetBlockIndex(int worldX, int worldY, int worldZ) {
+    return static_cast<std::size_t>(worldY) * static_cast<std::size_t>(kWorldSizeZ) * static_cast<std::size_t>(kWorldSizeX) +
+           static_cast<std::size_t>(worldZ) * static_cast<std::size_t>(kWorldSizeX) +
+           static_cast<std::size_t>(worldX);
+}
+
+bool VoxelWorld::IsInsideWorld(int worldX, int worldY, int worldZ) {
+    return worldX >= 0 && worldX < kWorldSizeX &&
+           worldY >= 0 && worldY < kWorldSizeY &&
+           worldZ >= 0 && worldZ < kWorldSizeZ;
+}
+
 void VoxelWorld::EnsureChunkColumn(int chunkX, int chunkZ) {
     if (chunkX < 0 || chunkX >= kWorldChunkCountX || chunkZ < 0 || chunkZ >= kWorldChunkCountZ) {
         return;
     }
 
-    const std::int64_t key = MakeChunkKey(chunkX, chunkZ);
-    if (columns_.contains(key)) {
-        return;
-    }
-
-    ChunkColumn column{};
-    column.chunkX = chunkX;
-    column.chunkZ = chunkZ;
-    GenerateChunkColumn(column);
-    columns_.emplace(key, std::move(column));
+    EnsureInitialized();
 }
 
 void VoxelWorld::EnsureRange(int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ) {
-    for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ) {
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX) {
-            EnsureChunkColumn(chunkX, chunkZ);
-        }
+    if (minChunkX > maxChunkX || minChunkZ > maxChunkZ) {
+        return;
     }
+
+    EnsureInitialized();
 }
 
-void VoxelWorld::GenerateChunkColumn(ChunkColumn& column) const {
-    for (int subChunkIndex = 0; subChunkIndex < kSubChunkCountY; ++subChunkIndex) {
-        SubChunk& subChunk = column.subChunks[subChunkIndex];
-        const int subChunkMinY = subChunkIndex * kSubChunkSize;
-        const int subChunkMaxY = subChunkMinY + kSubChunkSize - 1;
+void VoxelWorld::EnsureInitialized() {
+    if (initialized_) {
+        return;
+    }
 
-        if (subChunkMaxY < kGroundHeight) {
-            subChunk.blocks.fill(1);
-            subChunk.isEmpty = false;
-            subChunk.isFull = true;
+    blocks_.resize(static_cast<std::size_t>(kWorldSizeX) * static_cast<std::size_t>(kWorldSizeY) * static_cast<std::size_t>(kWorldSizeZ), 0);
+    for (int worldY = 0; worldY < kWorldSizeY; ++worldY) {
+        const std::uint8_t blockValue = worldY < kGroundHeight ? 1 : 0;
+        if (blockValue == 0) {
             continue;
         }
 
-        if (subChunkMinY >= kGroundHeight) {
-            subChunk.blocks.fill(0);
-            subChunk.isEmpty = true;
-            subChunk.isFull = false;
-            continue;
-        }
-
-        for (int localY = 0; localY < kSubChunkSize; ++localY) {
-            const int worldY = subChunkMinY + localY;
-            const std::uint8_t blockValue = worldY < kGroundHeight ? 1 : 0;
-
-            for (int localZ = 0; localZ < kSubChunkSize; ++localZ) {
-                for (int localX = 0; localX < kSubChunkSize; ++localX) {
-                    subChunk.blocks[GetSubChunkBlockIndex(localX, localY, localZ)] = blockValue;
-                }
+        for (int worldZ = 0; worldZ < kWorldSizeZ; ++worldZ) {
+            for (int worldX = 0; worldX < kWorldSizeX; ++worldX) {
+                blocks_[GetBlockIndex(worldX, worldY, worldZ)] = blockValue;
             }
         }
-
-        subChunk.isEmpty = false;
-        subChunk.isFull = false;
     }
+
+    initialized_ = true;
+}
+
+std::uint8_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) {
+    if (!IsInsideWorld(worldX, worldY, worldZ)) {
+        return 0;
+    }
+
+    EnsureInitialized();
+    return blocks_[GetBlockIndex(worldX, worldY, worldZ)];
+}
+
+bool VoxelWorld::SetBlock(int worldX, int worldY, int worldZ, std::uint8_t blockValue) {
+    if (!IsInsideWorld(worldX, worldY, worldZ)) {
+        return false;
+    }
+
+    EnsureInitialized();
+
+    const std::size_t blockIndex = GetBlockIndex(worldX, worldY, worldZ);
+    if (blocks_[blockIndex] == blockValue) {
+        return false;
+    }
+
+    blocks_[blockIndex] = blockValue;
+
+    const int chunkX = worldX / kChunkSizeX;
+    const int chunkZ = worldZ / kChunkSizeZ;
+    MarkChunkColumnModified(chunkX, chunkZ);
+
+    const int localX = worldX % kChunkSizeX;
+    const int localZ = worldZ % kChunkSizeZ;
+    if (localX == 0) {
+        MarkChunkColumnModified(chunkX - 1, chunkZ);
+    }
+    if (localX == kChunkSizeX - 1) {
+        MarkChunkColumnModified(chunkX + 1, chunkZ);
+    }
+    if (localZ == 0) {
+        MarkChunkColumnModified(chunkX, chunkZ - 1);
+    }
+    if (localZ == kChunkSizeZ - 1) {
+        MarkChunkColumnModified(chunkX, chunkZ + 1);
+    }
+
+    return true;
+}
+
+bool VoxelWorld::IsChunkColumnModified(int chunkX, int chunkZ) const {
+    return modifiedColumns_.contains(MakeChunkKey(chunkX, chunkZ));
 }
 
 bool VoxelWorld::IsChunkInsideFrustum(
@@ -206,6 +252,13 @@ void VoxelWorld::BuildVisibleMesh(
     float aspectRatio,
     WorldMeshData& outMesh
 ) {
+    (void)cameraPosition;
+    (void)cameraForward;
+    (void)verticalFovDegrees;
+    (void)aspectRatio;
+
+    EnsureInitialized();
+
     outMesh.vertices.clear();
     outMesh.indices.clear();
 
@@ -227,15 +280,9 @@ void VoxelWorld::BuildVisibleMesh(
 
     for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ) {
         for (int chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX) {
-            const bool visible = IsChunkInsideFrustum(
-                chunkX,
-                chunkZ,
-                cameraPosition,
-                cameraForward,
-                verticalFovDegrees,
-                aspectRatio
-            );
-            visibleMask[maskIndex(chunkX - minChunkX, chunkZ - minChunkZ)] = visible;
+            const bool visible = true;
+            const bool useDetailedColumn = visible && IsChunkColumnModified(chunkX, chunkZ);
+            visibleMask[maskIndex(chunkX - minChunkX, chunkZ - minChunkZ)] = visible && !useDetailedColumn;
         }
     }
 
@@ -398,11 +445,22 @@ void VoxelWorld::BuildVisibleMesh(
         ++localChunkZ;
     }
 
-    outMesh.loadedChunkCount = columns_.size();
+    for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ) {
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX) {
+            if (!IsChunkColumnModified(chunkX, chunkZ)) {
+                continue;
+            }
+            AppendDetailedColumnMesh(outMesh, chunkX, chunkZ);
+        }
+    }
+
+    outMesh.loadedChunkCount = static_cast<std::size_t>(kWorldChunkCountX) * static_cast<std::size_t>(kWorldChunkCountZ);
 }
 
 std::size_t VoxelWorld::GetLoadedChunkCount() const {
-    return columns_.size();
+    return initialized_
+        ? static_cast<std::size_t>(kWorldChunkCountX) * static_cast<std::size_t>(kWorldChunkCountZ)
+        : 0;
 }
 
 void VoxelWorld::AppendTopQuad(WorldMeshData& mesh, int startX, int startZ, int width, int depth) const {
@@ -479,4 +537,77 @@ void VoxelWorld::AppendEastQuad(WorldMeshData& mesh, int startZ, int depth) cons
         static_cast<float>(depth),
         static_cast<float>(kGroundHeight)
     );
+}
+
+void VoxelWorld::AppendFaceQuad(
+    WorldMeshData& mesh,
+    int worldX,
+    int worldY,
+    int worldZ,
+    int faceIndex
+) const {
+    const float x = static_cast<float>(worldX);
+    const float y = static_cast<float>(worldY);
+    const float z = static_cast<float>(worldZ);
+
+    switch (faceIndex) {
+    case 0:
+        AppendQuad(mesh, {x, y + 1.0f, z}, {x, y + 1.0f, z + 1.0f}, {x + 1.0f, y + 1.0f, z + 1.0f}, {x + 1.0f, y + 1.0f, z}, 1.0f, 1.0f);
+        break;
+    case 1:
+        AppendQuad(mesh, {x, y, z + 1.0f}, {x, y, z}, {x + 1.0f, y, z}, {x + 1.0f, y, z + 1.0f}, 1.0f, 1.0f);
+        break;
+    case 2:
+        AppendQuad(mesh, {x + 1.0f, y, z}, {x, y, z}, {x, y + 1.0f, z}, {x + 1.0f, y + 1.0f, z}, 1.0f, 1.0f);
+        break;
+    case 3:
+        AppendQuad(mesh, {x, y, z + 1.0f}, {x + 1.0f, y, z + 1.0f}, {x + 1.0f, y + 1.0f, z + 1.0f}, {x, y + 1.0f, z + 1.0f}, 1.0f, 1.0f);
+        break;
+    case 4:
+        AppendQuad(mesh, {x, y, z}, {x, y, z + 1.0f}, {x, y + 1.0f, z + 1.0f}, {x, y + 1.0f, z}, 1.0f, 1.0f);
+        break;
+    case 5:
+        AppendQuad(mesh, {x + 1.0f, y, z + 1.0f}, {x + 1.0f, y, z}, {x + 1.0f, y + 1.0f, z}, {x + 1.0f, y + 1.0f, z + 1.0f}, 1.0f, 1.0f);
+        break;
+    default:
+        break;
+    }
+}
+
+void VoxelWorld::AppendDetailedColumnMesh(WorldMeshData& mesh, int chunkX, int chunkZ) {
+    const int minWorldX = chunkX * kChunkSizeX;
+    const int minWorldZ = chunkZ * kChunkSizeZ;
+
+    for (int localY = 0; localY < kWorldSizeY; ++localY) {
+        for (int localZ = 0; localZ < kChunkSizeZ; ++localZ) {
+            for (int localX = 0; localX < kChunkSizeX; ++localX) {
+                const int worldX = minWorldX + localX;
+                const int worldY = localY;
+                const int worldZ = minWorldZ + localZ;
+
+                if (GetBlock(worldX, worldY, worldZ) == 0) {
+                    continue;
+                }
+
+                for (int faceIndex = 0; faceIndex < 6; ++faceIndex) {
+                    const int neighborX = worldX + kFaceNeighborOffsets[faceIndex][0];
+                    const int neighborY = worldY + kFaceNeighborOffsets[faceIndex][1];
+                    const int neighborZ = worldZ + kFaceNeighborOffsets[faceIndex][2];
+                    if (GetBlock(neighborX, neighborY, neighborZ) != 0) {
+                        continue;
+                    }
+
+                    AppendFaceQuad(mesh, worldX, worldY, worldZ, faceIndex);
+                }
+            }
+        }
+    }
+}
+
+void VoxelWorld::MarkChunkColumnModified(int chunkX, int chunkZ) {
+    if (chunkX < 0 || chunkX >= kWorldChunkCountX || chunkZ < 0 || chunkZ >= kWorldChunkCountZ) {
+        return;
+    }
+
+    modifiedColumns_.insert(MakeChunkKey(chunkX, chunkZ));
 }

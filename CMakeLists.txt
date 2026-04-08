@@ -20,6 +20,7 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(glfw-3.4)
 
 find_package(Vulkan REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 find_program(
     GLSLC_EXECUTABLE
@@ -34,13 +35,21 @@ if(NOT GLSLC_EXECUTABLE)
 endif()
 
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
+file(MAKE_DIRECTORY "${GENERATED_ASSET_DIR}")
+
+set(CHARACTER_GLB_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/assets/Character.glb")
+set(CHARACTER_MESH_OUTPUT "${GENERATED_ASSET_DIR}/character_mesh.bin")
+set(CHARACTER_TEXTURE_OUTPUT "${GENERATED_ASSET_DIR}/character_texture.bin")
 
 set(SHADER_SOURCES
     shaders/world.vert
     shaders/world.frag
     shaders/overlay.vert
     shaders/overlay.frag
+    shaders/selection.vert
+    shaders/selection.frag
 )
 
 set(SPIRV_OUTPUTS)
@@ -61,6 +70,25 @@ endforeach()
 
 add_custom_target(VulkanVoxelShaders ALL DEPENDS ${SPIRV_OUTPUTS})
 
+add_custom_command(
+    OUTPUT "${CHARACTER_MESH_OUTPUT}" "${CHARACTER_TEXTURE_OUTPUT}"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_character_glb.py"
+            "${CHARACTER_GLB_SOURCE}"
+            "${CHARACTER_MESH_OUTPUT}"
+            "${CHARACTER_TEXTURE_OUTPUT}"
+    DEPENDS
+        "${CHARACTER_GLB_SOURCE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_character_glb.py"
+    COMMENT "Extract Character.glb"
+    VERBATIM
+)
+
+add_custom_target(
+    VulkanVoxelAssets ALL
+    DEPENDS "${CHARACTER_MESH_OUTPUT}" "${CHARACTER_TEXTURE_OUTPUT}"
+)
+
 add_executable(VulkanVoxel
     MathTypes.h
     VoxelWorld.cpp
@@ -73,11 +101,14 @@ add_executable(VulkanVoxel
 )
 
 add_dependencies(VulkanVoxel VulkanVoxelShaders)
+add_dependencies(VulkanVoxel VulkanVoxelAssets)
 
 target_compile_definitions(VulkanVoxel
     PRIVATE
         SHADER_DIR="${SHADER_OUTPUT_DIR}"
         ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        CHARACTER_MESH_PATH="${CHARACTER_MESH_OUTPUT}"
+        CHARACTER_TEXTURE_PATH="${CHARACTER_TEXTURE_OUTPUT}"
 )
 
 target_link_libraries(VulkanVoxel

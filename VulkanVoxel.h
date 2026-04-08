@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <array>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,6 +35,21 @@ struct UniformBufferObject {
     Mat4 viewProj;
 };
 
+struct SelectionVertex {
+    float position[3];
+};
+
+enum class CameraViewMode {
+    FirstPerson,
+    ThirdPersonRear,
+    ThirdPersonFront,
+};
+
+enum class MovementMode {
+    Fly,
+    Walk,
+};
+
 class VulkanVoxelApp {
 public:
     int Run();
@@ -45,9 +61,21 @@ private:
     void Cleanup();
 
     void ProcessInput(float deltaTime);
+    void StepFixedPhysics();
+    float GetPhysicsInterpolationAlpha() const;
+    Vec3 GetInterpolatedCameraPosition() const;
+    Vec3 GetInterpolatedPlayerFeetPosition() const;
     Vec3 GetForwardVector() const;
     Vec3 GetHorizontalForwardVector() const;
     Vec3 GetRightVector() const;
+    Vec3 GetPlayerFeetPosition() const;
+    Vec3 GetRenderCameraPosition();
+    Vec3 GetRenderCameraForward();
+    bool IsThirdPersonView() const;
+    bool IsSolidBlockAt(int worldX, int worldY, int worldZ);
+    bool IsPlayerCollidingAt(const Vec3& eyePosition);
+    Vec3 MovePlayerAxis(const Vec3& startPosition, const Vec3& axisDelta, bool& hitNegativeY);
+    BlockRaycastHit TraceSelectedBlock();
     void UpdateWorldMeshIfNeeded();
     void ToggleFullscreen();
     void CleanupSwapChain();
@@ -66,7 +94,18 @@ private:
     void CreateTextureImage();
     void CreateTextureImageView();
     void CreateTextureSampler();
+    void LoadPlayerMesh();
+    void CreatePlayerTextureImage();
+    void CreatePlayerTextureImageView();
+    void CreatePlayerTextureSampler();
+    void CreatePlayerBuffers();
+    void UpdatePlayerRenderMesh();
+    void DestroyPlayerBuffers();
     void LoadOverlayFont();
+    void CreateSelectionBuffer();
+    void UpdateSelectionBuffer();
+    void CreateEntityColliderBuffer();
+    void UpdateEntityColliderBuffer();
     void BuildWorldMesh();
     void RequestWorldMeshBuild();
     void StartWorldMeshWorker();
@@ -169,6 +208,8 @@ private:
     VkPipeline worldPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout overlayPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline overlayPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout selectionPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline selectionPipeline_ = VK_NULL_HANDLE;
 
     VkImage depthImage_ = VK_NULL_HANDLE;
     VkDeviceMemory depthImageMemory_ = VK_NULL_HANDLE;
@@ -179,6 +220,10 @@ private:
     VkDeviceMemory textureImageMemory_ = VK_NULL_HANDLE;
     VkImageView textureImageView_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
+    VkImage playerTextureImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory playerTextureImageMemory_ = VK_NULL_HANDLE;
+    VkImageView playerTextureImageView_ = VK_NULL_HANDLE;
+    VkSampler playerTextureSampler_ = VK_NULL_HANDLE;
     VkImage overlayFontImage_ = VK_NULL_HANDLE;
     VkDeviceMemory overlayFontImageMemory_ = VK_NULL_HANDLE;
     VkImageView overlayFontImageView_ = VK_NULL_HANDLE;
@@ -187,20 +232,37 @@ private:
     VkBuffer worldVertexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory worldVertexBufferMemory_ = VK_NULL_HANDLE;
     std::uint32_t worldVertexCount_ = 0;
+    VkDeviceSize worldVertexBufferCapacity_ = 0;
     VkBuffer worldIndexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory worldIndexBufferMemory_ = VK_NULL_HANDLE;
     std::uint32_t worldIndexCount_ = 0;
+    VkDeviceSize worldIndexBufferCapacity_ = 0;
+    VkBuffer playerVertexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory playerVertexBufferMemory_ = VK_NULL_HANDLE;
+    std::uint32_t playerVertexCount_ = 0;
+    VkDeviceSize playerVertexBufferCapacity_ = 0;
+    VkBuffer playerIndexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory playerIndexBufferMemory_ = VK_NULL_HANDLE;
+    std::uint32_t playerIndexCount_ = 0;
+    VkDeviceSize playerIndexBufferCapacity_ = 0;
 
     VkBuffer overlayVertexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory overlayVertexBufferMemory_ = VK_NULL_HANDLE;
     std::vector<OverlayVertex> overlayVertices_;
     std::uint32_t overlayVertexCount_ = 0;
     bool overlayDirty_ = false;
+    VkBuffer selectionVertexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory selectionVertexBufferMemory_ = VK_NULL_HANDLE;
+    std::uint32_t selectionVertexCount_ = 0;
+    VkBuffer entityColliderVertexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory entityColliderVertexBufferMemory_ = VK_NULL_HANDLE;
+    std::uint32_t entityColliderVertexCount_ = 0;
 
     std::vector<VkBuffer> uniformBuffers_;
     std::vector<VkDeviceMemory> uniformBuffersMemory_;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> descriptorSets_;
+    std::vector<VkDescriptorSet> playerDescriptorSets_;
     std::vector<VkDescriptorSet> overlayDescriptorSets_;
 
     std::vector<VkFramebuffer> swapChainFramebuffers_;
@@ -215,16 +277,38 @@ private:
     std::size_t currentFrame_ = 0;
 
     VoxelWorld world_;
+    mutable std::shared_mutex worldMutex_;
     Vec3 cameraPosition_{256.0f, 290.0f, 340.0f};
+    Vec3 previousPhysicsCameraPosition_{256.0f, 290.0f, 340.0f};
     float cameraYaw_ = -90.0f;
     float cameraPitch_ = -35.0f;
+    CameraViewMode cameraViewMode_ = CameraViewMode::FirstPerson;
+    MovementMode movementMode_ = MovementMode::Fly;
+    float verticalVelocity_ = 0.0f;
+    bool playerGrounded_ = false;
     double lastMouseX_ = 0.0;
     double lastMouseY_ = 0.0;
     bool firstMouseSample_ = true;
     bool fullscreenEnabled_ = false;
     bool debugOverlayEnabled_ = true;
+    bool entityColliderVisible_ = false;
     bool previousF3Pressed_ = false;
+    bool previousCPressed_ = false;
+    bool f3CommandExecutedWhileHeld_ = false;
+    bool previousF5Pressed_ = false;
     bool previousF11Pressed_ = false;
+    bool previousSpacePressed_ = false;
+    bool previousLeftMousePressed_ = false;
+    bool previousRightMousePressed_ = false;
+    bool moveForwardHeld_ = false;
+    bool moveBackwardHeld_ = false;
+    bool moveRightHeld_ = false;
+    bool moveLeftHeld_ = false;
+    bool moveUpHeld_ = false;
+    bool moveDownHeld_ = false;
+    bool jumpSuppressedUntilSpaceRelease_ = false;
+    double lastSpaceTapTime_ = -1000.0;
+    double physicsAccumulatorSeconds_ = 0.0;
     int windowedPosX_ = 100;
     int windowedPosY_ = 100;
     int windowedWidth_ = 1280;
@@ -253,6 +337,20 @@ private:
     std::string presentModeString_ = "FIFO";
     std::array<FontGlyphBitmap, 128> overlayFontGlyphs_{};
     int overlayFontLineHeight_ = 0;
+    float crosshairU0_ = 0.0f;
+    float crosshairV0_ = 0.0f;
+    float crosshairU1_ = 0.0f;
+    float crosshairV1_ = 0.0f;
+    float crosshairWidth_ = 0.0f;
+    float crosshairHeight_ = 0.0f;
+    bool crosshairLoaded_ = false;
+    std::vector<WorldVertex> playerBaseVertices_;
+    std::vector<WorldVertex> playerRenderVertices_;
+    std::vector<std::uint32_t> playerIndices_;
+    Vec3 playerModelBoundsMin_{};
+    Vec3 playerModelBoundsMax_{};
+    bool playerLoaded_ = false;
+    std::optional<BlockRaycastHit> selectedBlockHit_;
 
     struct WorldMeshBuildRequest {
         int centerChunkX = 0;

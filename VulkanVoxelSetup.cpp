@@ -304,11 +304,15 @@ void VulkanVoxelApp::CreatePipelines() {
     const std::vector<char> worldFragShaderCode = ReadFile(SHADER_DIR "/world.frag.spv");
     const std::vector<char> overlayVertShaderCode = ReadFile(SHADER_DIR "/overlay.vert.spv");
     const std::vector<char> overlayFragShaderCode = ReadFile(SHADER_DIR "/overlay.frag.spv");
+    const std::vector<char> selectionVertShaderCode = ReadFile(SHADER_DIR "/selection.vert.spv");
+    const std::vector<char> selectionFragShaderCode = ReadFile(SHADER_DIR "/selection.frag.spv");
 
     const VkShaderModule worldVertShaderModule = CreateShaderModule(worldVertShaderCode);
     const VkShaderModule worldFragShaderModule = CreateShaderModule(worldFragShaderCode);
     const VkShaderModule overlayVertShaderModule = CreateShaderModule(overlayVertShaderCode);
     const VkShaderModule overlayFragShaderModule = CreateShaderModule(overlayFragShaderCode);
+    const VkShaderModule selectionVertShaderModule = CreateShaderModule(selectionVertShaderCode);
+    const VkShaderModule selectionFragShaderModule = CreateShaderModule(selectionFragShaderCode);
 
     VkPipelineShaderStageCreateInfo worldVertStage{};
     worldVertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -523,6 +527,86 @@ void VulkanVoxelApp::CreatePipelines() {
         throw std::runtime_error("Failed to create overlay pipeline.");
     }
 
+    VkPipelineShaderStageCreateInfo selectionVertStage{};
+    selectionVertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    selectionVertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    selectionVertStage.module = selectionVertShaderModule;
+    selectionVertStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo selectionFragStage{};
+    selectionFragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    selectionFragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    selectionFragStage.module = selectionFragShaderModule;
+    selectionFragStage.pName = "main";
+
+    const std::array<VkPipelineShaderStageCreateInfo, 2> selectionStages = {
+        selectionVertStage,
+        selectionFragStage,
+    };
+
+    VkVertexInputBindingDescription selectionBindingDescription{};
+    selectionBindingDescription.binding = 0;
+    selectionBindingDescription.stride = sizeof(SelectionVertex);
+    selectionBindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription selectionAttribute{};
+    selectionAttribute.binding = 0;
+    selectionAttribute.location = 0;
+    selectionAttribute.format = VK_FORMAT_R32G32B32_SFLOAT;
+    selectionAttribute.offset = offsetof(SelectionVertex, position);
+
+    VkPipelineVertexInputStateCreateInfo selectionVertexInput{};
+    selectionVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    selectionVertexInput.vertexBindingDescriptionCount = 1;
+    selectionVertexInput.pVertexBindingDescriptions = &selectionBindingDescription;
+    selectionVertexInput.vertexAttributeDescriptionCount = 1;
+    selectionVertexInput.pVertexAttributeDescriptions = &selectionAttribute;
+
+    VkPipelineInputAssemblyStateCreateInfo selectionInputAssembly = inputAssembly;
+    selectionInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+
+    VkPipelineRasterizationStateCreateInfo selectionRasterizer = rasterizer;
+    selectionRasterizer.cullMode = VK_CULL_MODE_NONE;
+
+    VkPipelineDepthStencilStateCreateInfo selectionDepthStencil = worldDepthStencil;
+    selectionDepthStencil.depthWriteEnable = VK_FALSE;
+
+    VkPipelineLayoutCreateInfo selectionLayoutInfo{};
+    selectionLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    selectionLayoutInfo.setLayoutCount = 1;
+    selectionLayoutInfo.pSetLayouts = &descriptorSetLayout_;
+
+    if (vkCreatePipelineLayout(device_, &selectionLayoutInfo, nullptr, &selectionPipelineLayout_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create selection pipeline layout.");
+    }
+
+    VkGraphicsPipelineCreateInfo selectionPipelineInfo{};
+    selectionPipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    selectionPipelineInfo.stageCount = static_cast<std::uint32_t>(selectionStages.size());
+    selectionPipelineInfo.pStages = selectionStages.data();
+    selectionPipelineInfo.pVertexInputState = &selectionVertexInput;
+    selectionPipelineInfo.pInputAssemblyState = &selectionInputAssembly;
+    selectionPipelineInfo.pViewportState = &viewportState;
+    selectionPipelineInfo.pRasterizationState = &selectionRasterizer;
+    selectionPipelineInfo.pMultisampleState = &multisampling;
+    selectionPipelineInfo.pDepthStencilState = &selectionDepthStencil;
+    selectionPipelineInfo.pColorBlendState = &colorBlending;
+    selectionPipelineInfo.layout = selectionPipelineLayout_;
+    selectionPipelineInfo.renderPass = renderPass_;
+    selectionPipelineInfo.subpass = 0;
+
+    if (vkCreateGraphicsPipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1,
+            &selectionPipelineInfo,
+            nullptr,
+            &selectionPipeline_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create selection pipeline.");
+    }
+
+    vkDestroyShaderModule(device_, selectionFragShaderModule, nullptr);
+    vkDestroyShaderModule(device_, selectionVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, overlayFragShaderModule, nullptr);
     vkDestroyShaderModule(device_, overlayVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, worldFragShaderModule, nullptr);

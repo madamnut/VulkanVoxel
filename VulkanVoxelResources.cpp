@@ -20,6 +20,14 @@
 #define ASSET_DIR "."
 #endif
 
+#ifndef CHARACTER_MESH_PATH
+#define CHARACTER_MESH_PATH "./character_mesh.bin"
+#endif
+
+#ifndef CHARACTER_TEXTURE_PATH
+#define CHARACTER_TEXTURE_PATH "./character_texture.bin"
+#endif
+
 namespace {
 
 constexpr int kMaxFramesInFlight = 2;
@@ -131,6 +139,80 @@ LoadedImage LoadImageRgba(const std::string& path) {
             image.pixels.data()
         ),
         ("Failed to copy texture pixels: " + path).c_str()
+    );
+
+    return image;
+}
+
+LoadedImage LoadImageRgbaFromMemory(const std::vector<std::uint8_t>& bytes) {
+    ComScope comScope;
+
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    ThrowIfFailed(
+        CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)
+        ),
+        "Failed to create WIC factory."
+    );
+
+    Microsoft::WRL::ComPtr<IWICStream> stream;
+    ThrowIfFailed(factory->CreateStream(&stream), "Failed to create WIC stream.");
+    ThrowIfFailed(
+        stream->InitializeFromMemory(
+            const_cast<BYTE*>(bytes.data()),
+            static_cast<DWORD>(bytes.size())
+        ),
+        "Failed to initialize WIC stream from memory."
+    );
+
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    ThrowIfFailed(
+        factory->CreateDecoderFromStream(
+            stream.Get(),
+            nullptr,
+            WICDecodeMetadataCacheOnLoad,
+            &decoder
+        ),
+        "Failed to decode image from memory."
+    );
+
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+    ThrowIfFailed(decoder->GetFrame(0, &frame), "Failed to read image frame.");
+
+    Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+    ThrowIfFailed(factory->CreateFormatConverter(&converter), "Failed to create WIC converter.");
+    ThrowIfFailed(
+        converter->Initialize(
+            frame.Get(),
+            GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom
+        ),
+        "Failed to convert memory image to RGBA."
+    );
+
+    UINT width = 0;
+    UINT height = 0;
+    ThrowIfFailed(converter->GetSize(&width, &height), "Failed to read memory image size.");
+
+    LoadedImage image{};
+    image.width = width;
+    image.height = height;
+    image.pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+
+    ThrowIfFailed(
+        converter->CopyPixels(
+            nullptr,
+            width * 4,
+            static_cast<UINT>(image.pixels.size()),
+            image.pixels.data()
+        ),
+        "Failed to copy memory image pixels."
     );
 
     return image;
@@ -257,6 +339,139 @@ void VulkanVoxelApp::CreateTextureSampler() {
 
     if (vkCreateSampler(device_, &samplerInfo, nullptr, &textureSampler_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create texture sampler.");
+    }
+}
+
+void VulkanVoxelApp::LoadPlayerMesh() {
+    std::ifstream file(CHARACTER_MESH_PATH, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open extracted player mesh.");
+    }
+
+    char magic[4] = {};
+    std::uint32_t vertexCount = 0;
+    std::uint32_t indexCount = 0;
+    file.read(magic, sizeof(magic));
+    file.read(reinterpret_cast<char*>(&vertexCount), sizeof(vertexCount));
+    file.read(reinterpret_cast<char*>(&indexCount), sizeof(indexCount));
+
+    if (std::memcmp(magic, "PMSH", 4) != 0) {
+        throw std::runtime_error("Invalid extracted player mesh format.");
+    }
+
+    playerBaseVertices_.resize(vertexCount);
+    playerRenderVertices_.resize(vertexCount);
+    playerIndices_.resize(indexCount);
+
+    file.read(
+        reinterpret_cast<char*>(playerBaseVertices_.data()),
+        static_cast<std::streamsize>(sizeof(WorldVertex) * playerBaseVertices_.size())
+    );
+    file.read(
+        reinterpret_cast<char*>(playerIndices_.data()),
+        static_cast<std::streamsize>(sizeof(std::uint32_t) * playerIndices_.size())
+    );
+
+    if (!file) {
+        throw std::runtime_error("Failed to read extracted player mesh data.");
+    }
+
+    playerIndexCount_ = indexCount;
+    playerLoaded_ = !playerBaseVertices_.empty() && !playerIndices_.empty();
+    if (!playerLoaded_) {
+        return;
+    }
+
+    playerModelBoundsMin_ = {
+        playerBaseVertices_[0].position[0],
+        playerBaseVertices_[0].position[1],
+        playerBaseVertices_[0].position[2],
+    };
+    playerModelBoundsMax_ = playerModelBoundsMin_;
+
+    for (const WorldVertex& vertex : playerBaseVertices_) {
+        playerModelBoundsMin_.x = std::min(playerModelBoundsMin_.x, vertex.position[0]);
+        playerModelBoundsMin_.y = std::min(playerModelBoundsMin_.y, vertex.position[1]);
+        playerModelBoundsMin_.z = std::min(playerModelBoundsMin_.z, vertex.position[2]);
+        playerModelBoundsMax_.x = std::max(playerModelBoundsMax_.x, vertex.position[0]);
+        playerModelBoundsMax_.y = std::max(playerModelBoundsMax_.y, vertex.position[1]);
+        playerModelBoundsMax_.z = std::max(playerModelBoundsMax_.z, vertex.position[2]);
+    }
+}
+
+void VulkanVoxelApp::CreatePlayerTextureImage() {
+    const std::vector<char> rawTextureBytes = ReadFile(CHARACTER_TEXTURE_PATH);
+    std::vector<std::uint8_t> textureBytes(rawTextureBytes.begin(), rawTextureBytes.end());
+    const LoadedImage image = LoadImageRgbaFromMemory(textureBytes);
+    const VkDeviceSize imageSize = static_cast<VkDeviceSize>(image.pixels.size());
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+    CreateBuffer(
+        imageSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        stagingBuffer,
+        stagingBufferMemory
+    );
+
+    void* mappedData = nullptr;
+    if (vkMapMemory(device_, stagingBufferMemory, 0, imageSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map player texture staging buffer.");
+    }
+
+    std::memcpy(mappedData, image.pixels.data(), image.pixels.size());
+    vkUnmapMemory(device_, stagingBufferMemory);
+
+    CreateImage(
+        image.width,
+        image.height,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        playerTextureImage_,
+        playerTextureImageMemory_
+    );
+
+    TransitionImageLayout(
+        playerTextureImage_,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    );
+    CopyBufferToImage(stagingBuffer, playerTextureImage_, image.width, image.height);
+    TransitionImageLayout(
+        playerTextureImage_,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    );
+
+    vkDestroyBuffer(device_, stagingBuffer, nullptr);
+    vkFreeMemory(device_, stagingBufferMemory, nullptr);
+}
+
+void VulkanVoxelApp::CreatePlayerTextureImageView() {
+    playerTextureImageView_ = CreateImageView(playerTextureImage_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+void VulkanVoxelApp::CreatePlayerTextureSampler() {
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+
+    if (vkCreateSampler(device_, &samplerInfo, nullptr, &playerTextureSampler_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create player texture sampler.");
     }
 }
 
@@ -415,6 +630,11 @@ void VulkanVoxelApp::LoadOverlayFont() {
     constexpr int atlasWidth = 1024;
     constexpr int atlasHeight = 1024;
     constexpr int atlasPadding = 2;
+    const std::filesystem::path crosshairPath = std::filesystem::path(ASSET_DIR) / "assets" / "Crosshair.png";
+    LoadedImage crosshairImage{};
+    if (std::filesystem::exists(crosshairPath)) {
+        crosshairImage = LoadImageRgba(crosshairPath.string());
+    }
 
     std::vector<std::uint8_t> atlasPixels(static_cast<std::size_t>(atlasWidth * atlasHeight), 0);
     int cursorX = atlasPadding;
@@ -456,6 +676,40 @@ void VulkanVoxelApp::LoadOverlayFont() {
 
         cursorX += glyph.width + atlasPadding;
         rowHeight = std::max(rowHeight, glyph.height);
+    }
+
+    crosshairLoaded_ = false;
+    if (crosshairImage.width > 0 && crosshairImage.height > 0) {
+        if (cursorX + static_cast<int>(crosshairImage.width) + atlasPadding > atlasWidth) {
+            cursorX = atlasPadding;
+            cursorY += rowHeight + atlasPadding;
+            rowHeight = 0;
+        }
+
+        if (cursorY + static_cast<int>(crosshairImage.height) + atlasPadding > atlasHeight) {
+            throw std::runtime_error("Overlay atlas is too small for crosshair.");
+        }
+
+        for (std::uint32_t y = 0; y < crosshairImage.height; ++y) {
+            for (std::uint32_t x = 0; x < crosshairImage.width; ++x) {
+                const std::size_t srcIndex = static_cast<std::size_t>((y * crosshairImage.width + x) * 4);
+                const std::uint8_t alpha = std::max({
+                    crosshairImage.pixels[srcIndex + 3],
+                    crosshairImage.pixels[srcIndex + 0],
+                    crosshairImage.pixels[srcIndex + 1],
+                    crosshairImage.pixels[srcIndex + 2]
+                });
+                atlasPixels[static_cast<std::size_t>((cursorY + static_cast<int>(y)) * atlasWidth + cursorX + static_cast<int>(x))] = alpha;
+            }
+        }
+
+        crosshairU0_ = static_cast<float>(cursorX) / static_cast<float>(atlasWidth);
+        crosshairV0_ = static_cast<float>(cursorY) / static_cast<float>(atlasHeight);
+        crosshairU1_ = static_cast<float>(cursorX + static_cast<int>(crosshairImage.width)) / static_cast<float>(atlasWidth);
+        crosshairV1_ = static_cast<float>(cursorY + static_cast<int>(crosshairImage.height)) / static_cast<float>(atlasHeight);
+        crosshairWidth_ = static_cast<float>(crosshairImage.width);
+        crosshairHeight_ = static_cast<float>(crosshairImage.height);
+        crosshairLoaded_ = true;
     }
 
     const VkDeviceSize atlasSize = static_cast<VkDeviceSize>(atlasPixels.size());
@@ -548,6 +802,126 @@ void VulkanVoxelApp::DestroyWorldMeshBuffers() {
 
     worldVertexCount_ = 0;
     worldIndexCount_ = 0;
+    worldVertexBufferCapacity_ = 0;
+    worldIndexBufferCapacity_ = 0;
+}
+
+void VulkanVoxelApp::DestroyPlayerBuffers() {
+    if (playerVertexBuffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, playerVertexBuffer_, nullptr);
+        playerVertexBuffer_ = VK_NULL_HANDLE;
+    }
+    if (playerVertexBufferMemory_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, playerVertexBufferMemory_, nullptr);
+        playerVertexBufferMemory_ = VK_NULL_HANDLE;
+    }
+    if (playerIndexBuffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, playerIndexBuffer_, nullptr);
+        playerIndexBuffer_ = VK_NULL_HANDLE;
+    }
+    if (playerIndexBufferMemory_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, playerIndexBufferMemory_, nullptr);
+        playerIndexBufferMemory_ = VK_NULL_HANDLE;
+    }
+
+    playerVertexCount_ = 0;
+    playerIndexCount_ = 0;
+    playerVertexBufferCapacity_ = 0;
+    playerIndexBufferCapacity_ = 0;
+}
+
+void VulkanVoxelApp::CreatePlayerBuffers() {
+    if (!playerLoaded_) {
+        return;
+    }
+
+    const VkDeviceSize vertexBufferSize =
+        sizeof(WorldVertex) * static_cast<VkDeviceSize>(playerBaseVertices_.size());
+    const VkDeviceSize indexBufferSize =
+        sizeof(std::uint32_t) * static_cast<VkDeviceSize>(playerIndices_.size());
+
+    if (playerVertexBuffer_ == VK_NULL_HANDLE) {
+        playerVertexBufferCapacity_ = vertexBufferSize;
+        CreateBuffer(
+            playerVertexBufferCapacity_,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            playerVertexBuffer_,
+            playerVertexBufferMemory_
+        );
+    }
+
+    if (playerIndexBuffer_ == VK_NULL_HANDLE) {
+        playerIndexBufferCapacity_ = indexBufferSize;
+        CreateBuffer(
+            playerIndexBufferCapacity_,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            playerIndexBuffer_,
+            playerIndexBufferMemory_
+        );
+
+        void* mappedData = nullptr;
+        if (vkMapMemory(device_, playerIndexBufferMemory_, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to map player index buffer.");
+        }
+        std::memcpy(mappedData, playerIndices_.data(), static_cast<std::size_t>(indexBufferSize));
+        vkUnmapMemory(device_, playerIndexBufferMemory_);
+    }
+
+    playerIndexCount_ = static_cast<std::uint32_t>(playerIndices_.size());
+    UpdatePlayerRenderMesh();
+}
+
+void VulkanVoxelApp::UpdatePlayerRenderMesh() {
+    if (!playerLoaded_ || playerVertexBuffer_ == VK_NULL_HANDLE) {
+        playerVertexCount_ = 0;
+        return;
+    }
+
+    if (!IsThirdPersonView()) {
+        playerVertexCount_ = 0;
+        return;
+    }
+
+    const float modelHeight = std::max(playerModelBoundsMax_.y - playerModelBoundsMin_.y, 0.0001f);
+    const float scale = 1.75f / modelHeight;
+    const float centerX = (playerModelBoundsMin_.x + playerModelBoundsMax_.x) * 0.5f;
+    const float centerZ = (playerModelBoundsMin_.z + playerModelBoundsMax_.z) * 0.5f;
+    const float yawRadians = (cameraYaw_ + 90.0f) * 3.14159265358979323846f / 180.0f;
+    const float cosYaw = std::cos(yawRadians);
+    const float sinYaw = std::sin(yawRadians);
+    const Vec3 playerFeet = GetInterpolatedPlayerFeetPosition();
+
+    playerRenderVertices_.resize(playerBaseVertices_.size());
+    for (std::size_t i = 0; i < playerBaseVertices_.size(); ++i) {
+        const WorldVertex& src = playerBaseVertices_[i];
+        WorldVertex& dst = playerRenderVertices_[i];
+
+        const float localX = (src.position[0] - centerX) * scale;
+        const float localY = (src.position[1] - playerModelBoundsMin_.y) * scale;
+        const float localZ = (src.position[2] - centerZ) * scale;
+
+        const float rotatedX = localX * cosYaw - localZ * sinYaw;
+        const float rotatedZ = localX * sinYaw + localZ * cosYaw;
+
+        dst.position[0] = playerFeet.x + rotatedX;
+        dst.position[1] = playerFeet.y + localY;
+        dst.position[2] = playerFeet.z + rotatedZ;
+        dst.uv[0] = src.uv[0];
+        dst.uv[1] = src.uv[1];
+    }
+
+    const VkDeviceSize vertexBufferSize =
+        sizeof(WorldVertex) * static_cast<VkDeviceSize>(playerRenderVertices_.size());
+    void* mappedData = nullptr;
+    if (vkMapMemory(device_, playerVertexBufferMemory_, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map player vertex buffer.");
+    }
+    std::memcpy(mappedData, playerRenderVertices_.data(), static_cast<std::size_t>(vertexBufferSize));
+    vkUnmapMemory(device_, playerVertexBufferMemory_);
+
+    playerVertexCount_ = static_cast<std::uint32_t>(playerRenderVertices_.size());
 }
 
 WorldMeshData VulkanVoxelApp::BuildWorldMeshData(
@@ -558,16 +932,19 @@ WorldMeshData VulkanVoxelApp::BuildWorldMeshData(
     float aspectRatio
 ) {
     WorldMeshData mesh;
-    world_.BuildVisibleMesh(
-        centerChunkX,
-        centerChunkZ,
-        std::max(kWorldChunkCountX, kWorldChunkCountZ),
-        cameraPosition,
-        cameraForward,
-        kWorldVerticalFovDegrees,
-        aspectRatio,
-        mesh
-    );
+    {
+        std::shared_lock lock(worldMutex_);
+        world_.BuildVisibleMesh(
+            centerChunkX,
+            centerChunkZ,
+            std::max(kWorldChunkCountX, kWorldChunkCountZ),
+            cameraPosition,
+            cameraForward,
+            kWorldVerticalFovDegrees,
+            aspectRatio,
+            mesh
+        );
+    }
     return mesh;
 }
 
@@ -586,72 +963,70 @@ void VulkanVoxelApp::UploadWorldMesh(const WorldMeshData& mesh) {
         );
     }
 
-    DestroyWorldMeshBuffers();
     loadedChunkCount_ = mesh.loadedChunkCount;
 
     if (mesh.vertices.empty() || mesh.indices.empty()) {
+        worldVertexCount_ = 0;
+        worldIndexCount_ = 0;
         return;
     }
 
     const VkDeviceSize vertexBufferSize = sizeof(WorldVertex) * static_cast<VkDeviceSize>(mesh.vertices.size());
     const VkDeviceSize indexBufferSize = sizeof(std::uint32_t) * static_cast<VkDeviceSize>(mesh.indices.size());
 
-    VkBuffer vertexStagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory vertexStagingMemory = VK_NULL_HANDLE;
-    CreateBuffer(
-        vertexBufferSize,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        vertexStagingBuffer,
-        vertexStagingMemory
-    );
-
     void* mappedData = nullptr;
-    if (vkMapMemory(device_, vertexStagingMemory, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to map world vertex staging buffer.");
+
+    if (worldVertexBuffer_ == VK_NULL_HANDLE || worldVertexBufferCapacity_ < vertexBufferSize) {
+        if (worldVertexBuffer_ != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, worldVertexBuffer_, nullptr);
+            worldVertexBuffer_ = VK_NULL_HANDLE;
+        }
+        if (worldVertexBufferMemory_ != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, worldVertexBufferMemory_, nullptr);
+            worldVertexBufferMemory_ = VK_NULL_HANDLE;
+        }
+
+        worldVertexBufferCapacity_ = std::max(vertexBufferSize, worldVertexBufferCapacity_ * 2);
+        CreateBuffer(
+            worldVertexBufferCapacity_,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            worldVertexBuffer_,
+            worldVertexBufferMemory_
+        );
+    }
+
+    if (vkMapMemory(device_, worldVertexBufferMemory_, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map world vertex buffer.");
     }
     std::memcpy(mappedData, mesh.vertices.data(), static_cast<std::size_t>(vertexBufferSize));
-    vkUnmapMemory(device_, vertexStagingMemory);
+    vkUnmapMemory(device_, worldVertexBufferMemory_);
 
-    CreateBuffer(
-        vertexBufferSize,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        worldVertexBuffer_,
-        worldVertexBufferMemory_
-    );
-    CopyBuffer(vertexStagingBuffer, worldVertexBuffer_, vertexBufferSize);
+    if (worldIndexBuffer_ == VK_NULL_HANDLE || worldIndexBufferCapacity_ < indexBufferSize) {
+        if (worldIndexBuffer_ != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, worldIndexBuffer_, nullptr);
+            worldIndexBuffer_ = VK_NULL_HANDLE;
+        }
+        if (worldIndexBufferMemory_ != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, worldIndexBufferMemory_, nullptr);
+            worldIndexBufferMemory_ = VK_NULL_HANDLE;
+        }
 
-    vkDestroyBuffer(device_, vertexStagingBuffer, nullptr);
-    vkFreeMemory(device_, vertexStagingMemory, nullptr);
+        worldIndexBufferCapacity_ = std::max(indexBufferSize, worldIndexBufferCapacity_ * 2);
+        CreateBuffer(
+            worldIndexBufferCapacity_,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            worldIndexBuffer_,
+            worldIndexBufferMemory_
+        );
+    }
 
-    VkBuffer indexStagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory indexStagingMemory = VK_NULL_HANDLE;
-    CreateBuffer(
-        indexBufferSize,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        indexStagingBuffer,
-        indexStagingMemory
-    );
-
-    if (vkMapMemory(device_, indexStagingMemory, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to map world index staging buffer.");
+    if (vkMapMemory(device_, worldIndexBufferMemory_, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map world index buffer.");
     }
     std::memcpy(mappedData, mesh.indices.data(), static_cast<std::size_t>(indexBufferSize));
-    vkUnmapMemory(device_, indexStagingMemory);
-
-    CreateBuffer(
-        indexBufferSize,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        worldIndexBuffer_,
-        worldIndexBufferMemory_
-    );
-    CopyBuffer(indexStagingBuffer, worldIndexBuffer_, indexBufferSize);
-
-    vkDestroyBuffer(device_, indexStagingBuffer, nullptr);
-    vkFreeMemory(device_, indexStagingMemory, nullptr);
+    vkUnmapMemory(device_, worldIndexBufferMemory_);
 
     worldVertexCount_ = static_cast<std::uint32_t>(mesh.vertices.size());
     worldIndexCount_ = static_cast<std::uint32_t>(mesh.indices.size());
@@ -788,6 +1163,30 @@ void VulkanVoxelApp::CreateOverlayBuffer() {
     UploadOverlayVertices();
 }
 
+void VulkanVoxelApp::CreateSelectionBuffer() {
+    CreateBuffer(
+        sizeof(SelectionVertex) * 24,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        selectionVertexBuffer_,
+        selectionVertexBufferMemory_
+    );
+
+    UpdateSelectionBuffer();
+}
+
+void VulkanVoxelApp::CreateEntityColliderBuffer() {
+    CreateBuffer(
+        sizeof(SelectionVertex) * 24,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        entityColliderVertexBuffer_,
+        entityColliderVertexBufferMemory_
+    );
+
+    UpdateEntityColliderBuffer();
+}
+
 void VulkanVoxelApp::CreateUniformBuffers() {
     uniformBuffers_.resize(kMaxFramesInFlight);
     uniformBuffersMemory_.resize(kMaxFramesInFlight);
@@ -805,15 +1204,15 @@ void VulkanVoxelApp::CreateUniformBuffers() {
 
 void VulkanVoxelApp::CreateDescriptorPool() {
     const std::array<VkDescriptorPoolSize, 2> poolSizes = {{
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight * 2},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 2},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight * 3},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 3},
     }};
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = kMaxFramesInFlight * 2;
+    poolInfo.maxSets = kMaxFramesInFlight * 3;
 
     if (vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create descriptor pool.");
@@ -832,6 +1231,11 @@ void VulkanVoxelApp::CreateDescriptorSets() {
     descriptorSets_.resize(kMaxFramesInFlight);
     if (vkAllocateDescriptorSets(device_, &allocInfo, descriptorSets_.data()) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate descriptor sets.");
+    }
+
+    playerDescriptorSets_.resize(kMaxFramesInFlight);
+    if (vkAllocateDescriptorSets(device_, &allocInfo, playerDescriptorSets_.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate player descriptor sets.");
     }
 
     overlayDescriptorSets_.resize(kMaxFramesInFlight);
@@ -870,6 +1274,34 @@ void VulkanVoxelApp::CreateDescriptorSets() {
             device_,
             static_cast<std::uint32_t>(descriptorWrites.size()),
             descriptorWrites.data(),
+            0,
+            nullptr
+        );
+
+        VkDescriptorImageInfo playerImageInfo{};
+        playerImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        playerImageInfo.imageView = playerTextureImageView_;
+        playerImageInfo.sampler = playerTextureSampler_;
+
+        std::array<VkWriteDescriptorSet, 2> playerWrites{};
+        playerWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        playerWrites[0].dstSet = playerDescriptorSets_[i];
+        playerWrites[0].dstBinding = 0;
+        playerWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        playerWrites[0].descriptorCount = 1;
+        playerWrites[0].pBufferInfo = &bufferInfo;
+
+        playerWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        playerWrites[1].dstSet = playerDescriptorSets_[i];
+        playerWrites[1].dstBinding = 1;
+        playerWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        playerWrites[1].descriptorCount = 1;
+        playerWrites[1].pImageInfo = &playerImageInfo;
+
+        vkUpdateDescriptorSets(
+            device_,
+            static_cast<std::uint32_t>(playerWrites.size()),
+            playerWrites.data(),
             0,
             nullptr
         );

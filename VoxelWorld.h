@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 constexpr int kWorldSizeX = 512;
@@ -36,18 +37,6 @@ struct OverlayVertex {
     float color[3];
 };
 
-struct SubChunk {
-    std::array<std::uint8_t, kSubChunkSize * kSubChunkSize * kSubChunkSize> blocks{};
-    bool isEmpty = true;
-    bool isFull = false;
-};
-
-struct ChunkColumn {
-    int chunkX = 0;
-    int chunkZ = 0;
-    std::array<SubChunk, kSubChunkCountY> subChunks{};
-};
-
 struct FontGlyphBitmap {
     int width = 0;
     int height = 0;
@@ -62,10 +51,24 @@ struct FontGlyphBitmap {
     std::vector<std::uint8_t> alpha;
 };
 
+struct BlockRaycastHit {
+    bool hit = false;
+    int blockX = 0;
+    int blockY = 0;
+    int blockZ = 0;
+    int placeX = 0;
+    int placeY = 0;
+    int placeZ = 0;
+};
+
 class VoxelWorld {
 public:
+    static bool IsInsideWorld(int worldX, int worldY, int worldZ);
     void EnsureChunkColumn(int chunkX, int chunkZ);
     void EnsureRange(int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ);
+    std::uint8_t GetBlock(int worldX, int worldY, int worldZ);
+    bool SetBlock(int worldX, int worldY, int worldZ, std::uint8_t blockValue);
+    bool IsChunkColumnModified(int chunkX, int chunkZ) const;
     void BuildVisibleMesh(
         int centerChunkX,
         int centerChunkZ,
@@ -80,10 +83,11 @@ public:
 
 private:
     static std::int64_t MakeChunkKey(int chunkX, int chunkZ);
+    static std::size_t GetBlockIndex(int worldX, int worldY, int worldZ);
     static int GetSubChunkIndex(int worldY);
     static int GetSubChunkBlockIndex(int localX, int localY, int localZ);
 
-    void GenerateChunkColumn(ChunkColumn& column) const;
+    void EnsureInitialized();
     static bool IsChunkInsideFrustum(
         int chunkX,
         int chunkZ,
@@ -97,6 +101,17 @@ private:
     void AppendSouthQuad(WorldMeshData& mesh, int startX, int width) const;
     void AppendWestQuad(WorldMeshData& mesh, int startZ, int depth) const;
     void AppendEastQuad(WorldMeshData& mesh, int startZ, int depth) const;
+    void AppendFaceQuad(
+        WorldMeshData& mesh,
+        int worldX,
+        int worldY,
+        int worldZ,
+        int faceIndex
+    ) const;
+    void AppendDetailedColumnMesh(WorldMeshData& mesh, int chunkX, int chunkZ);
+    void MarkChunkColumnModified(int chunkX, int chunkZ);
 
-    std::unordered_map<std::int64_t, ChunkColumn> columns_;
+    std::vector<std::uint8_t> blocks_;
+    bool initialized_ = false;
+    std::unordered_set<std::int64_t> modifiedColumns_;
 };
