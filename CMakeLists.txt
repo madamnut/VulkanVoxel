@@ -12,7 +12,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# GLFW side targets off
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -20,10 +19,8 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(glfw-3.4)
 
-# Vulkan SDK
 find_package(Vulkan REQUIRED)
 
-# Shader compiler
 find_program(
     GLSLC_EXECUTABLE
     NAMES glslc
@@ -40,8 +37,10 @@ set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 
 set(SHADER_SOURCES
-    shaders/triangle.vert
-    shaders/triangle.frag
+    shaders/world.vert
+    shaders/world.frag
+    shaders/overlay.vert
+    shaders/overlay.frag
 )
 
 set(SPIRV_OUTPUTS)
@@ -63,8 +62,14 @@ endforeach()
 add_custom_target(VulkanVoxelShaders ALL DEPENDS ${SPIRV_OUTPUTS})
 
 add_executable(VulkanVoxel
-    VulkanVoxel.cpp
+    MathTypes.h
+    VoxelWorld.cpp
+    VoxelWorld.h
     VulkanVoxel.h
+    VulkanVoxel.cpp
+    VulkanVoxelDraw.cpp
+    VulkanVoxelResources.cpp
+    VulkanVoxelSetup.cpp
 )
 
 add_dependencies(VulkanVoxel VulkanVoxelShaders)
@@ -72,15 +77,19 @@ add_dependencies(VulkanVoxel VulkanVoxelShaders)
 target_compile_definitions(VulkanVoxel
     PRIVATE
         SHADER_DIR="${SHADER_OUTPUT_DIR}"
+        ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(VulkanVoxel
     PRIVATE
         glfw
         Vulkan::Vulkan
+        dxgi
+        advapi32
+        windowscodecs
+        ole32
 )
 
-# Warnings
 if(MSVC)
     target_compile_options(VulkanVoxel PRIVATE /W4 /permissive-)
 else()
