@@ -34,6 +34,9 @@ constexpr double kMovementToggleTapWindowSeconds = 0.3;
 constexpr int kPhysicsTicksPerSecond = 20;
 constexpr float kPhysicsDeltaTime = 1.0f / static_cast<float>(kPhysicsTicksPerSecond);
 constexpr int kMaxPhysicsStepsPerFrame = 8;
+constexpr std::uint64_t kDayLengthTicks = 24ull * 60ull * kPhysicsTicksPerSecond;
+constexpr std::uint64_t kHourLengthTicks = 60ull * kPhysicsTicksPerSecond;
+constexpr std::uint64_t kMinuteLengthTicks = kPhysicsTicksPerSecond;
 constexpr float kMouseSensitivity = 0.08f;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr const char* kWindowTitle = "VulkanVoxel";
@@ -111,6 +114,35 @@ void AppendOverlayQuad(
     vertices.push_back(topLeft);
     vertices.push_back(bottomRight);
     vertices.push_back(bottomLeft);
+}
+
+bool ProjectDirectionToScreen(
+    const Vec3& direction,
+    const Vec3& cameraForward,
+    const Vec3& cameraRight,
+    const Vec3& cameraUp,
+    float tanHalfFovX,
+    float tanHalfFovY,
+    const VkExtent2D& extent,
+    float& outCenterX,
+    float& outCenterY
+) {
+    const float viewX = Dot(direction, cameraRight);
+    const float viewY = Dot(direction, cameraUp);
+    const float viewZ = Dot(direction, cameraForward);
+    if (viewZ <= 0.0001f) {
+        return false;
+    }
+
+    const float ndcX = viewX / (viewZ * tanHalfFovX);
+    const float ndcY = viewY / (viewZ * tanHalfFovY);
+    if (ndcX < -1.2f || ndcX > 1.2f || ndcY < -1.2f || ndcY > 1.2f) {
+        return false;
+    }
+
+    outCenterX = (ndcX * 0.5f + 0.5f) * static_cast<float>(extent.width);
+    outCenterY = (0.5f - ndcY * 0.5f) * static_cast<float>(extent.height);
+    return true;
 }
 
 void AppendGlyph(
@@ -222,6 +254,19 @@ std::string FormatVersion(std::uint32_t version) {
     return stream.str();
 }
 
+std::string FormatGameTime(std::uint64_t globalTick) {
+    const std::uint64_t day = globalTick / kDayLengthTicks + 1;
+    const std::uint64_t dayTick = globalTick % kDayLengthTicks;
+    const std::uint64_t hour = dayTick / kHourLengthTicks;
+    const std::uint64_t minute = (dayTick % kHourLengthTicks) / kMinuteLengthTicks;
+
+    std::ostringstream stream;
+    stream << "TIME: DAY " << day << ' '
+           << std::setw(2) << std::setfill('0') << hour << ':'
+           << std::setw(2) << std::setfill('0') << minute;
+    return stream.str();
+}
+
 std::string FormatDriverVersion(std::uint32_t vendorId, std::uint32_t version) {
     std::ostringstream stream;
 
@@ -265,6 +310,21 @@ float WrapAngle180(float angleDegrees) {
         angleDegrees += 360.0f;
     }
     return angleDegrees;
+}
+
+const char* GetCardinalDirectionLabel(float yawDegrees) {
+    const float wrappedYaw = WrapAngle180(yawDegrees);
+
+    if (wrappedYaw >= -45.0f && wrappedYaw < 45.0f) {
+        return "EAST";
+    }
+    if (wrappedYaw >= 45.0f && wrappedYaw < 135.0f) {
+        return "SOUTH";
+    }
+    if (wrappedYaw >= -135.0f && wrappedYaw < -45.0f) {
+        return "NORTH";
+    }
+    return "WEST";
 }
 
 }  // namespace
@@ -562,6 +622,14 @@ void VulkanVoxelApp::Cleanup() {
         if (overlayVertexBufferMemory_ != VK_NULL_HANDLE) {
             vkFreeMemory(device_, overlayVertexBufferMemory_, nullptr);
         }
+        for (std::size_t i = 0; i < celestialVertexBuffers_.size(); ++i) {
+            if (celestialVertexBuffers_[i] != VK_NULL_HANDLE) {
+                vkDestroyBuffer(device_, celestialVertexBuffers_[i], nullptr);
+            }
+            if (celestialVertexBuffersMemory_[i] != VK_NULL_HANDLE) {
+                vkFreeMemory(device_, celestialVertexBuffersMemory_[i], nullptr);
+            }
+        }
         if (selectionVertexBuffer_ != VK_NULL_HANDLE) {
             vkDestroyBuffer(device_, selectionVertexBuffer_, nullptr);
         }
@@ -586,14 +654,44 @@ void VulkanVoxelApp::Cleanup() {
         if (overlayFontSampler_ != VK_NULL_HANDLE) {
             vkDestroySampler(device_, overlayFontSampler_, nullptr);
         }
+        if (sunSampler_ != VK_NULL_HANDLE) {
+            vkDestroySampler(device_, sunSampler_, nullptr);
+        }
+        if (moonSampler_ != VK_NULL_HANDLE) {
+            vkDestroySampler(device_, moonSampler_, nullptr);
+        }
         if (overlayFontImageView_ != VK_NULL_HANDLE) {
             vkDestroyImageView(device_, overlayFontImageView_, nullptr);
+        }
+        if (sunImageView_ != VK_NULL_HANDLE) {
+            vkDestroyImageView(device_, sunImageView_, nullptr);
+        }
+        if (moonImageView_ != VK_NULL_HANDLE) {
+            vkDestroyImageView(device_, moonImageView_, nullptr);
         }
         if (overlayFontImage_ != VK_NULL_HANDLE) {
             vkDestroyImage(device_, overlayFontImage_, nullptr);
         }
+        if (sunImage_ != VK_NULL_HANDLE) {
+            vkDestroyImage(device_, sunImage_, nullptr);
+        }
+        if (moonImage_ != VK_NULL_HANDLE) {
+            vkDestroyImage(device_, moonImage_, nullptr);
+        }
         if (overlayFontImageMemory_ != VK_NULL_HANDLE) {
             vkFreeMemory(device_, overlayFontImageMemory_, nullptr);
+        }
+        if (sunImageMemory_ != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, sunImageMemory_, nullptr);
+        }
+        if (moonImageMemory_ != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, moonImageMemory_, nullptr);
+        }
+        if (screenshotStagingBuffer_ != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, screenshotStagingBuffer_, nullptr);
+        }
+        if (screenshotStagingBufferMemory_ != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, screenshotStagingBufferMemory_, nullptr);
         }
         if (textureImageView_ != VK_NULL_HANDLE) {
             vkDestroyImageView(device_, textureImageView_, nullptr);
@@ -648,6 +746,14 @@ void VulkanVoxelApp::CleanupSwapChain() {
     }
     swapChainFramebuffers_.clear();
 
+    if (skyPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, skyPipeline_, nullptr);
+        skyPipeline_ = VK_NULL_HANDLE;
+    }
+    if (skyPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, skyPipelineLayout_, nullptr);
+        skyPipelineLayout_ = VK_NULL_HANDLE;
+    }
     if (overlayPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, overlayPipeline_, nullptr);
         overlayPipeline_ = VK_NULL_HANDLE;
@@ -782,6 +888,7 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
 
     const bool isF3Pressed = glfwGetKey(window_, GLFW_KEY_F3) == GLFW_PRESS;
     const bool isCPressed = glfwGetKey(window_, GLFW_KEY_C) == GLFW_PRESS;
+    const bool isF2Pressed = glfwGetKey(window_, GLFW_KEY_F2) == GLFW_PRESS;
     if (!isF3Pressed && previousF3Pressed_ && !f3CommandExecutedWhileHeld_) {
         debugOverlayEnabled_ = !debugOverlayEnabled_;
         RebuildOverlayVertices();
@@ -800,6 +907,11 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
 
     previousF3Pressed_ = isF3Pressed;
     previousCPressed_ = isCPressed;
+
+    if (isF2Pressed && !previousF2Pressed_) {
+        screenshotRequested_ = true;
+    }
+    previousF2Pressed_ = isF2Pressed;
 
     const bool isF5Pressed = glfwGetKey(window_, GLFW_KEY_F5) == GLFW_PRESS;
     if (isF5Pressed && !previousF5Pressed_) {
@@ -976,6 +1088,8 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
 }
 
 void VulkanVoxelApp::StepFixedPhysics() {
+    ++globalTick_;
+
     if (movementMode_ != MovementMode::Walk) {
         return;
     }
@@ -1236,6 +1350,7 @@ void VulkanVoxelApp::LoadStaticDebugInfo() {
 
 void VulkanVoxelApp::RebuildOverlayVertices() {
     overlayVertices_.clear();
+    celestialVertexCount_ = 0;
 
     if (crosshairLoaded_) {
         const float width = crosshairWidth_;
@@ -1285,19 +1400,9 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     );
     leftLines.push_back(
         "ROT: YAW " + FormatFloat(cameraYaw_, 2) +
-        " PITCH " + FormatFloat(cameraPitch_, 2)
+        " PITCH " + FormatFloat(cameraPitch_, 2) +
+        " [" + std::string(GetCardinalDirectionLabel(cameraYaw_)) + "]"
     );
-    leftLines.push_back(
-        cameraViewMode_ == CameraViewMode::FirstPerson
-            ? "VIEW: FIRST"
-            : (cameraViewMode_ == CameraViewMode::ThirdPersonRear ? "VIEW: THIRD REAR" : "VIEW: THIRD FRONT")
-    );
-    leftLines.push_back(
-        movementMode_ == MovementMode::Fly
-            ? "MOVE: FLY"
-            : (playerGrounded_ ? "MOVE: WALK GROUND" : "MOVE: WALK AIR")
-    );
-    leftLines.push_back(entityColliderVisible_ ? "ECOLL: ON" : "ECOLL: OFF");
     leftLines.push_back(
         "CHUNK: X " + std::to_string(chunkX) +
         " Z " + std::to_string(chunkZ) +
@@ -1305,6 +1410,7 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     );
     leftLines.push_back("LOADED CHUNKS: " + std::to_string(loadedChunkCount_));
     leftLines.push_back("FACE COUNT: " + std::to_string(faceCount));
+    leftLines.push_back(FormatGameTime(globalTick_));
 
     rightLines.push_back("GPU: " + gpuName_);
     rightLines.push_back("CPU: " + cpuName_);
@@ -1317,10 +1423,8 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     rightLines.push_back(
         "RES: " + std::to_string(swapChainExtent_.width) + " X " + std::to_string(swapChainExtent_.height)
     );
-    rightLines.push_back("API: " + apiVersionString_);
+    rightLines.push_back("API: VULKAN " + apiVersionString_);
     rightLines.push_back("DRIVER: " + driverVersionString_);
-    rightLines.push_back("RENDERER: " + rendererName_);
-    rightLines.push_back("PRESENT: " + presentModeString_);
     rightLines.push_back("DRAW CALLS: " + std::to_string(drawCallCount_));
     rightLines.push_back("VERTEX COUNT: " + std::to_string(worldVertexCount_));
     rightLines.push_back("TRIANGLE COUNT: " + std::to_string(triangleCount));
@@ -1363,6 +1467,101 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     }
 
     overlayVertexCount_ = static_cast<std::uint32_t>(overlayVertices_.size());
+}
+
+void VulkanVoxelApp::UpdateCelestialVertices(std::uint32_t frameIndex) {
+    sunVertexCount_ = 0;
+    moonVertexCount_ = 0;
+    celestialVertexCount_ = 0;
+
+    if (frameIndex >= celestialVertexBuffersMemory_.size() || celestialVertexBuffersMemory_[frameIndex] == VK_NULL_HANDLE) {
+        return;
+    }
+
+    std::vector<OverlayVertex> celestialVertices;
+    celestialVertices.reserve(12);
+
+    const Vec3 renderCameraForward = GetRenderCameraForward();
+    Vec3 renderCameraRight = Normalize(Cross(renderCameraForward, {0.0f, 1.0f, 0.0f}));
+    if (Length(renderCameraRight) <= 0.0001f) {
+        renderCameraRight = {1.0f, 0.0f, 0.0f};
+    }
+    const Vec3 renderCameraUp = Normalize(Cross(renderCameraRight, renderCameraForward));
+    const float aspectRatio = swapChainExtent_.height > 0
+        ? static_cast<float>(swapChainExtent_.width) / static_cast<float>(swapChainExtent_.height)
+        : 16.0f / 9.0f;
+    const float tanHalfFovY = std::tan(70.0f * 0.5f * kPi / 180.0f);
+    const float tanHalfFovX = tanHalfFovY * aspectRatio;
+
+    const double fractionalTick = static_cast<double>(globalTick_) +
+        physicsAccumulatorSeconds_ * static_cast<double>(kPhysicsTicksPerSecond);
+    const double dayFraction = std::fmod(fractionalTick, static_cast<double>(kDayLengthTicks)) /
+        static_cast<double>(kDayLengthTicks);
+    const float sunAngleRadians = static_cast<float>(dayFraction * 2.0 * kPi - kPi * 0.5);
+    const Vec3 sunDirection = Normalize({std::cos(sunAngleRadians), std::sin(sunAngleRadians), 0.0f});
+    const Vec3 moonDirection = sunDirection * -1.0f;
+
+    const auto appendCelestialBody = [&](bool loaded, const Vec3& direction, float u0, float v0, float u1, float v1, float width, float height, std::uint32_t& outVertexCount) {
+        if (!loaded) {
+            outVertexCount = 0;
+            return;
+        }
+
+        float centerX = 0.0f;
+        float centerY = 0.0f;
+        if (!ProjectDirectionToScreen(
+                direction,
+                renderCameraForward,
+                renderCameraRight,
+                renderCameraUp,
+                tanHalfFovX,
+                tanHalfFovY,
+                swapChainExtent_,
+                centerX,
+                centerY)) {
+            outVertexCount = 0;
+            return;
+        }
+
+        const std::size_t beforeCount = celestialVertices.size();
+        const float scaledWidth = width * 0.5f;
+        const float scaledHeight = height * 0.5f;
+        const float left = centerX - scaledWidth * 0.5f;
+        const float top = centerY - scaledHeight * 0.5f;
+        AppendOverlayQuad(
+            celestialVertices,
+            left,
+            top,
+            left + scaledWidth,
+            top + scaledHeight,
+            u0,
+            v0,
+            u1,
+            v1,
+            1.0f,
+            1.0f,
+            1.0f,
+            swapChainExtent_
+        );
+        outVertexCount = static_cast<std::uint32_t>(celestialVertices.size() - beforeCount);
+    };
+
+    appendCelestialBody(sunLoaded_, sunDirection, sunU0_, sunV0_, sunU1_, sunV1_, sunWidth_, sunHeight_, sunVertexCount_);
+    appendCelestialBody(moonLoaded_, moonDirection, moonU0_, moonV0_, moonU1_, moonV1_, moonWidth_, moonHeight_, moonVertexCount_);
+    celestialVertexCount_ = static_cast<std::uint32_t>(celestialVertices.size());
+
+    if (celestialVertices.empty()) {
+        return;
+    }
+
+    void* mappedData = nullptr;
+    const VkDeviceSize dataSize = sizeof(OverlayVertex) * static_cast<VkDeviceSize>(celestialVertices.size());
+    if (vkMapMemory(device_, celestialVertexBuffersMemory_[frameIndex], 0, dataSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map celestial vertex buffer.");
+    }
+
+    std::memcpy(mappedData, celestialVertices.data(), static_cast<std::size_t>(dataSize));
+    vkUnmapMemory(device_, celestialVertexBuffersMemory_[frameIndex]);
 }
 
 void VulkanVoxelApp::UploadOverlayVertices() {

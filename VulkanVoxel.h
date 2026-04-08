@@ -33,6 +33,10 @@ struct SwapChainSupportDetails {
 
 struct UniformBufferObject {
     Mat4 viewProj;
+    float cameraRight[4];
+    float cameraUp[4];
+    float cameraForward[4];
+    float projectionParams[4];
 };
 
 struct SelectionVertex {
@@ -129,8 +133,17 @@ private:
     void CreateCommandBuffers();
     void CreateSyncObjects();
     void DrawFrame();
+    void PrepareScreenshotCapture();
+    void RecordScreenshotCopyCommands(VkCommandBuffer commandBuffer, std::uint32_t imageIndex);
+    void FinalizeScreenshotCapture();
+    void SaveScreenshotPng(
+        const std::vector<std::uint8_t>& rgbaPixels,
+        std::uint32_t width,
+        std::uint32_t height
+    ) const;
     void UpdateUniformBuffer(std::uint32_t frameIndex);
     void UpdateOverlayText(float deltaTime);
+    void UpdateCelestialVertices(std::uint32_t frameIndex);
     void RefreshSystemUsageStats();
     void LoadStaticDebugInfo();
     void RebuildOverlayVertices();
@@ -206,6 +219,8 @@ private:
 
     VkPipelineLayout worldPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline worldPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout skyPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline skyPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout overlayPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline overlayPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout selectionPipelineLayout_ = VK_NULL_HANDLE;
@@ -228,6 +243,14 @@ private:
     VkDeviceMemory overlayFontImageMemory_ = VK_NULL_HANDLE;
     VkImageView overlayFontImageView_ = VK_NULL_HANDLE;
     VkSampler overlayFontSampler_ = VK_NULL_HANDLE;
+    VkImage sunImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory sunImageMemory_ = VK_NULL_HANDLE;
+    VkImageView sunImageView_ = VK_NULL_HANDLE;
+    VkSampler sunSampler_ = VK_NULL_HANDLE;
+    VkImage moonImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory moonImageMemory_ = VK_NULL_HANDLE;
+    VkImageView moonImageView_ = VK_NULL_HANDLE;
+    VkSampler moonSampler_ = VK_NULL_HANDLE;
 
     VkBuffer worldVertexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory worldVertexBufferMemory_ = VK_NULL_HANDLE;
@@ -248,7 +271,12 @@ private:
 
     VkBuffer overlayVertexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory overlayVertexBufferMemory_ = VK_NULL_HANDLE;
+    std::vector<VkBuffer> celestialVertexBuffers_;
+    std::vector<VkDeviceMemory> celestialVertexBuffersMemory_;
     std::vector<OverlayVertex> overlayVertices_;
+    std::uint32_t sunVertexCount_ = 0;
+    std::uint32_t moonVertexCount_ = 0;
+    std::uint32_t celestialVertexCount_ = 0;
     std::uint32_t overlayVertexCount_ = 0;
     bool overlayDirty_ = false;
     VkBuffer selectionVertexBuffer_ = VK_NULL_HANDLE;
@@ -264,6 +292,8 @@ private:
     std::vector<VkDescriptorSet> descriptorSets_;
     std::vector<VkDescriptorSet> playerDescriptorSets_;
     std::vector<VkDescriptorSet> overlayDescriptorSets_;
+    std::vector<VkDescriptorSet> sunDescriptorSets_;
+    std::vector<VkDescriptorSet> moonDescriptorSets_;
 
     std::vector<VkFramebuffer> swapChainFramebuffers_;
 
@@ -295,6 +325,7 @@ private:
     bool previousF3Pressed_ = false;
     bool previousCPressed_ = false;
     bool f3CommandExecutedWhileHeld_ = false;
+    bool previousF2Pressed_ = false;
     bool previousF5Pressed_ = false;
     bool previousF11Pressed_ = false;
     bool previousSpacePressed_ = false;
@@ -313,6 +344,7 @@ private:
     int windowedPosY_ = 100;
     int windowedWidth_ = 1280;
     int windowedHeight_ = 720;
+    std::uint64_t globalTick_ = 7200;
 
     std::uint32_t frameCounter_ = 0;
     std::uint32_t currentFps_ = 0;
@@ -344,6 +376,20 @@ private:
     float crosshairWidth_ = 0.0f;
     float crosshairHeight_ = 0.0f;
     bool crosshairLoaded_ = false;
+    float sunU0_ = 0.0f;
+    float sunV0_ = 0.0f;
+    float sunU1_ = 0.0f;
+    float sunV1_ = 0.0f;
+    float sunWidth_ = 0.0f;
+    float sunHeight_ = 0.0f;
+    bool sunLoaded_ = false;
+    float moonU0_ = 0.0f;
+    float moonV0_ = 0.0f;
+    float moonU1_ = 0.0f;
+    float moonV1_ = 0.0f;
+    float moonWidth_ = 0.0f;
+    float moonHeight_ = 0.0f;
+    bool moonLoaded_ = false;
     std::vector<WorldVertex> playerBaseVertices_;
     std::vector<WorldVertex> playerRenderVertices_;
     std::vector<std::uint32_t> playerIndices_;
@@ -351,6 +397,13 @@ private:
     Vec3 playerModelBoundsMax_{};
     bool playerLoaded_ = false;
     std::optional<BlockRaycastHit> selectedBlockHit_;
+    bool screenshotRequested_ = false;
+    bool screenshotCapturePending_ = false;
+    VkBuffer screenshotStagingBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory screenshotStagingBufferMemory_ = VK_NULL_HANDLE;
+    VkDeviceSize screenshotStagingBufferSize_ = 0;
+    std::uint32_t screenshotWidth_ = 0;
+    std::uint32_t screenshotHeight_ = 0;
 
     struct WorldMeshBuildRequest {
         int centerChunkX = 0;

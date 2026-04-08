@@ -32,6 +32,7 @@ namespace {
 
 constexpr int kMaxFramesInFlight = 2;
 constexpr std::size_t kMaxOverlayVertexCount = 4194304;
+constexpr std::size_t kMaxCelestialVertexCount = 12;
 constexpr float kWorldVerticalFovDegrees = 70.0f;
 
 struct LoadedImage {
@@ -39,6 +40,19 @@ struct LoadedImage {
     std::uint32_t height = 0;
     std::vector<std::uint8_t> pixels;
 };
+
+void PremultiplyAlpha(LoadedImage& image) {
+    if (image.width == 0 || image.height == 0 || image.pixels.empty()) {
+        return;
+    }
+
+    for (std::size_t i = 0; i < image.pixels.size(); i += 4) {
+        const std::uint32_t alpha = image.pixels[i + 3];
+        image.pixels[i + 0] = static_cast<std::uint8_t>((static_cast<std::uint32_t>(image.pixels[i + 0]) * alpha) / 255);
+        image.pixels[i + 1] = static_cast<std::uint8_t>((static_cast<std::uint32_t>(image.pixels[i + 1]) * alpha) / 255);
+        image.pixels[i + 2] = static_cast<std::uint8_t>((static_cast<std::uint32_t>(image.pixels[i + 2]) * alpha) / 255);
+    }
+}
 
 struct ComScope {
     bool shouldUninitialize = false;
@@ -631,12 +645,25 @@ void VulkanVoxelApp::LoadOverlayFont() {
     constexpr int atlasHeight = 1024;
     constexpr int atlasPadding = 2;
     const std::filesystem::path crosshairPath = std::filesystem::path(ASSET_DIR) / "assets" / "Crosshair.png";
+    const std::filesystem::path sunPath = std::filesystem::path(ASSET_DIR) / "assets" / "Sun.png";
+    const std::filesystem::path moonPath = std::filesystem::path(ASSET_DIR) / "assets" / "Moon.png";
     LoadedImage crosshairImage{};
+    LoadedImage sunImage{};
+    LoadedImage moonImage{};
     if (std::filesystem::exists(crosshairPath)) {
         crosshairImage = LoadImageRgba(crosshairPath.string());
+        PremultiplyAlpha(crosshairImage);
+    }
+    if (std::filesystem::exists(sunPath)) {
+        sunImage = LoadImageRgba(sunPath.string());
+        PremultiplyAlpha(sunImage);
+    }
+    if (std::filesystem::exists(moonPath)) {
+        moonImage = LoadImageRgba(moonPath.string());
+        PremultiplyAlpha(moonImage);
     }
 
-    std::vector<std::uint8_t> atlasPixels(static_cast<std::size_t>(atlasWidth * atlasHeight), 0);
+    std::vector<std::uint8_t> atlasPixels(static_cast<std::size_t>(atlasWidth * atlasHeight) * 4, 0);
     int cursorX = atlasPadding;
     int cursorY = atlasPadding;
     int rowHeight = 0;
@@ -659,12 +686,14 @@ void VulkanVoxelApp::LoadOverlayFont() {
 
         for (int y = 0; y < glyph.height; ++y) {
             const std::size_t srcOffset = static_cast<std::size_t>(y * glyph.width);
-            const std::size_t dstOffset = static_cast<std::size_t>((cursorY + y) * atlasWidth + cursorX);
-            std::memcpy(
-                atlasPixels.data() + dstOffset,
-                glyph.alpha.data() + srcOffset,
-                static_cast<std::size_t>(glyph.width)
-            );
+            for (int x = 0; x < glyph.width; ++x) {
+                const std::uint8_t alpha = glyph.alpha[srcOffset + static_cast<std::size_t>(x)];
+                const std::size_t dstIndex = static_cast<std::size_t>(((cursorY + y) * atlasWidth + cursorX + x) * 4);
+                atlasPixels[dstIndex + 0] = alpha;
+                atlasPixels[dstIndex + 1] = alpha;
+                atlasPixels[dstIndex + 2] = alpha;
+                atlasPixels[dstIndex + 3] = alpha;
+            }
         }
 
         glyph.u0 = static_cast<float>(cursorX) / static_cast<float>(atlasWidth);
@@ -693,13 +722,13 @@ void VulkanVoxelApp::LoadOverlayFont() {
         for (std::uint32_t y = 0; y < crosshairImage.height; ++y) {
             for (std::uint32_t x = 0; x < crosshairImage.width; ++x) {
                 const std::size_t srcIndex = static_cast<std::size_t>((y * crosshairImage.width + x) * 4);
-                const std::uint8_t alpha = std::max({
-                    crosshairImage.pixels[srcIndex + 3],
-                    crosshairImage.pixels[srcIndex + 0],
-                    crosshairImage.pixels[srcIndex + 1],
-                    crosshairImage.pixels[srcIndex + 2]
-                });
-                atlasPixels[static_cast<std::size_t>((cursorY + static_cast<int>(y)) * atlasWidth + cursorX + static_cast<int>(x))] = alpha;
+                const std::size_t dstIndex = static_cast<std::size_t>(
+                    ((cursorY + static_cast<int>(y)) * atlasWidth + cursorX + static_cast<int>(x)) * 4
+                );
+                atlasPixels[dstIndex + 0] = crosshairImage.pixels[srcIndex + 0];
+                atlasPixels[dstIndex + 1] = crosshairImage.pixels[srcIndex + 1];
+                atlasPixels[dstIndex + 2] = crosshairImage.pixels[srcIndex + 2];
+                atlasPixels[dstIndex + 3] = crosshairImage.pixels[srcIndex + 3];
             }
         }
 
@@ -710,7 +739,25 @@ void VulkanVoxelApp::LoadOverlayFont() {
         crosshairWidth_ = static_cast<float>(crosshairImage.width);
         crosshairHeight_ = static_cast<float>(crosshairImage.height);
         crosshairLoaded_ = true;
+        cursorX += static_cast<int>(crosshairImage.width) + atlasPadding;
+        rowHeight = std::max(rowHeight, static_cast<int>(crosshairImage.height));
     }
+
+    sunLoaded_ = sunImage.width > 0 && sunImage.height > 0;
+    sunU0_ = 0.0f;
+    sunV0_ = 0.0f;
+    sunU1_ = 1.0f;
+    sunV1_ = 1.0f;
+    sunWidth_ = static_cast<float>(sunImage.width);
+    sunHeight_ = static_cast<float>(sunImage.height);
+
+    moonLoaded_ = moonImage.width > 0 && moonImage.height > 0;
+    moonU0_ = 0.0f;
+    moonV0_ = 0.0f;
+    moonU1_ = 1.0f;
+    moonV1_ = 1.0f;
+    moonWidth_ = static_cast<float>(moonImage.width);
+    moonHeight_ = static_cast<float>(moonImage.height);
 
     const VkDeviceSize atlasSize = static_cast<VkDeviceSize>(atlasPixels.size());
 
@@ -734,7 +781,7 @@ void VulkanVoxelApp::LoadOverlayFont() {
     CreateImage(
         atlasWidth,
         atlasHeight,
-        VK_FORMAT_R8_UNORM,
+        VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_TILING_OPTIMAL,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -744,14 +791,14 @@ void VulkanVoxelApp::LoadOverlayFont() {
 
     TransitionImageLayout(
         overlayFontImage_,
-        VK_FORMAT_R8_UNORM,
+        VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
     );
     CopyBufferToImage(stagingBuffer, overlayFontImage_, atlasWidth, atlasHeight);
     TransitionImageLayout(
         overlayFontImage_,
-        VK_FORMAT_R8_UNORM,
+        VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
     );
@@ -759,7 +806,7 @@ void VulkanVoxelApp::LoadOverlayFont() {
     vkDestroyBuffer(device_, stagingBuffer, nullptr);
     vkFreeMemory(device_, stagingBufferMemory, nullptr);
 
-    overlayFontImageView_ = CreateImageView(overlayFontImage_, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    overlayFontImageView_ = CreateImageView(overlayFontImage_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -780,6 +827,83 @@ void VulkanVoxelApp::LoadOverlayFont() {
     if (vkCreateSampler(device_, &samplerInfo, nullptr, &overlayFontSampler_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create overlay font sampler.");
     }
+
+    const auto createCelestialTexture = [&](const LoadedImage& image, VkImage& targetImage, VkDeviceMemory& targetMemory, VkImageView& targetView, VkSampler& targetSampler) {
+        if (image.width == 0 || image.height == 0 || image.pixels.empty()) {
+            return;
+        }
+
+        const VkDeviceSize imageSize = static_cast<VkDeviceSize>(image.pixels.size());
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+        CreateBuffer(
+            imageSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            stagingBuffer,
+            stagingBufferMemory
+        );
+
+        void* mappedTextureData = nullptr;
+        if (vkMapMemory(device_, stagingBufferMemory, 0, imageSize, 0, &mappedTextureData) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to map celestial staging buffer.");
+        }
+        std::memcpy(mappedTextureData, image.pixels.data(), image.pixels.size());
+        vkUnmapMemory(device_, stagingBufferMemory);
+
+        CreateImage(
+            image.width,
+            image.height,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            targetImage,
+            targetMemory
+        );
+
+        TransitionImageLayout(
+            targetImage,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        );
+        CopyBufferToImage(stagingBuffer, targetImage, image.width, image.height);
+        TransitionImageLayout(
+            targetImage,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        );
+
+        vkDestroyBuffer(device_, stagingBuffer, nullptr);
+        vkFreeMemory(device_, stagingBufferMemory, nullptr);
+
+        targetView = CreateImageView(targetImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+
+        VkSamplerCreateInfo celestialSamplerInfo{};
+        celestialSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        celestialSamplerInfo.magFilter = VK_FILTER_LINEAR;
+        celestialSamplerInfo.minFilter = VK_FILTER_LINEAR;
+        celestialSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        celestialSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        celestialSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        celestialSamplerInfo.anisotropyEnable = VK_FALSE;
+        celestialSamplerInfo.maxAnisotropy = 1.0f;
+        celestialSamplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        celestialSamplerInfo.unnormalizedCoordinates = VK_FALSE;
+        celestialSamplerInfo.compareEnable = VK_FALSE;
+        celestialSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        celestialSamplerInfo.minLod = 0.0f;
+        celestialSamplerInfo.maxLod = 0.0f;
+
+        if (vkCreateSampler(device_, &celestialSamplerInfo, nullptr, &targetSampler) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create celestial sampler.");
+        }
+    };
+
+    createCelestialTexture(sunImage, sunImage_, sunImageMemory_, sunImageView_, sunSampler_);
+    createCelestialTexture(moonImage, moonImage_, moonImageMemory_, moonImageView_, moonSampler_);
 }
 
 void VulkanVoxelApp::DestroyWorldMeshBuffers() {
@@ -1159,6 +1283,18 @@ void VulkanVoxelApp::CreateOverlayBuffer() {
         overlayVertexBufferMemory_
     );
 
+    celestialVertexBuffers_.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
+    celestialVertexBuffersMemory_.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        CreateBuffer(
+            sizeof(OverlayVertex) * kMaxCelestialVertexCount,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            celestialVertexBuffers_[i],
+            celestialVertexBuffersMemory_[i]
+        );
+    }
+
     RebuildOverlayVertices();
     UploadOverlayVertices();
 }
@@ -1204,15 +1340,15 @@ void VulkanVoxelApp::CreateUniformBuffers() {
 
 void VulkanVoxelApp::CreateDescriptorPool() {
     const std::array<VkDescriptorPoolSize, 2> poolSizes = {{
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight * 3},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 3},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxFramesInFlight * 5},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxFramesInFlight * 5},
     }};
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = kMaxFramesInFlight * 3;
+    poolInfo.maxSets = kMaxFramesInFlight * 5;
 
     if (vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create descriptor pool.");
@@ -1241,6 +1377,16 @@ void VulkanVoxelApp::CreateDescriptorSets() {
     overlayDescriptorSets_.resize(kMaxFramesInFlight);
     if (vkAllocateDescriptorSets(device_, &allocInfo, overlayDescriptorSets_.data()) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate overlay descriptor sets.");
+    }
+
+    sunDescriptorSets_.resize(kMaxFramesInFlight);
+    if (vkAllocateDescriptorSets(device_, &allocInfo, sunDescriptorSets_.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate sun descriptor sets.");
+    }
+
+    moonDescriptorSets_.resize(kMaxFramesInFlight);
+    if (vkAllocateDescriptorSets(device_, &allocInfo, moonDescriptorSets_.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate moon descriptor sets.");
     }
 
     for (std::size_t i = 0; i < descriptorSets_.size(); ++i) {
@@ -1333,6 +1479,64 @@ void VulkanVoxelApp::CreateDescriptorSets() {
             0,
             nullptr
         );
+
+        if (sunImageView_ != VK_NULL_HANDLE && sunSampler_ != VK_NULL_HANDLE) {
+            VkDescriptorImageInfo sunImageInfo{};
+            sunImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            sunImageInfo.imageView = sunImageView_;
+            sunImageInfo.sampler = sunSampler_;
+
+            std::array<VkWriteDescriptorSet, 2> sunWrites{};
+            sunWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            sunWrites[0].dstSet = sunDescriptorSets_[i];
+            sunWrites[0].dstBinding = 0;
+            sunWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            sunWrites[0].descriptorCount = 1;
+            sunWrites[0].pBufferInfo = &bufferInfo;
+            sunWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            sunWrites[1].dstSet = sunDescriptorSets_[i];
+            sunWrites[1].dstBinding = 1;
+            sunWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            sunWrites[1].descriptorCount = 1;
+            sunWrites[1].pImageInfo = &sunImageInfo;
+
+            vkUpdateDescriptorSets(
+                device_,
+                static_cast<std::uint32_t>(sunWrites.size()),
+                sunWrites.data(),
+                0,
+                nullptr
+            );
+        }
+
+        if (moonImageView_ != VK_NULL_HANDLE && moonSampler_ != VK_NULL_HANDLE) {
+            VkDescriptorImageInfo moonImageInfo{};
+            moonImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            moonImageInfo.imageView = moonImageView_;
+            moonImageInfo.sampler = moonSampler_;
+
+            std::array<VkWriteDescriptorSet, 2> moonWrites{};
+            moonWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            moonWrites[0].dstSet = moonDescriptorSets_[i];
+            moonWrites[0].dstBinding = 0;
+            moonWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            moonWrites[0].descriptorCount = 1;
+            moonWrites[0].pBufferInfo = &bufferInfo;
+            moonWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            moonWrites[1].dstSet = moonDescriptorSets_[i];
+            moonWrites[1].dstBinding = 1;
+            moonWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            moonWrites[1].descriptorCount = 1;
+            moonWrites[1].pImageInfo = &moonImageInfo;
+
+            vkUpdateDescriptorSets(
+                device_,
+                static_cast<std::uint32_t>(moonWrites.size()),
+                moonWrites.data(),
+                0,
+                nullptr
+            );
+        }
     }
 }
 

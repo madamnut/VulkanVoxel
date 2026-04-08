@@ -44,6 +44,8 @@ set(CHARACTER_MESH_OUTPUT "${GENERATED_ASSET_DIR}/character_mesh.bin")
 set(CHARACTER_TEXTURE_OUTPUT "${GENERATED_ASSET_DIR}/character_texture.bin")
 
 set(SHADER_SOURCES
+    shaders/sky.vert
+    shaders/sky.frag
     shaders/world.vert
     shaders/world.frag
     shaders/overlay.vert

@@ -1,13 +1,45 @@
 #include "VulkanVoxel.h"
 
+#define NOMINMAX
+#include <Windows.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
 constexpr int kMaxFramesInFlight = 2;
 constexpr float kPi = 3.14159265358979323846f;
+
+struct ScreenshotComScope {
+    bool shouldUninitialize = false;
+
+    ScreenshotComScope() {
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(hr)) {
+            shouldUninitialize = true;
+            return;
+        }
+
+        if (hr != RPC_E_CHANGED_MODE) {
+            throw std::runtime_error("Failed to initialize COM for screenshot.");
+        }
+    }
+
+    ~ScreenshotComScope() {
+        if (shouldUninitialize) {
+            CoUninitialize();
+        }
+    }
+};
 
 }  // namespace
 
@@ -25,6 +57,8 @@ void VulkanVoxelApp::DrawFrame() {
         UploadOverlayVertices();
         overlayDirty_ = false;
     }
+
+    UpdateCelestialVertices(static_cast<std::uint32_t>(currentFrame_));
 
     vkWaitForFences(
         device_,
@@ -58,6 +92,10 @@ void VulkanVoxelApp::DrawFrame() {
         vkWaitForFences(device_, 1, &imagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX);
     }
     imagesInFlight_[imageIndex] = inFlightFences_[currentFrame_];
+
+    if (screenshotRequested_) {
+        PrepareScreenshotCapture();
+    }
 
     vkResetFences(device_, 1, &inFlightFences_[currentFrame_]);
     vkResetCommandBuffer(commandBuffers_[imageIndex], 0);
@@ -97,7 +135,229 @@ void VulkanVoxelApp::DrawFrame() {
         throw std::runtime_error("Failed to present swap chain image.");
     }
 
+    if (screenshotCapturePending_) {
+        vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
+        FinalizeScreenshotCapture();
+    }
+
     currentFrame_ = (currentFrame_ + 1) % kMaxFramesInFlight;
+}
+
+void VulkanVoxelApp::PrepareScreenshotCapture() {
+    if (screenshotStagingBuffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, screenshotStagingBuffer_, nullptr);
+        screenshotStagingBuffer_ = VK_NULL_HANDLE;
+    }
+    if (screenshotStagingBufferMemory_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, screenshotStagingBufferMemory_, nullptr);
+        screenshotStagingBufferMemory_ = VK_NULL_HANDLE;
+    }
+
+    screenshotWidth_ = swapChainExtent_.width;
+    screenshotHeight_ = swapChainExtent_.height;
+    screenshotStagingBufferSize_ =
+        static_cast<VkDeviceSize>(screenshotWidth_) *
+        static_cast<VkDeviceSize>(screenshotHeight_) * 4;
+
+    CreateBuffer(
+        screenshotStagingBufferSize_,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        screenshotStagingBuffer_,
+        screenshotStagingBufferMemory_
+    );
+
+    screenshotCapturePending_ = true;
+}
+
+void VulkanVoxelApp::RecordScreenshotCopyCommands(VkCommandBuffer commandBuffer, std::uint32_t imageIndex) {
+    if (!screenshotCapturePending_) {
+        return;
+    }
+
+    VkImageMemoryBarrier toTransferBarrier{};
+    toTransferBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransferBarrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toTransferBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferBarrier.image = swapChainImages_[imageIndex];
+    toTransferBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransferBarrier.subresourceRange.baseMipLevel = 0;
+    toTransferBarrier.subresourceRange.levelCount = 1;
+    toTransferBarrier.subresourceRange.baseArrayLayer = 0;
+    toTransferBarrier.subresourceRange.layerCount = 1;
+    toTransferBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &toTransferBarrier
+    );
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = {screenshotWidth_, screenshotHeight_, 1};
+
+    vkCmdCopyImageToBuffer(
+        commandBuffer,
+        swapChainImages_[imageIndex],
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        screenshotStagingBuffer_,
+        1,
+        &copyRegion
+    );
+
+    VkImageMemoryBarrier toPresentBarrier = toTransferBarrier;
+    toPresentBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toPresentBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toPresentBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toPresentBarrier.dstAccessMask = 0;
+
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &toPresentBarrier
+    );
+}
+
+void VulkanVoxelApp::FinalizeScreenshotCapture() {
+    if (!screenshotCapturePending_ || screenshotStagingBufferMemory_ == VK_NULL_HANDLE) {
+        return;
+    }
+
+    std::vector<std::uint8_t> rgbaPixels(static_cast<std::size_t>(screenshotStagingBufferSize_));
+    void* mappedData = nullptr;
+    if (vkMapMemory(device_, screenshotStagingBufferMemory_, 0, screenshotStagingBufferSize_, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map screenshot staging buffer.");
+    }
+
+    const auto* sourcePixels = static_cast<const std::uint8_t*>(mappedData);
+    const bool isBgraFormat =
+        swapChainImageFormat_ == VK_FORMAT_B8G8R8A8_UNORM ||
+        swapChainImageFormat_ == VK_FORMAT_B8G8R8A8_SRGB;
+
+    for (std::size_t i = 0; i < rgbaPixels.size(); i += 4) {
+        if (isBgraFormat) {
+            rgbaPixels[i + 0] = sourcePixels[i + 2];
+            rgbaPixels[i + 1] = sourcePixels[i + 1];
+            rgbaPixels[i + 2] = sourcePixels[i + 0];
+            rgbaPixels[i + 3] = sourcePixels[i + 3];
+        } else {
+            rgbaPixels[i + 0] = sourcePixels[i + 0];
+            rgbaPixels[i + 1] = sourcePixels[i + 1];
+            rgbaPixels[i + 2] = sourcePixels[i + 2];
+            rgbaPixels[i + 3] = sourcePixels[i + 3];
+        }
+    }
+
+    vkUnmapMemory(device_, screenshotStagingBufferMemory_);
+    SaveScreenshotPng(rgbaPixels, screenshotWidth_, screenshotHeight_);
+
+    vkDestroyBuffer(device_, screenshotStagingBuffer_, nullptr);
+    vkFreeMemory(device_, screenshotStagingBufferMemory_, nullptr);
+    screenshotStagingBuffer_ = VK_NULL_HANDLE;
+    screenshotStagingBufferMemory_ = VK_NULL_HANDLE;
+    screenshotStagingBufferSize_ = 0;
+    screenshotCapturePending_ = false;
+    screenshotRequested_ = false;
+}
+
+void VulkanVoxelApp::SaveScreenshotPng(
+    const std::vector<std::uint8_t>& rgbaPixels,
+    std::uint32_t width,
+    std::uint32_t height
+) const {
+    ScreenshotComScope comScope;
+
+    namespace fs = std::filesystem;
+    const fs::path screenshotDirectory = fs::path(ASSET_DIR) / "screenshots";
+    fs::create_directories(screenshotDirectory);
+
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t nowTime = std::chrono::system_clock::to_time_t(now);
+    std::tm localTime{};
+    localtime_s(&localTime, &nowTime);
+
+    std::ostringstream nameStream;
+    nameStream << "screenshot_" << std::put_time(&localTime, "%Y-%m-%d_%H-%M-%S") << ".png";
+    const fs::path screenshotPath = screenshotDirectory / nameStream.str();
+
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)))) {
+        throw std::runtime_error("Failed to create WIC factory for screenshot.");
+    }
+
+    Microsoft::WRL::ComPtr<IWICStream> stream;
+    if (FAILED(factory->CreateStream(&stream))) {
+        throw std::runtime_error("Failed to create screenshot stream.");
+    }
+    if (FAILED(stream->InitializeFromFilename(screenshotPath.c_str(), GENERIC_WRITE))) {
+        throw std::runtime_error("Failed to open screenshot file for writing.");
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder))) {
+        throw std::runtime_error("Failed to create PNG encoder.");
+    }
+    if (FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) {
+        throw std::runtime_error("Failed to initialize PNG encoder.");
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+    Microsoft::WRL::ComPtr<IPropertyBag2> propertyBag;
+    if (FAILED(encoder->CreateNewFrame(&frame, &propertyBag))) {
+        throw std::runtime_error("Failed to create PNG frame.");
+    }
+    if (FAILED(frame->Initialize(propertyBag.Get()))) {
+        throw std::runtime_error("Failed to initialize PNG frame.");
+    }
+    if (FAILED(frame->SetSize(width, height))) {
+        throw std::runtime_error("Failed to set PNG frame size.");
+    }
+
+    WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppRGBA;
+    if (FAILED(frame->SetPixelFormat(&pixelFormat))) {
+        throw std::runtime_error("Failed to set PNG pixel format.");
+    }
+
+    const UINT stride = width * 4;
+    const UINT imageSize = static_cast<UINT>(rgbaPixels.size());
+    if (FAILED(frame->WritePixels(height, stride, imageSize, const_cast<BYTE*>(rgbaPixels.data())))) {
+        throw std::runtime_error("Failed to write screenshot pixels.");
+    }
+    if (FAILED(frame->Commit())) {
+        throw std::runtime_error("Failed to finalize PNG frame.");
+    }
+    if (FAILED(encoder->Commit())) {
+        throw std::runtime_error("Failed to finalize PNG file.");
+    }
 }
 
 void VulkanVoxelApp::UpdateUniformBuffer(std::uint32_t frameIndex) {
@@ -107,13 +367,39 @@ void VulkanVoxelApp::UpdateUniformBuffer(std::uint32_t frameIndex) {
                          static_cast<float>(swapChainExtent_.height);
     const Vec3 renderCameraPosition = GetRenderCameraPosition();
     const Vec3 renderCameraForward = GetRenderCameraForward();
-    const Mat4 projection = Perspective(70.0f * kPi / 180.0f, aspect, 0.1f, 2048.0f);
+    const float fovYRadians = 70.0f * kPi / 180.0f;
+    const float tanHalfFovY = std::tan(fovYRadians * 0.5f);
+    const float tanHalfFovX = tanHalfFovY * aspect;
+    const Vec3 worldUp{0.0f, 1.0f, 0.0f};
+    Vec3 renderCameraRight = Normalize(Cross(renderCameraForward, worldUp));
+    if (Length(renderCameraRight) <= 0.00001f) {
+        renderCameraRight = {1.0f, 0.0f, 0.0f};
+    }
+    const Vec3 renderCameraUp = Normalize(Cross(renderCameraRight, renderCameraForward));
+
+    const Mat4 projection = Perspective(fovYRadians, aspect, 0.1f, 2048.0f);
     const Mat4 view = LookAt(
         renderCameraPosition,
         renderCameraPosition + renderCameraForward,
-        {0.0f, 1.0f, 0.0f}
+        worldUp
     );
     ubo.viewProj = Multiply(projection, view);
+    ubo.cameraRight[0] = renderCameraRight.x;
+    ubo.cameraRight[1] = renderCameraRight.y;
+    ubo.cameraRight[2] = renderCameraRight.z;
+    ubo.cameraRight[3] = 0.0f;
+    ubo.cameraUp[0] = renderCameraUp.x;
+    ubo.cameraUp[1] = renderCameraUp.y;
+    ubo.cameraUp[2] = renderCameraUp.z;
+    ubo.cameraUp[3] = 0.0f;
+    ubo.cameraForward[0] = renderCameraForward.x;
+    ubo.cameraForward[1] = renderCameraForward.y;
+    ubo.cameraForward[2] = renderCameraForward.z;
+    ubo.cameraForward[3] = 0.0f;
+    ubo.projectionParams[0] = tanHalfFovX;
+    ubo.projectionParams[1] = tanHalfFovY;
+    ubo.projectionParams[2] = 0.0f;
+    ubo.projectionParams[3] = 0.0f;
 
     void* mappedData = nullptr;
     if (vkMapMemory(
@@ -139,9 +425,9 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
     }
 
     std::array<VkClearValue, 2> clearValues{};
-    clearValues[0].color.float32[0] = 0.53f;
-    clearValues[0].color.float32[1] = 0.81f;
-    clearValues[0].color.float32[2] = 0.92f;
+    clearValues[0].color.float32[0] = 0.0f;
+    clearValues[0].color.float32[1] = 0.0f;
+    clearValues[0].color.float32[2] = 0.0f;
     clearValues[0].color.float32[3] = 1.0f;
     clearValues[1].depthStencil = {1.0f, 0};
 
@@ -157,6 +443,60 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
     drawCallCount_ = 0;
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipeline_);
+    vkCmdBindDescriptorSets(
+        commandBuffer,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        skyPipelineLayout_,
+        0,
+        1,
+        &descriptorSets_[currentFrame_],
+        0,
+        nullptr
+    );
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    ++drawCallCount_;
+
+    if (sunVertexCount_ > 0) {
+        const VkBuffer overlayVertexBuffers[] = {celestialVertexBuffers_[currentFrame_]};
+        const VkDeviceSize overlayOffsets[] = {0};
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            overlayPipelineLayout_,
+            0,
+            1,
+            &sunDescriptorSets_[currentFrame_],
+            0,
+            nullptr
+        );
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, overlayVertexBuffers, overlayOffsets);
+        vkCmdDraw(commandBuffer, sunVertexCount_, 1, 0, 0);
+        ++drawCallCount_;
+    }
+
+    if (moonVertexCount_ > 0) {
+        const VkBuffer overlayVertexBuffers[] = {celestialVertexBuffers_[currentFrame_]};
+        const VkDeviceSize overlayOffsets[] = {0};
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            overlayPipelineLayout_,
+            0,
+            1,
+            &moonDescriptorSets_[currentFrame_],
+            0,
+            nullptr
+        );
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, overlayVertexBuffers, overlayOffsets);
+        vkCmdDraw(commandBuffer, moonVertexCount_, 1, sunVertexCount_, 0);
+        ++drawCallCount_;
+    }
 
     if (worldVertexCount_ > 0 && worldIndexCount_ > 0) {
         const VkBuffer worldVertexBuffers[] = {worldVertexBuffer_};
@@ -261,6 +601,8 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
     }
 
     vkCmdEndRenderPass(commandBuffer);
+
+    RecordScreenshotCopyCommands(commandBuffer, imageIndex);
 
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
         throw std::runtime_error("Failed to end command buffer.");

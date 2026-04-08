@@ -135,7 +135,7 @@ void VulkanVoxelApp::CreateSwapChain() {
     createInfo.imageColorSpace = surfaceFormat.colorSpace;
     createInfo.imageExtent = extent;
     createInfo.imageArrayLayers = 1;
-    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
     const QueueFamilyIndices indices = FindQueueFamilies(physicalDevice_);
     const std::uint32_t queueFamilyIndices[] = {
@@ -300,6 +300,8 @@ void VulkanVoxelApp::CreateRenderPass() {
 }
 
 void VulkanVoxelApp::CreatePipelines() {
+    const std::vector<char> skyVertShaderCode = ReadFile(SHADER_DIR "/sky.vert.spv");
+    const std::vector<char> skyFragShaderCode = ReadFile(SHADER_DIR "/sky.frag.spv");
     const std::vector<char> worldVertShaderCode = ReadFile(SHADER_DIR "/world.vert.spv");
     const std::vector<char> worldFragShaderCode = ReadFile(SHADER_DIR "/world.frag.spv");
     const std::vector<char> overlayVertShaderCode = ReadFile(SHADER_DIR "/overlay.vert.spv");
@@ -307,6 +309,8 @@ void VulkanVoxelApp::CreatePipelines() {
     const std::vector<char> selectionVertShaderCode = ReadFile(SHADER_DIR "/selection.vert.spv");
     const std::vector<char> selectionFragShaderCode = ReadFile(SHADER_DIR "/selection.frag.spv");
 
+    const VkShaderModule skyVertShaderModule = CreateShaderModule(skyVertShaderCode);
+    const VkShaderModule skyFragShaderModule = CreateShaderModule(skyFragShaderCode);
     const VkShaderModule worldVertShaderModule = CreateShaderModule(worldVertShaderCode);
     const VkShaderModule worldFragShaderModule = CreateShaderModule(worldFragShaderCode);
     const VkShaderModule overlayVertShaderModule = CreateShaderModule(overlayVertShaderCode);
@@ -405,6 +409,82 @@ void VulkanVoxelApp::CreatePipelines() {
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &colorBlendAttachment;
+
+    VkPipelineColorBlendAttachmentState overlayBlendAttachment = colorBlendAttachment;
+    overlayBlendAttachment.blendEnable = VK_TRUE;
+    overlayBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    overlayBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    overlayBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    overlayBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    overlayBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    overlayBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+    VkPipelineColorBlendStateCreateInfo overlayColorBlending = colorBlending;
+    overlayColorBlending.pAttachments = &overlayBlendAttachment;
+
+    VkPipelineShaderStageCreateInfo skyVertStage{};
+    skyVertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    skyVertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    skyVertStage.module = skyVertShaderModule;
+    skyVertStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo skyFragStage{};
+    skyFragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    skyFragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    skyFragStage.module = skyFragShaderModule;
+    skyFragStage.pName = "main";
+
+    const std::array<VkPipelineShaderStageCreateInfo, 2> skyStages = {
+        skyVertStage,
+        skyFragStage,
+    };
+
+    VkPipelineVertexInputStateCreateInfo skyVertexInput{};
+    skyVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineRasterizationStateCreateInfo skyRasterizer = rasterizer;
+    skyRasterizer.cullMode = VK_CULL_MODE_NONE;
+
+    VkPipelineDepthStencilStateCreateInfo skyDepthStencil{};
+    skyDepthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    skyDepthStencil.depthTestEnable = VK_FALSE;
+    skyDepthStencil.depthWriteEnable = VK_FALSE;
+    skyDepthStencil.depthBoundsTestEnable = VK_FALSE;
+    skyDepthStencil.stencilTestEnable = VK_FALSE;
+
+    VkPipelineLayoutCreateInfo skyLayoutInfo{};
+    skyLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    skyLayoutInfo.setLayoutCount = 1;
+    skyLayoutInfo.pSetLayouts = &descriptorSetLayout_;
+
+    if (vkCreatePipelineLayout(device_, &skyLayoutInfo, nullptr, &skyPipelineLayout_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create sky pipeline layout.");
+    }
+
+    VkGraphicsPipelineCreateInfo skyPipelineInfo{};
+    skyPipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    skyPipelineInfo.stageCount = static_cast<std::uint32_t>(skyStages.size());
+    skyPipelineInfo.pStages = skyStages.data();
+    skyPipelineInfo.pVertexInputState = &skyVertexInput;
+    skyPipelineInfo.pInputAssemblyState = &inputAssembly;
+    skyPipelineInfo.pViewportState = &viewportState;
+    skyPipelineInfo.pRasterizationState = &skyRasterizer;
+    skyPipelineInfo.pMultisampleState = &multisampling;
+    skyPipelineInfo.pDepthStencilState = &skyDepthStencil;
+    skyPipelineInfo.pColorBlendState = &colorBlending;
+    skyPipelineInfo.layout = skyPipelineLayout_;
+    skyPipelineInfo.renderPass = renderPass_;
+    skyPipelineInfo.subpass = 0;
+
+    if (vkCreateGraphicsPipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1,
+            &skyPipelineInfo,
+            nullptr,
+            &skyPipeline_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create sky pipeline.");
+    }
 
     VkPipelineLayoutCreateInfo worldLayoutInfo{};
     worldLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -512,7 +592,7 @@ void VulkanVoxelApp::CreatePipelines() {
     overlayPipelineInfo.pRasterizationState = &overlayRasterizer;
     overlayPipelineInfo.pMultisampleState = &multisampling;
     overlayPipelineInfo.pDepthStencilState = &overlayDepthStencil;
-    overlayPipelineInfo.pColorBlendState = &colorBlending;
+    overlayPipelineInfo.pColorBlendState = &overlayColorBlending;
     overlayPipelineInfo.layout = overlayPipelineLayout_;
     overlayPipelineInfo.renderPass = renderPass_;
     overlayPipelineInfo.subpass = 0;
@@ -605,6 +685,8 @@ void VulkanVoxelApp::CreatePipelines() {
         throw std::runtime_error("Failed to create selection pipeline.");
     }
 
+    vkDestroyShaderModule(device_, skyFragShaderModule, nullptr);
+    vkDestroyShaderModule(device_, skyVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, selectionFragShaderModule, nullptr);
     vkDestroyShaderModule(device_, selectionVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, overlayFragShaderModule, nullptr);
