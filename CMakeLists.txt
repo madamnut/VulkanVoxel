@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# GLFW side targets off
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -19,11 +20,58 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(glfw-3.4)
 
+# Vulkan SDK
 find_package(Vulkan REQUIRED)
+
+# Shader compiler
+find_program(
+    GLSLC_EXECUTABLE
+    NAMES glslc
+    HINTS
+        "$ENV{VULKAN_SDK}/Bin"
+        "$ENV{VULKAN_SDK}/Bin32"
+)
+
+if(NOT GLSLC_EXECUTABLE)
+    message(FATAL_ERROR "glslc not found. Install the Vulkan SDK or add glslc to PATH.")
+endif()
+
+set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
+
+set(SHADER_SOURCES
+    shaders/triangle.vert
+    shaders/triangle.frag
+)
+
+set(SPIRV_OUTPUTS)
+foreach(SHADER_SOURCE IN LISTS SHADER_SOURCES)
+    get_filename_component(SHADER_NAME "${SHADER_SOURCE}" NAME)
+    set(SPIRV_OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER_NAME}.spv")
+
+    add_custom_command(
+        OUTPUT "${SPIRV_OUTPUT}"
+        COMMAND "${GLSLC_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}" -o "${SPIRV_OUTPUT}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}"
+        COMMENT "Compile ${SHADER_NAME}"
+        VERBATIM
+    )
+
+    list(APPEND SPIRV_OUTPUTS "${SPIRV_OUTPUT}")
+endforeach()
+
+add_custom_target(VulkanVoxelShaders ALL DEPENDS ${SPIRV_OUTPUTS})
 
 add_executable(VulkanVoxel
     VulkanVoxel.cpp
     VulkanVoxel.h
+)
+
+add_dependencies(VulkanVoxel VulkanVoxelShaders)
+
+target_compile_definitions(VulkanVoxel
+    PRIVATE
+        SHADER_DIR="${SHADER_OUTPUT_DIR}"
 )
 
 target_link_libraries(VulkanVoxel
@@ -32,6 +80,7 @@ target_link_libraries(VulkanVoxel
         Vulkan::Vulkan
 )
 
+# Warnings
 if(MSVC)
     target_compile_options(VulkanVoxel PRIVATE /W4 /permissive-)
 else()
