@@ -99,6 +99,12 @@ add_custom_target(
 
 add_executable(VulkanVoxel
     MathTypes.h
+    TerrainConfig.h
+    TerrainConfig.cpp
+    WorldGenerator.h
+    WorldGenerator.cpp
+    WorldSettings.h
+    WorldSettings.cpp
     VoxelWorld.cpp
     VoxelWorld.h
     VulkanVoxel.h

@@ -45,6 +45,7 @@ struct ScreenshotComScope {
 
 void VulkanVoxelApp::DrawFrame() {
     vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
+    TryCleanupRetiredWorldRenderBatches();
 
     if (overlayDirty_) {
         vkWaitForFences(
@@ -59,14 +60,6 @@ void VulkanVoxelApp::DrawFrame() {
     }
 
     UpdateCelestialVertices(static_cast<std::uint32_t>(currentFrame_));
-
-    vkWaitForFences(
-        device_,
-        static_cast<std::uint32_t>(inFlightFences_.size()),
-        inFlightFences_.data(),
-        VK_TRUE,
-        UINT64_MAX
-    );
     UpdatePlayerRenderMesh();
     UpdateUniformBuffer(static_cast<std::uint32_t>(currentFrame_));
 
@@ -498,10 +491,7 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
         ++drawCallCount_;
     }
 
-    if (worldVertexCount_ > 0 && worldIndexCount_ > 0) {
-        const VkBuffer worldVertexBuffers[] = {worldVertexBuffer_};
-        const VkDeviceSize worldOffsets[] = {0};
-
+    if (!worldRenderBatches_.empty()) {
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldPipeline_);
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -513,14 +503,24 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
             0,
             nullptr
         );
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, worldVertexBuffers, worldOffsets);
-        vkCmdBindIndexBuffer(commandBuffer, worldIndexBuffer_, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(commandBuffer, worldIndexCount_, 1, 0, 0, 0);
-        ++drawCallCount_;
+
+        for (const auto& [id, batch] : worldRenderBatches_) {
+            (void)id;
+            if (batch.vertexCount == 0 || batch.indexCount == 0) {
+                continue;
+            }
+
+            const VkBuffer worldVertexBuffers[] = {batch.vertexBuffer};
+            const VkDeviceSize worldOffsets[] = {0};
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, worldVertexBuffers, worldOffsets);
+            vkCmdBindIndexBuffer(commandBuffer, batch.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(commandBuffer, batch.indexCount, 1, 0, 0, 0);
+            ++drawCallCount_;
+        }
     }
 
     if (playerVertexCount_ > 0 && playerIndexCount_ > 0) {
-        const VkBuffer playerVertexBuffers[] = {playerVertexBuffer_};
+        const VkBuffer playerVertexBuffers[] = {playerVertexBuffers_[currentFrame_]};
         const VkDeviceSize playerOffsets[] = {0};
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldPipeline_);

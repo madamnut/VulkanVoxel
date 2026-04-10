@@ -3,6 +3,8 @@ function(target_architecture output_arch output_arch_ver)
         set(ARCH "${CMAKE_OSX_ARCHITECTURES}")
         set(ARCH_VER unknown)
     else()
+        set(FASTSIMD_ARCHDETECT_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/fastsimd_arch_detect")
+        file(MAKE_DIRECTORY "${FASTSIMD_ARCHDETECT_BUILD_DIR}")
 
         # Detect the architecture in a rather creative way...
         # This compiles a small C program which is a series of ifdefs that selects a
@@ -14,7 +16,7 @@ function(target_architecture output_arch output_arch_ver)
         # since the program itself never needs to be run (only the compiler/preprocessor)
         try_compile(
             compile_result_unused
-            "${CMAKE_BINARY_DIR}"
+            "${FASTSIMD_ARCHDETECT_BUILD_DIR}"
             "${FastSIMD_SOURCE_DIR}/cmake/ArchDetect.cpp"
             OUTPUT_VARIABLE COMPILE_OUTPUT
         )

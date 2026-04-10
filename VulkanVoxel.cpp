@@ -48,6 +48,10 @@ constexpr float kSelectionExpand = 0.002f;
 constexpr float kPlayerEyeHeight = 1.5625f;
 constexpr float kThirdPersonDistance = 4.5f;
 
+int GetChunkCoordinate(float worldCoordinate, int chunkSize) {
+    return static_cast<int>(std::floor(worldCoordinate / static_cast<float>(chunkSize)));
+}
+
 bool HasOverlayGlyph(const std::array<FontGlyphBitmap, 128>& glyphs, char c) {
     const unsigned char code = static_cast<unsigned char>(c);
     return code < glyphs.size() && glyphs[code].valid;
@@ -347,7 +351,7 @@ int VulkanVoxelApp::Run() {
 }
 
 bool VulkanVoxelApp::IsSolidBlockAt(int worldX, int worldY, int worldZ) {
-    if (!VoxelWorld::IsInsideWorld(worldX, worldY, worldZ)) {
+    if (worldY < 0 || worldY >= kWorldSizeY) {
         return true;
     }
 
@@ -362,10 +366,7 @@ bool VulkanVoxelApp::IsPlayerCollidingAt(const Vec3& eyePosition) {
     const float minZ = eyePosition.z - kPlayerHalfWidth;
     const float maxZ = eyePosition.z + kPlayerHalfWidth;
 
-    if (minX < 0.0f || minY < 0.0f || minZ < 0.0f ||
-        maxX > static_cast<float>(kWorldSizeX) ||
-        maxY > static_cast<float>(kWorldSizeY) ||
-        maxZ > static_cast<float>(kWorldSizeZ)) {
+    if (minY < 0.0f || maxY > static_cast<float>(kWorldSizeY)) {
         return true;
     }
 
@@ -522,6 +523,13 @@ void VulkanVoxelApp::InitWindow() {
 }
 
 void VulkanVoxelApp::InitVulkan() {
+    worldSettings_ = LoadWorldSettings(std::string(ASSET_DIR) + "/assets/config/world.json");
+    {
+        const int centerChunkX = static_cast<int>(std::floor(cameraPosition_.x / static_cast<float>(kChunkSizeX)));
+        const int centerChunkZ = static_cast<int>(std::floor(cameraPosition_.z / static_cast<float>(kChunkSizeZ)));
+        std::unique_lock lock(worldMutex_);
+        world_.UpdateStreamingTargets(centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+    }
     CreateInstance();
     CreateSurface();
     PickPhysicalDevice();
@@ -542,8 +550,8 @@ void VulkanVoxelApp::InitVulkan() {
     CreatePlayerTextureImageView();
     CreatePlayerTextureSampler();
     LoadOverlayFont();
-    BuildWorldMesh();
     StartWorldMeshWorker();
+    RequestWorldMeshBuild();
     CreatePlayerBuffers();
     CreateOverlayBuffer();
     CreateSelectionBuffer();
@@ -579,6 +587,14 @@ void VulkanVoxelApp::MainLoop() {
 
 void VulkanVoxelApp::Cleanup() {
     StopWorldMeshWorker();
+
+    try {
+        std::unique_lock lock(worldMutex_);
+        world_.Save();
+    } catch (const std::exception& e) {
+        OutputDebugStringA(e.what());
+        OutputDebugStringA("\n");
+    }
 
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
@@ -1013,9 +1029,7 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
             cameraPosition_ = cameraPosition_ + movement * (kMoveSpeed * deltaTime);
         }
 
-        cameraPosition_.x = std::clamp(cameraPosition_.x, 0.0f, static_cast<float>(kWorldSizeX));
         cameraPosition_.y = std::clamp(cameraPosition_.y, 1.0f, static_cast<float>(kWorldSizeY - 1));
-        cameraPosition_.z = std::clamp(cameraPosition_.z, 0.0f, static_cast<float>(kWorldSizeZ));
         previousPhysicsCameraPosition_ = cameraPosition_;
     }
 
@@ -1255,8 +1269,8 @@ Vec3 VulkanVoxelApp::GetRenderCameraForward() {
 }
 
 void VulkanVoxelApp::UpdateWorldMeshIfNeeded() {
-    const int chunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
-    const int chunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
+    const int chunkX = GetChunkCoordinate(cameraPosition_.x, kChunkSizeX);
+    const int chunkZ = GetChunkCoordinate(cameraPosition_.z, kChunkSizeZ);
 
     if (chunkX == lastMeshChunkX_ &&
         chunkZ == lastMeshChunkZ_) {
@@ -1274,7 +1288,7 @@ void VulkanVoxelApp::UpdateOverlayText(float deltaTime) {
     overlayRefreshAccumulatorSeconds_ += deltaTime;
     bool statsUpdated = false;
 
-    if (fpsAccumulatorSeconds_ >= 0.5) {
+    if (fpsAccumulatorSeconds_ >= 0.1) {
         currentFps_ = static_cast<std::uint32_t>(
             static_cast<double>(frameCounter_) / fpsAccumulatorSeconds_ + 0.5
         );
@@ -1379,8 +1393,8 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
         return;
     }
 
-    const int chunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
-    const int chunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
+    const int chunkX = GetChunkCoordinate(cameraPosition_.x, kChunkSizeX);
+    const int chunkZ = GetChunkCoordinate(cameraPosition_.z, kChunkSizeZ);
     const int subChunk = std::clamp(static_cast<int>(cameraPosition_.y) / kSubChunkSize, 0, kSubChunkCountY - 1);
     const std::uint32_t faceCount = worldIndexCount_ / 6;
     const std::uint32_t triangleCount = worldIndexCount_ / 3;

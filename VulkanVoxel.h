@@ -5,6 +5,7 @@
 
 #include "MathTypes.h"
 #include "VoxelWorld.h"
+#include "WorldSettings.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -41,6 +42,18 @@ struct UniformBufferObject {
 
 struct SelectionVertex {
     float position[3];
+};
+
+struct WorldRenderBatch {
+    PendingChunkId id{};
+    VkBuffer vertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
+    VkDeviceSize vertexBufferCapacity = 0;
+    std::uint32_t vertexCount = 0;
+    VkBuffer indexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
+    VkDeviceSize indexBufferCapacity = 0;
+    std::uint32_t indexCount = 0;
 };
 
 enum class CameraViewMode {
@@ -115,15 +128,11 @@ private:
     void StartWorldMeshWorker();
     void StopWorldMeshWorker();
     void ConsumeCompletedWorldMesh();
-    WorldMeshData BuildWorldMeshData(
-        int centerChunkX,
-        int centerChunkZ,
-        const Vec3& cameraPosition,
-        const Vec3& cameraForward,
-        float aspectRatio
-    );
-    void UploadWorldMesh(const WorldMeshData& mesh);
+    void UploadWorldRenderUpdate(const WorldRenderUpdate& update);
     void DestroyWorldMeshBuffers();
+    void DestroyWorldRenderBatch(WorldRenderBatch& batch);
+    void UploadWorldRenderBatch(WorldRenderBatch& batch, const ChunkMeshBatchData& batchData);
+    void TryCleanupRetiredWorldRenderBatches();
     void CreateOverlayBuffer();
     void CreateUniformBuffers();
     void CreateDescriptorPool();
@@ -252,18 +261,14 @@ private:
     VkImageView moonImageView_ = VK_NULL_HANDLE;
     VkSampler moonSampler_ = VK_NULL_HANDLE;
 
-    VkBuffer worldVertexBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory worldVertexBufferMemory_ = VK_NULL_HANDLE;
     std::uint32_t worldVertexCount_ = 0;
-    VkDeviceSize worldVertexBufferCapacity_ = 0;
-    VkBuffer worldIndexBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory worldIndexBufferMemory_ = VK_NULL_HANDLE;
     std::uint32_t worldIndexCount_ = 0;
-    VkDeviceSize worldIndexBufferCapacity_ = 0;
-    VkBuffer playerVertexBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory playerVertexBufferMemory_ = VK_NULL_HANDLE;
+    std::unordered_map<PendingChunkId, WorldRenderBatch, PendingChunkIdHash> worldRenderBatches_;
+    std::vector<WorldRenderBatch> retiredWorldRenderBatches_;
+    std::vector<VkBuffer> playerVertexBuffers_;
+    std::vector<VkDeviceMemory> playerVertexBuffersMemory_;
+    std::vector<VkDeviceSize> playerVertexBufferCapacities_;
     std::uint32_t playerVertexCount_ = 0;
-    VkDeviceSize playerVertexBufferCapacity_ = 0;
     VkBuffer playerIndexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory playerIndexBufferMemory_ = VK_NULL_HANDLE;
     std::uint32_t playerIndexCount_ = 0;
@@ -307,9 +312,10 @@ private:
     std::size_t currentFrame_ = 0;
 
     VoxelWorld world_;
+    WorldSettings worldSettings_{};
     mutable std::shared_mutex worldMutex_;
-    Vec3 cameraPosition_{256.0f, 290.0f, 340.0f};
-    Vec3 previousPhysicsCameraPosition_{256.0f, 290.0f, 340.0f};
+    Vec3 cameraPosition_{1.0f, 400.0f, 1.0f};
+    Vec3 previousPhysicsCameraPosition_{1.0f, 400.0f, 1.0f};
     float cameraYaw_ = -90.0f;
     float cameraPitch_ = -35.0f;
     CameraViewMode cameraViewMode_ = CameraViewMode::FirstPerson;
@@ -408,20 +414,21 @@ private:
     struct WorldMeshBuildRequest {
         int centerChunkX = 0;
         int centerChunkZ = 0;
-        Vec3 cameraPosition{};
-        Vec3 cameraForward{};
-        float aspectRatio = 16.0f / 9.0f;
         std::uint64_t serial = 0;
     };
 
     std::thread worldMeshWorkerThread_;
+    std::vector<std::thread> chunkLoadWorkerThreads_;
+    std::vector<std::thread> meshWorkerThreads_;
     std::mutex worldMeshWorkerMutex_;
     std::condition_variable worldMeshWorkerCv_;
     bool worldMeshWorkerRunning_ = false;
+    bool worldMeshTargetAvailable_ = false;
     bool worldMeshRequestPending_ = false;
     std::uint64_t nextWorldMeshRequestSerial_ = 0;
+    std::uint64_t nextCompletedWorldMeshSerial_ = 0;
     std::uint64_t completedWorldMeshSerial_ = 0;
     std::uint64_t uploadedWorldMeshSerial_ = 0;
     WorldMeshBuildRequest pendingWorldMeshRequest_{};
-    std::optional<WorldMeshData> completedWorldMesh_;
+    std::optional<WorldRenderUpdate> completedWorldRenderUpdate_;
 };

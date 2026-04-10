@@ -9,12 +9,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #ifndef ASSET_DIR
 #define ASSET_DIR "."
@@ -34,12 +36,58 @@ constexpr int kMaxFramesInFlight = 2;
 constexpr std::size_t kMaxOverlayVertexCount = 4194304;
 constexpr std::size_t kMaxCelestialVertexCount = 12;
 constexpr float kWorldVerticalFovDegrees = 70.0f;
+constexpr std::size_t kChunkLoadWorkerCount = 3;
+constexpr std::size_t kMeshWorkerCount = 2;
+constexpr std::size_t kChunkGenerationBudgetPerPass = 12;
+constexpr std::size_t kMeshBuildBudgetPerPass = 12;
+constexpr auto kWorldMeshWorkerYieldDelay = std::chrono::milliseconds(1);
 
 struct LoadedImage {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::vector<std::uint8_t> pixels;
 };
+
+bool PendingChunkIdEquals(const PendingChunkId& lhs, const PendingChunkId& rhs) {
+    return lhs.chunkX == rhs.chunkX && lhs.chunkZ == rhs.chunkZ;
+}
+
+void MergeWorldRenderUpdate(WorldRenderUpdate& destination, WorldRenderUpdate&& source) {
+    destination.loadedChunkCount = source.loadedChunkCount;
+
+    auto eraseChunk = [](std::vector<PendingChunkId>& chunks, const PendingChunkId& target) {
+        chunks.erase(
+            std::remove_if(
+                chunks.begin(),
+                chunks.end(),
+                [&target](const PendingChunkId& candidate) { return PendingChunkIdEquals(candidate, target); }
+            ),
+            chunks.end()
+        );
+    };
+
+    auto containsChunk = [](const std::vector<PendingChunkId>& chunks, const PendingChunkId& target) {
+        return std::any_of(
+            chunks.begin(),
+            chunks.end(),
+            [&target](const PendingChunkId& candidate) { return PendingChunkIdEquals(candidate, target); }
+        );
+    };
+
+    for (const PendingChunkId& removal : source.removals) {
+        eraseChunk(destination.uploads, removal);
+        if (!containsChunk(destination.removals, removal)) {
+            destination.removals.push_back(removal);
+        }
+    }
+
+    for (const PendingChunkId& upload : source.uploads) {
+        eraseChunk(destination.removals, upload);
+        if (!containsChunk(destination.uploads, upload)) {
+            destination.uploads.push_back(upload);
+        }
+    }
+}
 
 void PremultiplyAlpha(LoadedImage& image) {
     if (image.width == 0 || image.height == 0 || image.pixels.empty()) {
@@ -906,39 +954,143 @@ void VulkanVoxelApp::LoadOverlayFont() {
     createCelestialTexture(moonImage, moonImage_, moonImageMemory_, moonImageView_, moonSampler_);
 }
 
-void VulkanVoxelApp::DestroyWorldMeshBuffers() {
-    if (worldIndexBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, worldIndexBuffer_, nullptr);
-        worldIndexBuffer_ = VK_NULL_HANDLE;
+void VulkanVoxelApp::DestroyWorldRenderBatch(WorldRenderBatch& batch) {
+    if (batch.indexBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, batch.indexBuffer, nullptr);
+        batch.indexBuffer = VK_NULL_HANDLE;
     }
-    if (worldIndexBufferMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, worldIndexBufferMemory_, nullptr);
-        worldIndexBufferMemory_ = VK_NULL_HANDLE;
+    if (batch.indexBufferMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, batch.indexBufferMemory, nullptr);
+        batch.indexBufferMemory = VK_NULL_HANDLE;
     }
-    if (worldVertexBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, worldVertexBuffer_, nullptr);
-        worldVertexBuffer_ = VK_NULL_HANDLE;
+    if (batch.vertexBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, batch.vertexBuffer, nullptr);
+        batch.vertexBuffer = VK_NULL_HANDLE;
     }
-    if (worldVertexBufferMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, worldVertexBufferMemory_, nullptr);
-        worldVertexBufferMemory_ = VK_NULL_HANDLE;
+    if (batch.vertexBufferMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, batch.vertexBufferMemory, nullptr);
+        batch.vertexBufferMemory = VK_NULL_HANDLE;
     }
 
+    batch.vertexBufferCapacity = 0;
+    batch.indexBufferCapacity = 0;
+    batch.vertexCount = 0;
+    batch.indexCount = 0;
+}
+
+void VulkanVoxelApp::DestroyWorldMeshBuffers() {
+    for (auto& [id, batch] : worldRenderBatches_) {
+        (void)id;
+        DestroyWorldRenderBatch(batch);
+    }
+    worldRenderBatches_.clear();
+    for (WorldRenderBatch& batch : retiredWorldRenderBatches_) {
+        DestroyWorldRenderBatch(batch);
+    }
+    retiredWorldRenderBatches_.clear();
     worldVertexCount_ = 0;
     worldIndexCount_ = 0;
-    worldVertexBufferCapacity_ = 0;
-    worldIndexBufferCapacity_ = 0;
+}
+
+void VulkanVoxelApp::TryCleanupRetiredWorldRenderBatches() {
+    if (retiredWorldRenderBatches_.empty() || inFlightFences_.empty()) {
+        return;
+    }
+
+    for (VkFence fence : inFlightFences_) {
+        if (vkGetFenceStatus(device_, fence) != VK_SUCCESS) {
+            return;
+        }
+    }
+
+    for (WorldRenderBatch& batch : retiredWorldRenderBatches_) {
+        DestroyWorldRenderBatch(batch);
+    }
+    retiredWorldRenderBatches_.clear();
+}
+
+void VulkanVoxelApp::UploadWorldRenderBatch(WorldRenderBatch& batch, const ChunkMeshBatchData& batchData) {
+    batch.id = batchData.id;
+
+    const VkDeviceSize vertexBufferSize =
+        sizeof(WorldVertex) * static_cast<VkDeviceSize>(batchData.vertices.size());
+    const VkDeviceSize indexBufferSize =
+        sizeof(std::uint32_t) * static_cast<VkDeviceSize>(batchData.indices.size());
+
+    void* mappedData = nullptr;
+
+    if (batch.vertexBuffer == VK_NULL_HANDLE || batch.vertexBufferCapacity < vertexBufferSize) {
+        if (batch.vertexBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, batch.vertexBuffer, nullptr);
+            batch.vertexBuffer = VK_NULL_HANDLE;
+        }
+        if (batch.vertexBufferMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, batch.vertexBufferMemory, nullptr);
+            batch.vertexBufferMemory = VK_NULL_HANDLE;
+        }
+
+        batch.vertexBufferCapacity = std::max(vertexBufferSize, batch.vertexBufferCapacity * 2);
+        CreateBuffer(
+            batch.vertexBufferCapacity,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            batch.vertexBuffer,
+            batch.vertexBufferMemory
+        );
+    }
+
+    if (vkMapMemory(device_, batch.vertexBufferMemory, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map world batch vertex buffer.");
+    }
+    std::memcpy(mappedData, batchData.vertices.data(), static_cast<std::size_t>(vertexBufferSize));
+    vkUnmapMemory(device_, batch.vertexBufferMemory);
+
+    if (batch.indexBuffer == VK_NULL_HANDLE || batch.indexBufferCapacity < indexBufferSize) {
+        if (batch.indexBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, batch.indexBuffer, nullptr);
+            batch.indexBuffer = VK_NULL_HANDLE;
+        }
+        if (batch.indexBufferMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, batch.indexBufferMemory, nullptr);
+            batch.indexBufferMemory = VK_NULL_HANDLE;
+        }
+
+        batch.indexBufferCapacity = std::max(indexBufferSize, batch.indexBufferCapacity * 2);
+        CreateBuffer(
+            batch.indexBufferCapacity,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            batch.indexBuffer,
+            batch.indexBufferMemory
+        );
+    }
+
+    if (vkMapMemory(device_, batch.indexBufferMemory, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map world batch index buffer.");
+    }
+    std::memcpy(mappedData, batchData.indices.data(), static_cast<std::size_t>(indexBufferSize));
+    vkUnmapMemory(device_, batch.indexBufferMemory);
+
+    batch.vertexCount = static_cast<std::uint32_t>(batchData.vertices.size());
+    batch.indexCount = static_cast<std::uint32_t>(batchData.indices.size());
 }
 
 void VulkanVoxelApp::DestroyPlayerBuffers() {
-    if (playerVertexBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, playerVertexBuffer_, nullptr);
-        playerVertexBuffer_ = VK_NULL_HANDLE;
+    for (VkBuffer& buffer : playerVertexBuffers_) {
+        if (buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, buffer, nullptr);
+            buffer = VK_NULL_HANDLE;
+        }
     }
-    if (playerVertexBufferMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, playerVertexBufferMemory_, nullptr);
-        playerVertexBufferMemory_ = VK_NULL_HANDLE;
+    for (VkDeviceMemory& memory : playerVertexBuffersMemory_) {
+        if (memory != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
     }
+    playerVertexBuffers_.clear();
+    playerVertexBuffersMemory_.clear();
+    playerVertexBufferCapacities_.clear();
     if (playerIndexBuffer_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(device_, playerIndexBuffer_, nullptr);
         playerIndexBuffer_ = VK_NULL_HANDLE;
@@ -950,7 +1102,6 @@ void VulkanVoxelApp::DestroyPlayerBuffers() {
 
     playerVertexCount_ = 0;
     playerIndexCount_ = 0;
-    playerVertexBufferCapacity_ = 0;
     playerIndexBufferCapacity_ = 0;
 }
 
@@ -964,15 +1115,19 @@ void VulkanVoxelApp::CreatePlayerBuffers() {
     const VkDeviceSize indexBufferSize =
         sizeof(std::uint32_t) * static_cast<VkDeviceSize>(playerIndices_.size());
 
-    if (playerVertexBuffer_ == VK_NULL_HANDLE) {
-        playerVertexBufferCapacity_ = vertexBufferSize;
-        CreateBuffer(
-            playerVertexBufferCapacity_,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            playerVertexBuffer_,
-            playerVertexBufferMemory_
-        );
+    if (playerVertexBuffers_.empty()) {
+        playerVertexBuffers_.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
+        playerVertexBuffersMemory_.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
+        playerVertexBufferCapacities_.resize(kMaxFramesInFlight, vertexBufferSize);
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            CreateBuffer(
+                playerVertexBufferCapacities_[static_cast<std::size_t>(i)],
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                playerVertexBuffers_[static_cast<std::size_t>(i)],
+                playerVertexBuffersMemory_[static_cast<std::size_t>(i)]
+            );
+        }
     }
 
     if (playerIndexBuffer_ == VK_NULL_HANDLE) {
@@ -998,7 +1153,8 @@ void VulkanVoxelApp::CreatePlayerBuffers() {
 }
 
 void VulkanVoxelApp::UpdatePlayerRenderMesh() {
-    if (!playerLoaded_ || playerVertexBuffer_ == VK_NULL_HANDLE) {
+    if (!playerLoaded_ || currentFrame_ >= playerVertexBuffers_.size() ||
+        playerVertexBuffers_[currentFrame_] == VK_NULL_HANDLE) {
         playerVertexCount_ = 0;
         return;
     }
@@ -1039,137 +1195,118 @@ void VulkanVoxelApp::UpdatePlayerRenderMesh() {
     const VkDeviceSize vertexBufferSize =
         sizeof(WorldVertex) * static_cast<VkDeviceSize>(playerRenderVertices_.size());
     void* mappedData = nullptr;
-    if (vkMapMemory(device_, playerVertexBufferMemory_, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
+    if (vkMapMemory(
+            device_,
+            playerVertexBuffersMemory_[currentFrame_],
+            0,
+            vertexBufferSize,
+            0,
+            &mappedData) != VK_SUCCESS) {
         throw std::runtime_error("Failed to map player vertex buffer.");
     }
     std::memcpy(mappedData, playerRenderVertices_.data(), static_cast<std::size_t>(vertexBufferSize));
-    vkUnmapMemory(device_, playerVertexBufferMemory_);
+    vkUnmapMemory(device_, playerVertexBuffersMemory_[currentFrame_]);
 
     playerVertexCount_ = static_cast<std::uint32_t>(playerRenderVertices_.size());
 }
 
-WorldMeshData VulkanVoxelApp::BuildWorldMeshData(
-    int centerChunkX,
-    int centerChunkZ,
-    const Vec3& cameraPosition,
-    const Vec3& cameraForward,
-    float aspectRatio
-) {
-    WorldMeshData mesh;
-    {
-        std::shared_lock lock(worldMutex_);
-        world_.BuildVisibleMesh(
-            centerChunkX,
-            centerChunkZ,
-            std::max(kWorldChunkCountX, kWorldChunkCountZ),
-            cameraPosition,
-            cameraForward,
-            kWorldVerticalFovDegrees,
-            aspectRatio,
-            mesh
-        );
-    }
-    return mesh;
-}
-
-void VulkanVoxelApp::UploadWorldMesh(const WorldMeshData& mesh) {
+void VulkanVoxelApp::UploadWorldRenderUpdate(const WorldRenderUpdate& update) {
     if (device_ == VK_NULL_HANDLE) {
         return;
     }
 
-    if (!inFlightFences_.empty()) {
-        vkWaitForFences(
-            device_,
-            static_cast<std::uint32_t>(inFlightFences_.size()),
-            inFlightFences_.data(),
-            VK_TRUE,
-            UINT64_MAX
-        );
-    }
+    TryCleanupRetiredWorldRenderBatches();
+    loadedChunkCount_ = update.loadedChunkCount;
 
-    loadedChunkCount_ = mesh.loadedChunkCount;
-
-    if (mesh.vertices.empty() || mesh.indices.empty()) {
-        worldVertexCount_ = 0;
-        worldIndexCount_ = 0;
-        return;
-    }
-
-    const VkDeviceSize vertexBufferSize = sizeof(WorldVertex) * static_cast<VkDeviceSize>(mesh.vertices.size());
-    const VkDeviceSize indexBufferSize = sizeof(std::uint32_t) * static_cast<VkDeviceSize>(mesh.indices.size());
-
-    void* mappedData = nullptr;
-
-    if (worldVertexBuffer_ == VK_NULL_HANDLE || worldVertexBufferCapacity_ < vertexBufferSize) {
-        if (worldVertexBuffer_ != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device_, worldVertexBuffer_, nullptr);
-            worldVertexBuffer_ = VK_NULL_HANDLE;
-        }
-        if (worldVertexBufferMemory_ != VK_NULL_HANDLE) {
-            vkFreeMemory(device_, worldVertexBufferMemory_, nullptr);
-            worldVertexBufferMemory_ = VK_NULL_HANDLE;
+    for (const PendingChunkId& batchId : update.removals) {
+        auto batchIt = worldRenderBatches_.find(batchId);
+        if (batchIt == worldRenderBatches_.end()) {
+            continue;
         }
 
-        worldVertexBufferCapacity_ = std::max(vertexBufferSize, worldVertexBufferCapacity_ * 2);
-        CreateBuffer(
-            worldVertexBufferCapacity_,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            worldVertexBuffer_,
-            worldVertexBufferMemory_
-        );
+        worldVertexCount_ -= batchIt->second.vertexCount;
+        worldIndexCount_ -= batchIt->second.indexCount;
+        retiredWorldRenderBatches_.push_back(std::move(batchIt->second));
+        worldRenderBatches_.erase(batchIt);
     }
 
-    if (vkMapMemory(device_, worldVertexBufferMemory_, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to map world vertex buffer.");
-    }
-    std::memcpy(mappedData, mesh.vertices.data(), static_cast<std::size_t>(vertexBufferSize));
-    vkUnmapMemory(device_, worldVertexBufferMemory_);
-
-    if (worldIndexBuffer_ == VK_NULL_HANDLE || worldIndexBufferCapacity_ < indexBufferSize) {
-        if (worldIndexBuffer_ != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device_, worldIndexBuffer_, nullptr);
-            worldIndexBuffer_ = VK_NULL_HANDLE;
-        }
-        if (worldIndexBufferMemory_ != VK_NULL_HANDLE) {
-            vkFreeMemory(device_, worldIndexBufferMemory_, nullptr);
-            worldIndexBufferMemory_ = VK_NULL_HANDLE;
+    for (const PendingChunkId& chunkId : update.uploads) {
+        ChunkMeshBatchData batchData{};
+        {
+            std::shared_lock lock(worldMutex_);
+            if (!world_.CopyChunkMeshBatch(chunkId.chunkX, chunkId.chunkZ, batchData)) {
+                auto existingIt = worldRenderBatches_.find(chunkId);
+                if (existingIt != worldRenderBatches_.end()) {
+                    worldVertexCount_ -= existingIt->second.vertexCount;
+                    worldIndexCount_ -= existingIt->second.indexCount;
+                    retiredWorldRenderBatches_.push_back(std::move(existingIt->second));
+                    worldRenderBatches_.erase(existingIt);
+                }
+                continue;
+            }
         }
 
-        worldIndexBufferCapacity_ = std::max(indexBufferSize, worldIndexBufferCapacity_ * 2);
-        CreateBuffer(
-            worldIndexBufferCapacity_,
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            worldIndexBuffer_,
-            worldIndexBufferMemory_
-        );
-    }
+        auto existingIt = worldRenderBatches_.find(chunkId);
+        if (existingIt != worldRenderBatches_.end()) {
+            worldVertexCount_ -= existingIt->second.vertexCount;
+            worldIndexCount_ -= existingIt->second.indexCount;
+            retiredWorldRenderBatches_.push_back(std::move(existingIt->second));
+            worldRenderBatches_.erase(existingIt);
+        }
 
-    if (vkMapMemory(device_, worldIndexBufferMemory_, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to map world index buffer.");
+        WorldRenderBatch batch{};
+        UploadWorldRenderBatch(batch, batchData);
+        worldVertexCount_ += batch.vertexCount;
+        worldIndexCount_ += batch.indexCount;
+        worldRenderBatches_.emplace(batch.id, std::move(batch));
     }
-    std::memcpy(mappedData, mesh.indices.data(), static_cast<std::size_t>(indexBufferSize));
-    vkUnmapMemory(device_, worldIndexBufferMemory_);
-
-    worldVertexCount_ = static_cast<std::uint32_t>(mesh.vertices.size());
-    worldIndexCount_ = static_cast<std::uint32_t>(mesh.indices.size());
 }
 
 void VulkanVoxelApp::BuildWorldMesh() {
-    const int centerChunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
-    const int centerChunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
-    const float aspectRatio = swapChainExtent_.height > 0
-        ? static_cast<float>(swapChainExtent_.width) / static_cast<float>(swapChainExtent_.height)
-        : (16.0f / 9.0f);
-    const WorldMeshData mesh = BuildWorldMeshData(
-        centerChunkX,
-        centerChunkZ,
-        cameraPosition_,
-        GetForwardVector(),
-        aspectRatio
-    );
-    UploadWorldMesh(mesh);
+    const int centerChunkX = static_cast<int>(std::floor(cameraPosition_.x / static_cast<float>(kChunkSizeX)));
+    const int centerChunkZ = static_cast<int>(std::floor(cameraPosition_.z / static_cast<float>(kChunkSizeZ)));
+
+    std::vector<PendingChunkId> chunkRequests;
+    std::vector<MeshBuildInput> meshRequests;
+    WorldRenderUpdate renderUpdate{};
+    {
+        std::unique_lock lock(worldMutex_);
+        world_.UpdateStreamingTargets(centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+        chunkRequests = world_.AcquireChunkLoadRequests(kChunkGenerationBudgetPerPass);
+        meshRequests = world_.AcquireDirtyMeshRequests(kMeshBuildBudgetPerPass, centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+    }
+
+    std::vector<PreparedChunkColumn> preparedChunks;
+    preparedChunks.reserve(chunkRequests.size());
+    for (const PendingChunkId& chunkRequest : chunkRequests) {
+        preparedChunks.push_back(world_.PrepareChunkColumn(chunkRequest.chunkX, chunkRequest.chunkZ));
+    }
+
+    std::vector<PreparedSubChunkMesh> preparedMeshes;
+    preparedMeshes.reserve(meshRequests.size());
+    for (const MeshBuildInput& meshRequest : meshRequests) {
+        preparedMeshes.push_back(world_.PrepareSubChunkMesh(meshRequest));
+    }
+
+    {
+        std::unique_lock lock(worldMutex_);
+        world_.UpdateStreamingTargets(centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+        for (PreparedChunkColumn& preparedChunk : preparedChunks) {
+            world_.CommitPreparedChunkColumn(std::move(preparedChunk));
+        }
+        for (PreparedSubChunkMesh& preparedMesh : preparedMeshes) {
+            world_.CommitPreparedSubChunkMesh(std::move(preparedMesh));
+        }
+        world_.FinalizeStreamingWindow(
+            centerChunkX,
+            centerChunkZ,
+            worldSettings_.chunkRadius,
+            kChunkGenerationBudgetPerPass
+        );
+        renderUpdate = world_.DrainRenderUpdates();
+    }
+
+    UploadWorldRenderUpdate(renderUpdate);
 }
 
 void VulkanVoxelApp::RequestWorldMeshBuild() {
@@ -1178,22 +1315,18 @@ void VulkanVoxelApp::RequestWorldMeshBuild() {
     }
 
     WorldMeshBuildRequest request{};
-    request.centerChunkX = std::clamp(static_cast<int>(cameraPosition_.x) / kChunkSizeX, 0, kWorldChunkCountX - 1);
-    request.centerChunkZ = std::clamp(static_cast<int>(cameraPosition_.z) / kChunkSizeZ, 0, kWorldChunkCountZ - 1);
-    request.cameraPosition = cameraPosition_;
-    request.cameraForward = GetForwardVector();
-    request.aspectRatio = swapChainExtent_.height > 0
-        ? static_cast<float>(swapChainExtent_.width) / static_cast<float>(swapChainExtent_.height)
-        : (16.0f / 9.0f);
+    request.centerChunkX = static_cast<int>(std::floor(cameraPosition_.x / static_cast<float>(kChunkSizeX)));
+    request.centerChunkZ = static_cast<int>(std::floor(cameraPosition_.z / static_cast<float>(kChunkSizeZ)));
 
     {
         std::lock_guard lock(worldMeshWorkerMutex_);
         request.serial = ++nextWorldMeshRequestSerial_;
         pendingWorldMeshRequest_ = request;
+        worldMeshTargetAvailable_ = true;
         worldMeshRequestPending_ = true;
     }
 
-    worldMeshWorkerCv_.notify_one();
+    worldMeshWorkerCv_.notify_all();
 }
 
 void VulkanVoxelApp::StartWorldMeshWorker() {
@@ -1202,14 +1335,99 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
     }
 
     worldMeshWorkerRunning_ = true;
+    chunkLoadWorkerThreads_.clear();
+    chunkLoadWorkerThreads_.reserve(kChunkLoadWorkerCount);
+    meshWorkerThreads_.clear();
+    meshWorkerThreads_.reserve(kMeshWorkerCount);
+
+    for (std::size_t workerIndex = 0; workerIndex < kChunkLoadWorkerCount; ++workerIndex) {
+        chunkLoadWorkerThreads_.emplace_back([this]() {
+            for (;;) {
+                WorldMeshBuildRequest request{};
+                {
+                    std::unique_lock lock(worldMeshWorkerMutex_);
+                    worldMeshWorkerCv_.wait(lock, [this]() {
+                        return !worldMeshWorkerRunning_ || worldMeshTargetAvailable_;
+                    });
+
+                    if (!worldMeshWorkerRunning_) {
+                        return;
+                    }
+
+                    request = pendingWorldMeshRequest_;
+                }
+
+                PendingChunkId chunkRequest{};
+                bool hasChunkRequest = false;
+                {
+                    std::unique_lock lock(worldMutex_);
+                    world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                    std::vector<PendingChunkId> chunkRequests = world_.AcquireChunkLoadRequests(1);
+                    if (!chunkRequests.empty()) {
+                        chunkRequest = chunkRequests.front();
+                        hasChunkRequest = true;
+                    }
+                }
+
+                if (!hasChunkRequest) {
+                    std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
+                    continue;
+                }
+
+                PreparedChunkColumn preparedChunk = world_.PrepareChunkColumn(chunkRequest.chunkX, chunkRequest.chunkZ);
+                {
+                    std::unique_lock lock(worldMutex_);
+                    world_.CommitPreparedChunkColumn(std::move(preparedChunk));
+                }
+            }
+        });
+    }
+
+    for (std::size_t workerIndex = 0; workerIndex < kMeshWorkerCount; ++workerIndex) {
+        meshWorkerThreads_.emplace_back([this]() {
+            for (;;) {
+                WorldMeshBuildRequest request{};
+                {
+                    std::unique_lock lock(worldMeshWorkerMutex_);
+                    worldMeshWorkerCv_.wait(lock, [this]() {
+                        return !worldMeshWorkerRunning_ || worldMeshTargetAvailable_;
+                    });
+
+                    if (!worldMeshWorkerRunning_) {
+                        return;
+                    }
+
+                    request = pendingWorldMeshRequest_;
+                }
+
+                std::vector<MeshBuildInput> meshRequests;
+                {
+                    std::unique_lock lock(worldMutex_);
+                    world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                    meshRequests = world_.AcquireDirtyMeshRequests(1, request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                }
+
+                if (meshRequests.empty()) {
+                    std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
+                    continue;
+                }
+
+                PreparedSubChunkMesh preparedMesh = world_.PrepareSubChunkMesh(meshRequests.front());
+                {
+                    std::unique_lock lock(worldMutex_);
+                    world_.CommitPreparedSubChunkMesh(std::move(preparedMesh));
+                }
+            }
+        });
+    }
+
     worldMeshWorkerThread_ = std::thread([this]() {
         for (;;) {
             WorldMeshBuildRequest request{};
-
             {
                 std::unique_lock lock(worldMeshWorkerMutex_);
                 worldMeshWorkerCv_.wait(lock, [this]() {
-                    return !worldMeshWorkerRunning_ || worldMeshRequestPending_;
+                    return !worldMeshWorkerRunning_ || worldMeshTargetAvailable_;
                 });
 
                 if (!worldMeshWorkerRunning_) {
@@ -1217,25 +1435,50 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
                 }
 
                 request = pendingWorldMeshRequest_;
+            }
+
+            std::size_t remainingStreamingWork = 0;
+            std::optional<WorldRenderUpdate> renderUpdate;
+            {
+                std::unique_lock lock(worldMutex_);
+                world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                remainingStreamingWork = world_.FinalizeStreamingWindow(
+                    request.centerChunkX,
+                    request.centerChunkZ,
+                    worldSettings_.chunkRadius,
+                    kChunkGenerationBudgetPerPass
+                );
+                if (world_.HasPendingRenderUpdates()) {
+                    renderUpdate = world_.DrainRenderUpdates();
+                }
+            }
+
+            bool hasNewTarget = false;
+            {
+                std::lock_guard lock(worldMeshWorkerMutex_);
+                if (renderUpdate.has_value()) {
+                    if (completedWorldRenderUpdate_.has_value()) {
+                        MergeWorldRenderUpdate(*completedWorldRenderUpdate_, std::move(*renderUpdate));
+                    } else {
+                        completedWorldRenderUpdate_ = std::move(renderUpdate);
+                    }
+                    completedWorldMeshSerial_ = ++nextCompletedWorldMeshSerial_;
+                }
+
+                hasNewTarget = worldMeshRequestPending_;
                 worldMeshRequestPending_ = false;
             }
 
-            WorldMeshData mesh = BuildWorldMeshData(
-                request.centerChunkX,
-                request.centerChunkZ,
-                request.cameraPosition,
-                request.cameraForward,
-                request.aspectRatio
-            );
+            if (hasNewTarget || remainingStreamingWork > 0 || renderUpdate.has_value()) {
+                std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
+                continue;
+            }
 
             {
                 std::lock_guard lock(worldMeshWorkerMutex_);
-                if (request.serial < nextWorldMeshRequestSerial_) {
-                    continue;
+                if (!worldMeshRequestPending_) {
+                    worldMeshTargetAvailable_ = false;
                 }
-
-                completedWorldMesh_ = std::move(mesh);
-                completedWorldMeshSerial_ = request.serial;
             }
         }
     });
@@ -1245,10 +1488,25 @@ void VulkanVoxelApp::StopWorldMeshWorker() {
     {
         std::lock_guard lock(worldMeshWorkerMutex_);
         worldMeshWorkerRunning_ = false;
+        worldMeshTargetAvailable_ = false;
         worldMeshRequestPending_ = false;
     }
 
     worldMeshWorkerCv_.notify_all();
+
+    for (std::thread& workerThread : chunkLoadWorkerThreads_) {
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+    }
+    chunkLoadWorkerThreads_.clear();
+
+    for (std::thread& workerThread : meshWorkerThreads_) {
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+    }
+    meshWorkerThreads_.clear();
 
     if (worldMeshWorkerThread_.joinable()) {
         worldMeshWorkerThread_.join();
@@ -1256,21 +1514,21 @@ void VulkanVoxelApp::StopWorldMeshWorker() {
 }
 
 void VulkanVoxelApp::ConsumeCompletedWorldMesh() {
-    std::optional<WorldMeshData> mesh;
+    std::optional<WorldRenderUpdate> renderUpdate;
     std::uint64_t serial = 0;
 
     {
         std::lock_guard lock(worldMeshWorkerMutex_);
-        if (!completedWorldMesh_.has_value() || completedWorldMeshSerial_ <= uploadedWorldMeshSerial_) {
+        if (!completedWorldRenderUpdate_.has_value() || completedWorldMeshSerial_ <= uploadedWorldMeshSerial_) {
             return;
         }
 
         serial = completedWorldMeshSerial_;
-        mesh = std::move(completedWorldMesh_);
-        completedWorldMesh_.reset();
+        renderUpdate = std::move(completedWorldRenderUpdate_);
+        completedWorldRenderUpdate_.reset();
     }
 
-    UploadWorldMesh(*mesh);
+    UploadWorldRenderUpdate(*renderUpdate);
     uploadedWorldMeshSerial_ = serial;
 }
 

@@ -124,9 +124,11 @@ function(fastsimd_create_dispatch_library simd_library_name)
             # Loop through OSX arches and test compile on each separately
             foreach(CMAKE_OSX_ARCHITECTURES ${CMAKE_OSX_ARCHITECTURES})
                 #message(STATUS "${CMAKE_OSX_ARCHITECTURES} ${feature_set}")
+                set(FASTSIMD_FEATURE_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/fastsimd_feature_test_${feature_set}_${CMAKE_OSX_ARCHITECTURES}")
+                file(MAKE_DIRECTORY "${FASTSIMD_FEATURE_TEST_DIR}")
                 try_compile(
                     compile_result_unused
-                    "${CMAKE_BINARY_DIR}"
+                    "${FASTSIMD_FEATURE_TEST_DIR}"
                     "${FastSIMD_SOURCE_DIR}/cmake/ArchDetect.cpp"
                     OUTPUT_VARIABLE COMPILE_OUTPUT
                     COMPILE_DEFINITIONS -DTEST_FEATURE_SET_ACTIVE=${feature_set}
@@ -142,9 +144,11 @@ function(fastsimd_create_dispatch_library simd_library_name)
                 endif()
             endforeach()
         else()
+            set(FASTSIMD_FEATURE_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/fastsimd_feature_test_${feature_set}")
+            file(MAKE_DIRECTORY "${FASTSIMD_FEATURE_TEST_DIR}")
             try_compile(
                 compile_result_unused
-                "${CMAKE_BINARY_DIR}"
+                "${FASTSIMD_FEATURE_TEST_DIR}"
                 "${FastSIMD_SOURCE_DIR}/cmake/ArchDetect.cpp"
                 OUTPUT_VARIABLE COMPILE_OUTPUT
                 COMPILE_DEFINITIONS -DTEST_FEATURE_SET_ACTIVE=${feature_set}
