@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -40,6 +41,8 @@ constexpr std::size_t kChunkLoadWorkerCount = 3;
 constexpr std::size_t kMeshWorkerCount = 2;
 constexpr std::size_t kChunkGenerationBudgetPerPass = 12;
 constexpr std::size_t kMeshBuildBudgetPerPass = 12;
+constexpr std::size_t kWorldRenderRemovalBudgetPerConsume = 16;
+constexpr std::size_t kWorldRenderUploadBudgetPerConsume = 8;
 constexpr auto kWorldMeshWorkerYieldDelay = std::chrono::milliseconds(1);
 
 struct LoadedImage {
@@ -57,6 +60,72 @@ bool PendingChunkIdEquals(const PendingChunkId& lhs, const PendingChunkId& rhs) 
     return lhs.chunkX == rhs.chunkX && lhs.chunkZ == rhs.chunkZ;
 }
 
+void ErasePendingChunkId(
+    std::vector<PendingChunkId>& chunks,
+    std::unordered_set<PendingChunkId, PendingChunkIdHash>& chunkSet,
+    const PendingChunkId& target
+) {
+    if (chunkSet.erase(target) == 0) {
+        return;
+    }
+
+    chunks.erase(
+        std::remove_if(
+            chunks.begin(),
+            chunks.end(),
+            [&target](const PendingChunkId& candidate) { return PendingChunkIdEquals(candidate, target); }
+        ),
+        chunks.end()
+    );
+}
+
+void EnqueuePendingChunkId(
+    std::vector<PendingChunkId>& chunks,
+    std::unordered_set<PendingChunkId, PendingChunkIdHash>& chunkSet,
+    const PendingChunkId& target
+) {
+    if (chunkSet.insert(target).second) {
+        chunks.push_back(target);
+    }
+}
+
+void ErasePendingChunkUpload(
+    std::vector<ChunkMeshBatchData>& uploads,
+    std::unordered_set<PendingChunkId, PendingChunkIdHash>& uploadSet,
+    const PendingChunkId& target
+) {
+    if (uploadSet.erase(target) == 0) {
+        return;
+    }
+
+    uploads.erase(
+        std::remove_if(
+            uploads.begin(),
+            uploads.end(),
+            [&target](const ChunkMeshBatchData& candidate) { return PendingChunkIdEquals(candidate.id, target); }
+        ),
+        uploads.end()
+    );
+}
+
+void EnqueuePendingChunkUpload(
+    std::vector<ChunkMeshBatchData>& uploads,
+    std::unordered_set<PendingChunkId, PendingChunkIdHash>& uploadSet,
+    ChunkMeshBatchData&& upload
+) {
+    if (uploadSet.insert(upload.id).second) {
+        uploads.push_back(std::move(upload));
+        return;
+    }
+
+    for (ChunkMeshBatchData& existing : uploads) {
+        if (PendingChunkIdEquals(existing.id, upload.id)) {
+            existing = std::move(upload);
+            return;
+        }
+    }
+}
+
 void MergeWorldRenderUpdate(WorldRenderUpdate& destination, WorldRenderUpdate&& source) {
     destination.loadedChunkCount = source.loadedChunkCount;
 
@@ -71,6 +140,17 @@ void MergeWorldRenderUpdate(WorldRenderUpdate& destination, WorldRenderUpdate&& 
         );
     };
 
+    auto eraseUpload = [](std::vector<ChunkMeshBatchData>& uploads, const PendingChunkId& target) {
+        uploads.erase(
+            std::remove_if(
+                uploads.begin(),
+                uploads.end(),
+                [&target](const ChunkMeshBatchData& candidate) { return PendingChunkIdEquals(candidate.id, target); }
+            ),
+            uploads.end()
+        );
+    };
+
     auto containsChunk = [](const std::vector<PendingChunkId>& chunks, const PendingChunkId& target) {
         return std::any_of(
             chunks.begin(),
@@ -80,16 +160,25 @@ void MergeWorldRenderUpdate(WorldRenderUpdate& destination, WorldRenderUpdate&& 
     };
 
     for (const PendingChunkId& removal : source.removals) {
-        eraseChunk(destination.uploads, removal);
+        eraseUpload(destination.uploads, removal);
         if (!containsChunk(destination.removals, removal)) {
             destination.removals.push_back(removal);
         }
     }
 
-    for (const PendingChunkId& upload : source.uploads) {
-        eraseChunk(destination.removals, upload);
-        if (!containsChunk(destination.uploads, upload)) {
-            destination.uploads.push_back(upload);
+    for (ChunkMeshBatchData& upload : source.uploads) {
+        eraseChunk(destination.removals, upload.id);
+
+        bool replaced = false;
+        for (ChunkMeshBatchData& existing : destination.uploads) {
+            if (PendingChunkIdEquals(existing.id, upload.id)) {
+                existing = std::move(upload);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            destination.uploads.push_back(std::move(upload));
         }
     }
 }
@@ -972,27 +1061,116 @@ void VulkanVoxelApp::LoadOverlayFont() {
 }
 
 void VulkanVoxelApp::DestroyWorldRenderBatch(WorldRenderBatch& batch) {
-    if (batch.indexBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, batch.indexBuffer, nullptr);
-        batch.indexBuffer = VK_NULL_HANDLE;
-    }
-    if (batch.indexBufferMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, batch.indexBufferMemory, nullptr);
-        batch.indexBufferMemory = VK_NULL_HANDLE;
-    }
-    if (batch.vertexBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, batch.vertexBuffer, nullptr);
-        batch.vertexBuffer = VK_NULL_HANDLE;
-    }
-    if (batch.vertexBufferMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, batch.vertexBufferMemory, nullptr);
-        batch.vertexBufferMemory = VK_NULL_HANDLE;
-    }
-
-    batch.vertexBufferCapacity = 0;
-    batch.indexBufferCapacity = 0;
+    batch.poolIndex = 0;
+    batch.quadOffset = 0;
+    batch.quadCapacity = 0;
+    batch.quadCount = 0;
     batch.vertexCount = 0;
     batch.indexCount = 0;
+}
+
+void VulkanVoxelApp::DestroyWorldQuadPool(WorldQuadPool& pool) {
+    if (pool.mappedData != nullptr && pool.memory != VK_NULL_HANDLE) {
+        vkUnmapMemory(device_, pool.memory);
+        pool.mappedData = nullptr;
+    }
+    if (pool.buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, pool.buffer, nullptr);
+        pool.buffer = VK_NULL_HANDLE;
+    }
+    if (pool.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, pool.memory, nullptr);
+        pool.memory = VK_NULL_HANDLE;
+    }
+    pool.capacityQuads = 0;
+    pool.committedQuads = 0;
+    pool.freeRanges.clear();
+}
+
+std::uint32_t VulkanVoxelApp::CreateWorldQuadPool(std::uint32_t capacityQuads) {
+    capacityQuads = std::max<std::uint32_t>(capacityQuads, 1u);
+    WorldQuadPool pool{};
+    CreateBuffer(
+        sizeof(WorldQuadRecord) * static_cast<VkDeviceSize>(capacityQuads),
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        pool.buffer,
+        pool.memory
+    );
+    if (vkMapMemory(
+            device_,
+            pool.memory,
+            0,
+            sizeof(WorldQuadRecord) * static_cast<VkDeviceSize>(capacityQuads),
+            0,
+            &pool.mappedData) != VK_SUCCESS) {
+        vkDestroyBuffer(device_, pool.buffer, nullptr);
+        vkFreeMemory(device_, pool.memory, nullptr);
+        throw std::runtime_error("Failed to map world quad pool.");
+    }
+    pool.capacityQuads = capacityQuads;
+    pool.committedQuads = 0;
+    pool.freeRanges.clear();
+    worldQuadPools_.push_back(std::move(pool));
+    return static_cast<std::uint32_t>(worldQuadPools_.size() - 1);
+}
+
+WorldQuadRange VulkanVoxelApp::AllocateWorldQuadRange(WorldQuadPool& pool, std::uint32_t quadCount) {
+    if (quadCount == 0) {
+        return {};
+    }
+
+    auto bestIt = pool.freeRanges.end();
+    for (auto it = pool.freeRanges.begin(); it != pool.freeRanges.end(); ++it) {
+        if (it->count >= quadCount &&
+            (bestIt == pool.freeRanges.end() || it->count < bestIt->count)) {
+            bestIt = it;
+        }
+    }
+    if (bestIt != pool.freeRanges.end()) {
+        WorldQuadRange range{bestIt->offset, quadCount};
+        bestIt->offset += quadCount;
+        bestIt->count -= quadCount;
+        if (bestIt->count == 0) {
+            pool.freeRanges.erase(bestIt);
+        }
+        return range;
+    }
+
+    if (pool.committedQuads + quadCount > pool.capacityQuads) {
+        return {};
+    }
+
+    WorldQuadRange range{pool.committedQuads, quadCount};
+    pool.committedQuads += quadCount;
+    return range;
+}
+
+void VulkanVoxelApp::ReleaseWorldQuadRange(WorldQuadPool& pool, std::uint32_t offset, std::uint32_t count) {
+    if (count == 0) {
+        return;
+    }
+
+    pool.freeRanges.push_back({offset, count});
+    std::sort(
+        pool.freeRanges.begin(),
+        pool.freeRanges.end(),
+        [](const WorldQuadRange& a, const WorldQuadRange& b) {
+            return a.offset < b.offset;
+        }
+    );
+
+    std::vector<WorldQuadRange> mergedRanges;
+    mergedRanges.reserve(pool.freeRanges.size());
+    for (const WorldQuadRange& range : pool.freeRanges) {
+        if (!mergedRanges.empty() &&
+            mergedRanges.back().offset + mergedRanges.back().count == range.offset) {
+            mergedRanges.back().count += range.count;
+        } else {
+            mergedRanges.push_back(range);
+        }
+    }
+    pool.freeRanges = std::move(mergedRanges);
 }
 
 void VulkanVoxelApp::DestroyWorldMeshBuffers() {
@@ -1001,95 +1179,101 @@ void VulkanVoxelApp::DestroyWorldMeshBuffers() {
         DestroyWorldRenderBatch(batch);
     }
     worldRenderBatches_.clear();
-    for (WorldRenderBatch& batch : retiredWorldRenderBatches_) {
-        DestroyWorldRenderBatch(batch);
+    for (WorldQuadPool& pool : worldQuadPools_) {
+        DestroyWorldQuadPool(pool);
     }
-    retiredWorldRenderBatches_.clear();
+    worldQuadPools_.clear();
     worldVertexCount_ = 0;
     worldIndexCount_ = 0;
 }
 
 void VulkanVoxelApp::TryCleanupRetiredWorldRenderBatches() {
-    if (retiredWorldRenderBatches_.empty() || inFlightFences_.empty()) {
-        return;
-    }
-
-    for (VkFence fence : inFlightFences_) {
-        if (vkGetFenceStatus(device_, fence) != VK_SUCCESS) {
-            return;
-        }
-    }
-
-    for (WorldRenderBatch& batch : retiredWorldRenderBatches_) {
-        DestroyWorldRenderBatch(batch);
-    }
-    retiredWorldRenderBatches_.clear();
+    // Shared quad pools stay resident for the app lifetime. No deferred pool retirement path remains.
 }
 
 void VulkanVoxelApp::UploadWorldRenderBatch(WorldRenderBatch& batch, const ChunkMeshBatchData& batchData) {
+    const auto uploadChunkStartTime = std::chrono::steady_clock::now();
     batch.id = batchData.id;
-
-    const VkDeviceSize vertexBufferSize =
-        sizeof(WorldVertex) * static_cast<VkDeviceSize>(batchData.vertices.size());
-    const VkDeviceSize indexBufferSize =
-        sizeof(std::uint32_t) * static_cast<VkDeviceSize>(batchData.indices.size());
-
-    void* mappedData = nullptr;
-
-    if (batch.vertexBuffer == VK_NULL_HANDLE || batch.vertexBufferCapacity < vertexBufferSize) {
-        if (batch.vertexBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device_, batch.vertexBuffer, nullptr);
-            batch.vertexBuffer = VK_NULL_HANDLE;
-        }
-        if (batch.vertexBufferMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(device_, batch.vertexBufferMemory, nullptr);
-            batch.vertexBufferMemory = VK_NULL_HANDLE;
+    const std::uint32_t requiredQuads = static_cast<std::uint32_t>(batchData.quads.size());
+    if (requiredQuads > 0 && batch.quadCapacity < requiredQuads) {
+        if (batch.quadCapacity > 0 && batch.poolIndex < worldQuadPools_.size()) {
+            ReleaseWorldQuadRange(worldQuadPools_[batch.poolIndex], batch.quadOffset, batch.quadCapacity);
         }
 
-        batch.vertexBufferCapacity = std::max(vertexBufferSize, batch.vertexBufferCapacity * 2);
-        CreateBuffer(
-            batch.vertexBufferCapacity,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            batch.vertexBuffer,
-            batch.vertexBufferMemory
+        WorldQuadRange range{};
+        std::uint32_t selectedPoolIndex = std::numeric_limits<std::uint32_t>::max();
+        for (std::uint32_t poolIndex = 0; poolIndex < static_cast<std::uint32_t>(worldQuadPools_.size()); ++poolIndex) {
+            range = AllocateWorldQuadRange(worldQuadPools_[poolIndex], requiredQuads);
+            if (range.count >= requiredQuads) {
+                selectedPoolIndex = poolIndex;
+                break;
+            }
+        }
+
+        if (selectedPoolIndex == std::numeric_limits<std::uint32_t>::max()) {
+            const std::uint32_t previousCapacity =
+                worldQuadPools_.empty() ? 0u : worldQuadPools_.back().capacityQuads;
+            const std::uint32_t newPoolCapacity = std::max<std::uint32_t>(
+                std::max<std::uint32_t>(requiredQuads, 1024u),
+                previousCapacity > 0 ? previousCapacity * 2u : 1024u
+            );
+            const auto uploadAllocStartTime = std::chrono::steady_clock::now();
+            selectedPoolIndex = CreateWorldQuadPool(newPoolCapacity);
+            const auto uploadAllocEndTime = std::chrono::steady_clock::now();
+            AccumulateRuntimeProfileSample(
+                std::chrono::duration<double, std::milli>(uploadAllocEndTime - uploadAllocStartTime).count(),
+                uploadAllocProfileTotalMs_,
+                uploadAllocProfileMaxMs_,
+                uploadAllocProfileSamples_
+            );
+            range = AllocateWorldQuadRange(worldQuadPools_[selectedPoolIndex], requiredQuads);
+        }
+
+        if (range.count < requiredQuads) {
+            throw std::runtime_error("Failed to allocate world quad range.");
+        }
+
+        batch.poolIndex = selectedPoolIndex;
+        batch.quadOffset = range.offset;
+        batch.quadCapacity = range.count;
+    } else if (requiredQuads == 0 && batch.quadCapacity > 0 && batch.poolIndex < worldQuadPools_.size()) {
+        ReleaseWorldQuadRange(worldQuadPools_[batch.poolIndex], batch.quadOffset, batch.quadCapacity);
+        batch.poolIndex = 0;
+        batch.quadOffset = 0;
+        batch.quadCapacity = 0;
+    }
+
+    const auto uploadCopyStartTime = std::chrono::steady_clock::now();
+    if (!batchData.quads.empty()) {
+        if (batch.poolIndex >= worldQuadPools_.size()) {
+            throw std::runtime_error("Invalid world quad pool index.");
+        }
+        WorldQuadPool& pool = worldQuadPools_[batch.poolIndex];
+        std::memcpy(
+            static_cast<std::byte*>(pool.mappedData) +
+                sizeof(WorldQuadRecord) * static_cast<std::size_t>(batch.quadOffset),
+            batchData.quads.data(),
+            sizeof(WorldQuadRecord) * batchData.quads.size()
         );
     }
+    const auto uploadCopyEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(uploadCopyEndTime - uploadCopyStartTime).count(),
+        uploadCopyProfileTotalMs_,
+        uploadCopyProfileMaxMs_,
+        uploadCopyProfileSamples_
+    );
 
-    if (vkMapMemory(device_, batch.vertexBufferMemory, 0, vertexBufferSize, 0, &mappedData) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to map world batch vertex buffer.");
-    }
-    std::memcpy(mappedData, batchData.vertices.data(), static_cast<std::size_t>(vertexBufferSize));
-    vkUnmapMemory(device_, batch.vertexBufferMemory);
-
-    if (batch.indexBuffer == VK_NULL_HANDLE || batch.indexBufferCapacity < indexBufferSize) {
-        if (batch.indexBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device_, batch.indexBuffer, nullptr);
-            batch.indexBuffer = VK_NULL_HANDLE;
-        }
-        if (batch.indexBufferMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(device_, batch.indexBufferMemory, nullptr);
-            batch.indexBufferMemory = VK_NULL_HANDLE;
-        }
-
-        batch.indexBufferCapacity = std::max(indexBufferSize, batch.indexBufferCapacity * 2);
-        CreateBuffer(
-            batch.indexBufferCapacity,
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            batch.indexBuffer,
-            batch.indexBufferMemory
-        );
-    }
-
-    if (vkMapMemory(device_, batch.indexBufferMemory, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to map world batch index buffer.");
-    }
-    std::memcpy(mappedData, batchData.indices.data(), static_cast<std::size_t>(indexBufferSize));
-    vkUnmapMemory(device_, batch.indexBufferMemory);
-
-    batch.vertexCount = static_cast<std::uint32_t>(batchData.vertices.size());
-    batch.indexCount = static_cast<std::uint32_t>(batchData.indices.size());
+    batch.quadCount = static_cast<std::uint32_t>(batchData.quads.size());
+    batch.vertexCount = batch.quadCount * 4;
+    batch.indexCount = batch.quadCount * 6;
+    const auto uploadChunkEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(uploadChunkEndTime - uploadChunkStartTime).count(),
+        uploadChunkProfileTotalMs_,
+        uploadChunkProfileMaxMs_,
+        uploadChunkProfileSamples_
+    );
 }
 
 void VulkanVoxelApp::DestroyPlayerBuffers() {
@@ -1229,13 +1413,16 @@ void VulkanVoxelApp::UpdatePlayerRenderMesh() {
 }
 
 void VulkanVoxelApp::UploadWorldRenderUpdate(const WorldRenderUpdate& update) {
+    const auto uploadStartTime = std::chrono::steady_clock::now();
     if (device_ == VK_NULL_HANDLE) {
         return;
     }
 
     TryCleanupRetiredWorldRenderBatches();
     loadedChunkCount_ = update.loadedChunkCount;
+    std::uint32_t uploadedChunkCount = 0;
 
+    const auto uploadRemoveStartTime = std::chrono::steady_clock::now();
     for (const PendingChunkId& batchId : update.removals) {
         auto batchIt = worldRenderBatches_.find(batchId);
         if (batchIt == worldRenderBatches_.end()) {
@@ -1244,31 +1431,37 @@ void VulkanVoxelApp::UploadWorldRenderUpdate(const WorldRenderUpdate& update) {
 
         worldVertexCount_ -= batchIt->second.vertexCount;
         worldIndexCount_ -= batchIt->second.indexCount;
-        retiredWorldRenderBatches_.push_back(std::move(batchIt->second));
+        if (batchIt->second.quadCapacity > 0 && batchIt->second.poolIndex < worldQuadPools_.size()) {
+            ReleaseWorldQuadRange(
+                worldQuadPools_[batchIt->second.poolIndex],
+                batchIt->second.quadOffset,
+                batchIt->second.quadCapacity
+            );
+        }
         worldRenderBatches_.erase(batchIt);
     }
+    const auto uploadRemoveEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(uploadRemoveEndTime - uploadRemoveStartTime).count(),
+        uploadRemoveProfileTotalMs_,
+        uploadRemoveProfileMaxMs_,
+        uploadRemoveProfileSamples_
+    );
 
-    for (const PendingChunkId& chunkId : update.uploads) {
-        ChunkMeshBatchData batchData{};
-        {
-            std::shared_lock lock(worldMutex_);
-            if (!world_.CopyChunkMeshBatch(chunkId.chunkX, chunkId.chunkZ, batchData)) {
-                auto existingIt = worldRenderBatches_.find(chunkId);
-                if (existingIt != worldRenderBatches_.end()) {
-                    worldVertexCount_ -= existingIt->second.vertexCount;
-                    worldIndexCount_ -= existingIt->second.indexCount;
-                    retiredWorldRenderBatches_.push_back(std::move(existingIt->second));
-                    worldRenderBatches_.erase(existingIt);
-                }
-                continue;
-            }
-        }
-
-        auto existingIt = worldRenderBatches_.find(chunkId);
+    for (const ChunkMeshBatchData& batchData : update.uploads) {
+        const auto uploadInsertStartTime = std::chrono::steady_clock::now();
+        auto existingIt = worldRenderBatches_.find(batchData.id);
         if (existingIt != worldRenderBatches_.end()) {
             worldVertexCount_ -= existingIt->second.vertexCount;
             worldIndexCount_ -= existingIt->second.indexCount;
-            retiredWorldRenderBatches_.push_back(std::move(existingIt->second));
+            if (existingIt->second.quadCapacity > 0 &&
+                existingIt->second.poolIndex < worldQuadPools_.size()) {
+                ReleaseWorldQuadRange(
+                    worldQuadPools_[existingIt->second.poolIndex],
+                    existingIt->second.quadOffset,
+                    existingIt->second.quadCapacity
+                );
+            }
             worldRenderBatches_.erase(existingIt);
         }
 
@@ -1277,6 +1470,30 @@ void VulkanVoxelApp::UploadWorldRenderUpdate(const WorldRenderUpdate& update) {
         worldVertexCount_ += batch.vertexCount;
         worldIndexCount_ += batch.indexCount;
         worldRenderBatches_.emplace(batch.id, std::move(batch));
+        ++uploadedChunkCount;
+        const auto uploadInsertEndTime = std::chrono::steady_clock::now();
+        AccumulateRuntimeProfileSample(
+            std::chrono::duration<double, std::milli>(uploadInsertEndTime - uploadInsertStartTime).count(),
+            uploadInsertProfileTotalMs_,
+            uploadInsertProfileMaxMs_,
+            uploadInsertProfileSamples_
+        );
+    }
+
+    const auto uploadEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(uploadEndTime - uploadStartTime).count(),
+        uploadProfileTotalMs_,
+        uploadProfileMaxMs_,
+        uploadProfileSamples_
+    );
+    if (uploadedChunkCount > 0) {
+        AccumulateRuntimeProfileSample(
+            static_cast<double>(uploadedChunkCount),
+            uploadCountProfileTotalValue_,
+            uploadCountProfileMaxValue_,
+            uploadCountProfileSamples_
+        );
     }
 }
 
@@ -1360,86 +1577,136 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
 
     for (std::size_t workerIndex = 0; workerIndex < kChunkLoadWorkerCount; ++workerIndex) {
         chunkLoadWorkerThreads_.emplace_back([this]() {
-            for (;;) {
-                WorldMeshBuildRequest request{};
-                {
-                    std::unique_lock lock(worldMeshWorkerMutex_);
-                    worldMeshWorkerCv_.wait(lock, [this]() {
-                        return !worldMeshWorkerRunning_ || worldMeshTargetAvailable_;
-                    });
+            try {
+                for (;;) {
+                    PendingChunkId chunkRequest{};
+                    bool hasChunkRequest = false;
+                    {
+                        std::unique_lock lock(worldMeshWorkerMutex_);
+                        worldMeshWorkerCv_.wait(lock, [this]() {
+                            return !worldMeshWorkerRunning_ || !pendingStorageChunkRequests_.empty() || worldMeshTargetAvailable_;
+                        });
 
-                    if (!worldMeshWorkerRunning_) {
-                        return;
+                        if (!worldMeshWorkerRunning_) {
+                            return;
+                        }
+
+                        if (!pendingStorageChunkRequests_.empty()) {
+                            chunkRequest = pendingStorageChunkRequests_.front();
+                            pendingStorageChunkRequests_.pop_front();
+                            pendingStorageChunkRequestSet_.erase(chunkRequest);
+                            hasChunkRequest = true;
+                        }
                     }
 
-                    request = pendingWorldMeshRequest_;
-                }
-
-                PendingChunkId chunkRequest{};
-                bool hasChunkRequest = false;
-                {
-                    std::unique_lock lock(worldMutex_);
-                    world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
-                    std::vector<PendingChunkId> chunkRequests = world_.AcquireChunkLoadRequests(1);
-                    if (!chunkRequests.empty()) {
-                        chunkRequest = chunkRequests.front();
-                        hasChunkRequest = true;
+                    if (!hasChunkRequest) {
+                        std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
+                        continue;
                     }
-                }
 
-                if (!hasChunkRequest) {
-                    std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
-                    continue;
+                    PreparedChunkColumn preparedChunk = world_.PrepareChunkColumn(chunkRequest.chunkX, chunkRequest.chunkZ);
+                    {
+                        std::lock_guard lock(worldMeshWorkerMutex_);
+                        completedPreparedChunkColumns_.push_back(std::move(preparedChunk));
+                        worldMeshTargetAvailable_ = true;
+                    }
+                    worldMeshWorkerCv_.notify_all();
                 }
-
-                PreparedChunkColumn preparedChunk = world_.PrepareChunkColumn(chunkRequest.chunkX, chunkRequest.chunkZ);
-                {
-                    std::unique_lock lock(worldMutex_);
-                    world_.CommitPreparedChunkColumn(std::move(preparedChunk));
-                }
+            } catch (const std::exception& e) {
+                OutputDebugStringA(e.what());
+                OutputDebugStringA("\n");
             }
         });
     }
 
     for (std::size_t workerIndex = 0; workerIndex < kMeshWorkerCount; ++workerIndex) {
         meshWorkerThreads_.emplace_back([this]() {
-            for (;;) {
-                WorldMeshBuildRequest request{};
-                {
-                    std::unique_lock lock(worldMeshWorkerMutex_);
-                    worldMeshWorkerCv_.wait(lock, [this]() {
-                        return !worldMeshWorkerRunning_ || worldMeshTargetAvailable_;
-                    });
+            try {
+                for (;;) {
+                    WorldMeshBuildRequest request{};
+                    {
+                        std::unique_lock lock(worldMeshWorkerMutex_);
+                        worldMeshWorkerCv_.wait(lock, [this]() {
+                            return !worldMeshWorkerRunning_ || worldMeshTargetAvailable_;
+                        });
 
-                    if (!worldMeshWorkerRunning_) {
-                        return;
+                        if (!worldMeshWorkerRunning_) {
+                            return;
+                        }
+
+                        request = pendingWorldMeshRequest_;
                     }
 
-                    request = pendingWorldMeshRequest_;
-                }
+                    std::vector<MeshBuildInput> meshRequests;
+                    {
+                        std::unique_lock lock(worldMutex_);
+                        world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                        meshRequests = world_.AcquireDirtyMeshRequests(1, request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                    }
 
-                std::vector<MeshBuildInput> meshRequests;
-                {
-                    std::unique_lock lock(worldMutex_);
-                    world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
-                    meshRequests = world_.AcquireDirtyMeshRequests(1, request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
-                }
+                    if (meshRequests.empty()) {
+                        std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
+                        continue;
+                    }
 
-                if (meshRequests.empty()) {
-                    std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
-                    continue;
+                    PreparedSubChunkMesh preparedMesh = world_.PrepareSubChunkMesh(meshRequests.front());
+                    {
+                        std::unique_lock lock(worldMutex_);
+                        world_.CommitPreparedSubChunkMesh(std::move(preparedMesh));
+                    }
                 }
-
-                PreparedSubChunkMesh preparedMesh = world_.PrepareSubChunkMesh(meshRequests.front());
-                {
-                    std::unique_lock lock(worldMutex_);
-                    world_.CommitPreparedSubChunkMesh(std::move(preparedMesh));
-                }
+            } catch (const std::exception& e) {
+                OutputDebugStringA(e.what());
+                OutputDebugStringA("\n");
             }
         });
     }
 
+    worldSaveWorkerThread_ = std::thread([this]() {
+        for (;;) {
+            RegionSaveTask saveTask{};
+            bool hasSaveTask = false;
+            {
+                std::unique_lock lock(worldMeshWorkerMutex_);
+                worldMeshWorkerCv_.wait(lock, [this]() {
+                    return !worldMeshWorkerRunning_ || !pendingWorldSaveTasks_.empty();
+                });
+
+                if (!worldMeshWorkerRunning_ && pendingWorldSaveTasks_.empty()) {
+                    return;
+                }
+
+                if (!pendingWorldSaveTasks_.empty()) {
+                    saveTask = std::move(pendingWorldSaveTasks_.front());
+                    pendingWorldSaveTasks_.pop_front();
+                    hasSaveTask = true;
+                }
+            }
+
+            if (!hasSaveTask) {
+                continue;
+            }
+
+            try {
+                world_.ExecuteSaveTask(saveTask);
+                {
+                    std::unique_lock lock(worldMutex_);
+                    world_.CompletePendingSaveTask(saveTask);
+                }
+            } catch (const std::exception& e) {
+                {
+                    std::lock_guard lock(worldMeshWorkerMutex_);
+                    pendingWorldSaveTasks_.push_back(std::move(saveTask));
+                }
+                OutputDebugStringA(e.what());
+                OutputDebugStringA("\n");
+                std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
+            }
+        }
+    });
+
     worldMeshWorkerThread_ = std::thread([this]() {
+        try {
         for (;;) {
             WorldMeshBuildRequest request{};
             {
@@ -1457,9 +1724,27 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
 
             std::size_t remainingStreamingWork = 0;
             std::optional<WorldRenderUpdate> renderUpdate;
+            std::vector<PendingChunkId> chunkRequests;
+            std::vector<PreparedChunkColumn> preparedChunks;
+            std::vector<RegionSaveTask> saveTasks;
+            bool hasPendingPreparedChunks = false;
+            {
+                std::lock_guard lock(worldMeshWorkerMutex_);
+                preparedChunks.reserve(std::min<std::size_t>(completedPreparedChunkColumns_.size(), kChunkGenerationBudgetPerPass));
+                while (!completedPreparedChunkColumns_.empty() &&
+                       preparedChunks.size() < kChunkGenerationBudgetPerPass) {
+                    preparedChunks.push_back(std::move(completedPreparedChunkColumns_.front()));
+                    completedPreparedChunkColumns_.pop_front();
+                }
+            }
             {
                 std::unique_lock lock(worldMutex_);
                 world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                chunkRequests = world_.AcquireChunkLoadRequests(kChunkGenerationBudgetPerPass);
+                for (PreparedChunkColumn& preparedChunk : preparedChunks) {
+                    world_.CommitPreparedChunkColumn(std::move(preparedChunk));
+                }
+                saveTasks = world_.DrainPendingSaveTasks(std::numeric_limits<std::size_t>::max());
                 remainingStreamingWork = world_.FinalizeStreamingWindow(
                     request.centerChunkX,
                     request.centerChunkZ,
@@ -1474,6 +1759,14 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
             bool hasNewTarget = false;
             {
                 std::lock_guard lock(worldMeshWorkerMutex_);
+                for (const PendingChunkId& chunkRequest : chunkRequests) {
+                    if (pendingStorageChunkRequestSet_.insert(chunkRequest).second) {
+                        pendingStorageChunkRequests_.push_back(chunkRequest);
+                    }
+                }
+                for (RegionSaveTask& saveTask : saveTasks) {
+                    pendingWorldSaveTasks_.push_back(std::move(saveTask));
+                }
                 if (renderUpdate.has_value()) {
                     if (completedWorldRenderUpdate_.has_value()) {
                         MergeWorldRenderUpdate(*completedWorldRenderUpdate_, std::move(*renderUpdate));
@@ -1485,19 +1778,28 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
 
                 hasNewTarget = worldMeshRequestPending_;
                 worldMeshRequestPending_ = false;
+                hasPendingPreparedChunks = !completedPreparedChunkColumns_.empty();
             }
 
-            if (hasNewTarget || remainingStreamingWork > 0 || renderUpdate.has_value()) {
+            if (!chunkRequests.empty() || !saveTasks.empty()) {
+                worldMeshWorkerCv_.notify_all();
+            }
+
+            if (hasNewTarget || hasPendingPreparedChunks || remainingStreamingWork > 0 || renderUpdate.has_value() || !saveTasks.empty()) {
                 std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
                 continue;
             }
 
             {
                 std::lock_guard lock(worldMeshWorkerMutex_);
-                if (!worldMeshRequestPending_) {
+                if (!worldMeshRequestPending_ && completedPreparedChunkColumns_.empty()) {
                     worldMeshTargetAvailable_ = false;
                 }
             }
+        }
+        } catch (const std::exception& e) {
+            OutputDebugStringA(e.what());
+            OutputDebugStringA("\n");
         }
     });
 }
@@ -1508,6 +1810,9 @@ void VulkanVoxelApp::StopWorldMeshWorker() {
         worldMeshWorkerRunning_ = false;
         worldMeshTargetAvailable_ = false;
         worldMeshRequestPending_ = false;
+        pendingStorageChunkRequests_.clear();
+        pendingStorageChunkRequestSet_.clear();
+        completedPreparedChunkColumns_.clear();
     }
 
     worldMeshWorkerCv_.notify_all();
@@ -1529,6 +1834,10 @@ void VulkanVoxelApp::StopWorldMeshWorker() {
     if (worldMeshWorkerThread_.joinable()) {
         worldMeshWorkerThread_.join();
     }
+
+    if (worldSaveWorkerThread_.joinable()) {
+        worldSaveWorkerThread_.join();
+    }
 }
 
 void VulkanVoxelApp::ConsumeCompletedWorldMesh() {
@@ -1537,17 +1846,64 @@ void VulkanVoxelApp::ConsumeCompletedWorldMesh() {
 
     {
         std::lock_guard lock(worldMeshWorkerMutex_);
-        if (!completedWorldRenderUpdate_.has_value() || completedWorldMeshSerial_ <= uploadedWorldMeshSerial_) {
-            return;
+        if (completedWorldRenderUpdate_.has_value() && completedWorldMeshSerial_ > uploadedWorldMeshSerial_) {
+            serial = completedWorldMeshSerial_;
+            renderUpdate = std::move(completedWorldRenderUpdate_);
+            completedWorldRenderUpdate_.reset();
         }
-
-        serial = completedWorldMeshSerial_;
-        renderUpdate = std::move(completedWorldRenderUpdate_);
-        completedWorldRenderUpdate_.reset();
     }
 
-    UploadWorldRenderUpdate(*renderUpdate);
-    uploadedWorldMeshSerial_ = serial;
+    if (renderUpdate.has_value()) {
+        pendingWorldRenderLoadedChunkCount_ = renderUpdate->loadedChunkCount;
+
+        for (const PendingChunkId& removal : renderUpdate->removals) {
+            ErasePendingChunkUpload(pendingWorldRenderUploads_, pendingWorldRenderUploadSet_, removal);
+            EnqueuePendingChunkId(pendingWorldRenderRemovals_, pendingWorldRenderRemovalSet_, removal);
+        }
+
+        for (ChunkMeshBatchData& upload : renderUpdate->uploads) {
+            ErasePendingChunkId(pendingWorldRenderRemovals_, pendingWorldRenderRemovalSet_, upload.id);
+            EnqueuePendingChunkUpload(pendingWorldRenderUploads_, pendingWorldRenderUploadSet_, std::move(upload));
+        }
+
+        uploadedWorldMeshSerial_ = serial;
+    }
+
+    if (pendingWorldRenderRemovals_.empty() && pendingWorldRenderUploads_.empty()) {
+        return;
+    }
+
+    WorldRenderUpdate budgetedUpdate{};
+    budgetedUpdate.loadedChunkCount = pendingWorldRenderLoadedChunkCount_;
+
+    const std::size_t removalCount =
+        std::min<std::size_t>(pendingWorldRenderRemovals_.size(), kWorldRenderRemovalBudgetPerConsume);
+    for (std::size_t i = 0; i < removalCount; ++i) {
+        const PendingChunkId batchId = pendingWorldRenderRemovals_[i];
+        budgetedUpdate.removals.push_back(batchId);
+        pendingWorldRenderRemovalSet_.erase(batchId);
+    }
+    pendingWorldRenderRemovals_.erase(
+        pendingWorldRenderRemovals_.begin(),
+        pendingWorldRenderRemovals_.begin() + static_cast<std::ptrdiff_t>(removalCount)
+    );
+
+    const std::size_t uploadCount =
+        std::min<std::size_t>(pendingWorldRenderUploads_.size(), kWorldRenderUploadBudgetPerConsume);
+    for (std::size_t i = 0; i < uploadCount; ++i) {
+        pendingWorldRenderUploadSet_.erase(pendingWorldRenderUploads_[i].id);
+        budgetedUpdate.uploads.push_back(std::move(pendingWorldRenderUploads_[i]));
+    }
+    pendingWorldRenderUploads_.erase(
+        pendingWorldRenderUploads_.begin(),
+        pendingWorldRenderUploads_.begin() + static_cast<std::ptrdiff_t>(uploadCount)
+    );
+
+    if (budgetedUpdate.removals.empty() && budgetedUpdate.uploads.empty()) {
+        return;
+    }
+
+    UploadWorldRenderUpdate(budgetedUpdate);
 }
 
 void VulkanVoxelApp::CreateOverlayBuffer() {

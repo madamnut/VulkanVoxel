@@ -4,8 +4,10 @@
 #include "TerrainConfig.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <deque>
 #include <istream>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
@@ -24,6 +26,11 @@ struct WorldVertex {
     float position[3];
     float uv[2];
     float ao = 1.0f;
+};
+
+struct WorldQuadRecord {
+    std::uint32_t packed0 = 0;
+    std::uint32_t packed1 = 0;
 };
 
 struct WorldBatchId {
@@ -49,8 +56,7 @@ struct WorldVisibleBatch {
 };
 
 struct SubChunkMeshData {
-    std::vector<WorldVertex> vertices;
-    std::vector<std::uint32_t> indices;
+    std::vector<WorldQuadRecord> quads;
     bool dirty = true;
     std::uint64_t revision = 0;
 };
@@ -131,8 +137,7 @@ struct PendingChunkIdHash {
 
 struct ChunkMeshBatchData {
     PendingChunkId id{};
-    std::vector<WorldVertex> vertices;
-    std::vector<std::uint32_t> indices;
+    std::vector<WorldQuadRecord> quads;
 };
 
 struct WorldMeshData {
@@ -143,7 +148,7 @@ struct WorldMeshData {
 };
 
 struct WorldRenderUpdate {
-    std::vector<PendingChunkId> uploads;
+    std::vector<ChunkMeshBatchData> uploads;
     std::vector<PendingChunkId> removals;
     std::size_t loadedChunkCount = 0;
 
@@ -168,9 +173,48 @@ struct MeshBuildInput {
 
 struct PreparedSubChunkMesh {
     DirtySubChunkId id{};
-    std::vector<WorldVertex> vertices;
-    std::vector<std::uint32_t> indices;
+    std::vector<WorldQuadRecord> quads;
 };
+
+struct RegionSaveChunkSnapshot {
+    PendingChunkId id{};
+    std::uint64_t generation = 0;
+    ChunkColumnData column;
+};
+
+struct RegionSaveTask {
+    int regionX = 0;
+    int regionZ = 0;
+    std::vector<RegionSaveChunkSnapshot> chunks;
+};
+
+struct RegionChunkIndexMetadata {
+    std::int32_t chunkX = 0;
+    std::int32_t chunkZ = 0;
+    std::uint64_t offset = 0;
+    std::uint32_t size = 0;
+};
+
+struct RegionIndexCacheEntry {
+    bool regionExists = false;
+    std::unordered_map<std::int64_t, RegionChunkIndexMetadata> chunkIndex;
+};
+
+struct RuntimeProfileStage {
+    double averageMs = 0.0;
+    double maxMs = 0.0;
+    std::uint32_t samples = 0;
+};
+
+struct VoxelWorldRuntimeProfileSnapshot {
+    RuntimeProfileStage chunkLoad{};
+    RuntimeProfileStage diskLoad{};
+    RuntimeProfileStage generate{};
+    RuntimeProfileStage meshBuild{};
+    RuntimeProfileStage save{};
+};
+
+VoxelWorldRuntimeProfileSnapshot ConsumeVoxelWorldRuntimeProfileSnapshot();
 
 class VoxelWorld {
 public:
@@ -199,6 +243,10 @@ public:
     bool SetBlock(int worldX, int worldY, int worldZ, std::uint16_t blockValue);
     void Save();
     bool CopyChunkMeshBatch(int chunkX, int chunkZ, ChunkMeshBatchData& outBatch) const;
+    std::vector<RegionSaveTask> DrainPendingSaveTasks(std::size_t maxCount);
+    void CompletePendingSaveTask(const RegionSaveTask& completedTask);
+    void ExecuteSaveTask(const RegionSaveTask& task) const;
+    bool HasPendingSaveTasks() const;
     void BuildVisibleMesh(
         int centerChunkX,
         int centerChunkZ,
@@ -252,6 +300,9 @@ private:
     void SaveRegionOverrides(int regionX, int regionZ, const std::unordered_map<std::int64_t, const ChunkColumnData*>& overrides) const;
     void LoadRegionFile(int regionX, int regionZ, std::unordered_map<std::int64_t, ChunkColumnData>& outColumns) const;
     void SaveRegionFile(int regionX, int regionZ, const std::unordered_map<std::int64_t, ChunkColumnData>& columns) const;
+    bool TryGetRegionChunkIndexMetadata(int regionX, int regionZ, int chunkX, int chunkZ, RegionChunkIndexMetadata& outMetadata) const;
+    void RefreshRegionIndexCacheEntry(int regionX, int regionZ, const std::filesystem::path& regionPath) const;
+    void InvalidateRegionIndexCacheEntry(int regionX, int regionZ) const;
     bool HasPendingMeshWorkForChunk(int chunkX, int chunkZ) const;
     static bool IsChunkInsideFrustum(
         int chunkX,
@@ -261,13 +312,6 @@ private:
         float verticalFovDegrees,
         float aspectRatio
     );
-    void AppendFaceQuad(
-        SubChunkMeshData& mesh,
-        float worldX,
-        float worldY,
-        float worldZ,
-        int faceIndex
-    ) const;
     void RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex);
     void EnsureTerrainConfigLoaded();
     static std::string GetSaveRootPath();
@@ -296,4 +340,15 @@ private:
     std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingRenderChunkUpdates_;
     std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingRenderChunkRemovals_;
     bool renderStatsDirty_ = true;
+    struct PendingSavedChunkState {
+        std::uint64_t generation = 0;
+        ChunkColumnData column;
+    };
+    mutable std::recursive_mutex regionFileIoMutex_;
+    mutable std::mutex pendingSaveMutex_;
+    std::deque<RegionSaveTask> pendingSaveTasks_;
+    std::unordered_map<std::int64_t, PendingSavedChunkState> pendingSavedChunkColumns_;
+    std::uint64_t nextPendingSaveGeneration_ = 1;
+    mutable std::mutex regionIndexCacheMutex_;
+    mutable std::unordered_map<std::int64_t, RegionIndexCacheEntry> regionIndexCache_;
 };

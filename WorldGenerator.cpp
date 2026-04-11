@@ -37,8 +37,7 @@ void GenerateChunkColumn(int chunkX, int chunkZ, const TerrainConfig& terrainCon
     }
 
     for (SubChunkMeshData& subChunkMesh : outColumn.subChunkMeshes) {
-        subChunkMesh.vertices.clear();
-        subChunkMesh.indices.clear();
+        subChunkMesh.quads.clear();
         subChunkMesh.dirty = true;
         subChunkMesh.revision = 0;
     }

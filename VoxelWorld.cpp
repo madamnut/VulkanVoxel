@@ -2,7 +2,10 @@
 #include "WorldGenerator.h"
 
 #include <algorithm>
+#include <bit>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +17,8 @@
 #include <vector>
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
 
 constexpr float kFrustumPaddingDegrees = 8.0f;
 constexpr int kFaceNeighborOffsets[6][3] = {
@@ -31,6 +36,46 @@ constexpr std::uint8_t kStoredSubChunkUniform = 1;
 constexpr std::uint8_t kStoredSubChunkDense = 2;
 constexpr std::size_t kDirtySubChunkBuildBudgetPerPass = 12;
 constexpr int kMeshBuildSampleSize = kSubChunkSize + 2;
+constexpr std::uint32_t kFaceRowBitMask = (1u << kSubChunkSize) - 1u;
+
+struct RuntimeProfileAccumulator {
+    std::atomic<std::uint64_t> totalNs{0};
+    std::atomic<std::uint64_t> maxNs{0};
+    std::atomic<std::uint32_t> samples{0};
+};
+
+RuntimeProfileAccumulator gChunkLoadProfile{};
+RuntimeProfileAccumulator gDiskLoadProfile{};
+RuntimeProfileAccumulator gGenerateProfile{};
+RuntimeProfileAccumulator gMeshBuildProfile{};
+RuntimeProfileAccumulator gSaveProfile{};
+
+void RecordRuntimeProfileSample(RuntimeProfileAccumulator& accumulator, std::uint64_t elapsedNs) {
+    accumulator.totalNs.fetch_add(elapsedNs, std::memory_order_relaxed);
+    accumulator.samples.fetch_add(1u, std::memory_order_relaxed);
+    std::uint64_t observedMax = accumulator.maxNs.load(std::memory_order_relaxed);
+    while (observedMax < elapsedNs &&
+           !accumulator.maxNs.compare_exchange_weak(
+               observedMax,
+               elapsedNs,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed
+           )) {
+    }
+}
+
+RuntimeProfileStage ConsumeRuntimeProfileStage(RuntimeProfileAccumulator& accumulator) {
+    RuntimeProfileStage stage{};
+    const std::uint64_t totalNs = accumulator.totalNs.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t maxNs = accumulator.maxNs.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t samples = accumulator.samples.exchange(0u, std::memory_order_relaxed);
+    stage.samples = samples;
+    if (samples > 0) {
+        stage.averageMs = static_cast<double>(totalNs) / static_cast<double>(samples) / 1'000'000.0;
+        stage.maxMs = static_cast<double>(maxNs) / 1'000'000.0;
+    }
+    return stage;
+}
 
 struct RegionChunkIndexEntry {
     std::int32_t chunkX = 0;
@@ -40,13 +85,10 @@ struct RegionChunkIndexEntry {
 };
 
 struct FaceMaskCell {
-    int value = 0;
-    std::array<std::uint8_t, 4> ao{3, 3, 3, 3};
+    std::uint32_t packed = 0;
 
     bool operator==(const FaceMaskCell& other) const = default;
 };
-
-constexpr float kAoBrightnessTable[4] = {0.55f, 0.70f, 0.85f, 1.0f};
 
 std::size_t GetMeshBuildSampleIndex(int x, int y, int z) {
     return static_cast<std::size_t>(y * kMeshBuildSampleSize * kMeshBuildSampleSize +
@@ -62,6 +104,36 @@ struct ClipVertex {
 
 Vec3 SubtractVec3(const Vec3& a, const Vec3& b) {
     return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+int CountTrailingZeros(std::uint32_t value) {
+    return static_cast<int>(std::countr_zero(value));
+}
+
+std::uint8_t PackAoPattern(const std::array<std::uint8_t, 4>& aoPattern) {
+    return static_cast<std::uint8_t>(
+        (aoPattern[0] & 0x3u) |
+        ((aoPattern[1] & 0x3u) << 2u) |
+        ((aoPattern[2] & 0x3u) << 4u) |
+        ((aoPattern[3] & 0x3u) << 6u)
+    );
+}
+
+FaceMaskCell MakeFaceMaskCell(std::uint16_t materialId, bool positiveNormal, std::uint8_t packedAo) {
+    FaceMaskCell cell{};
+    cell.packed =
+        (static_cast<std::uint32_t>(materialId) & 0xFFFFu) |
+        ((static_cast<std::uint32_t>(packedAo) & 0xFFu) << 16u) |
+        ((positiveNormal ? 1u : 0u) << 24u);
+    return cell;
+}
+
+bool IsPositiveFaceMaskCell(const FaceMaskCell& cell) {
+    return (cell.packed & (1u << 24u)) != 0;
+}
+
+std::uint16_t GetFaceMaskCellMaterialId(const FaceMaskCell& cell) {
+    return static_cast<std::uint16_t>(cell.packed & 0xFFFFu);
 }
 
 Vec3 CrossVec3(const Vec3& a, const Vec3& b) {
@@ -138,6 +210,49 @@ void AppendQuad(
             mesh.indices.push_back(baseIndex + 3);
         }
     }
+}
+
+template <typename MeshType>
+void AppendQuadRecord(
+    MeshType& mesh,
+    int localCellX,
+    int localCellY,
+    int localCellZ,
+    int subChunkIndex,
+    int axis,
+    bool positiveNormal,
+    int width,
+    int height,
+    std::uint16_t materialId,
+    const std::array<std::uint8_t, 4>& aoPattern,
+    bool flipDiagonal,
+    bool reverseWinding
+) {
+    WorldQuadRecord record{};
+    record.packed0 =
+        (static_cast<std::uint32_t>(localCellX) & 0xFu) |
+        ((static_cast<std::uint32_t>(localCellY) & 0xFu) << 4u) |
+        ((static_cast<std::uint32_t>(localCellZ) & 0xFu) << 8u) |
+        ((static_cast<std::uint32_t>(subChunkIndex) & 0x1Fu) << 12u) |
+        ((static_cast<std::uint32_t>(axis) & 0x3u) << 17u) |
+        ((positiveNormal ? 1u : 0u) << 19u) |
+        ((static_cast<std::uint32_t>(width - 1) & 0xFu) << 20u) |
+        ((static_cast<std::uint32_t>(height - 1) & 0xFu) << 24u);
+    if (flipDiagonal) {
+        record.packed0 |= (1u << 28u);
+    }
+    if (reverseWinding) {
+        record.packed0 |= (1u << 29u);
+    }
+
+    record.packed1 =
+        (static_cast<std::uint32_t>(aoPattern[0]) & 0x3u) |
+        ((static_cast<std::uint32_t>(aoPattern[1]) & 0x3u) << 2u) |
+        ((static_cast<std::uint32_t>(aoPattern[2]) & 0x3u) << 4u) |
+        ((static_cast<std::uint32_t>(aoPattern[3]) & 0x3u) << 6u) |
+        ((static_cast<std::uint32_t>(materialId) & 0xFFFFu) << 8u);
+
+    mesh.push_back(record);
 }
 
 template <typename Stream, typename T>
@@ -218,32 +333,339 @@ std::array<std::uint8_t, 4> ComputeQuadAoPattern(
 }
 
 template <typename SampleFn>
-std::array<float, 4> ComputeQuadAoValues(
+void BuildSubChunkQuadRecords(
     const SampleFn& sampleBlock,
-    int axis,
-    bool positiveNormal,
-    int planeSlice,
-    int startU,
-    int startV,
-    int width,
-    int height
+    int minWorldX,
+    int minWorldY,
+    int minWorldZ,
+    int subChunkIndex,
+    std::vector<WorldQuadRecord>& outQuads
 ) {
-    const std::array<std::uint8_t, 4> pattern =
-        ComputeQuadAoPattern(sampleBlock, axis, positiveNormal, planeSlice, startU, startV, width, height);
-    return {
-        kAoBrightnessTable[pattern[0]],
-        kAoBrightnessTable[pattern[1]],
-        kAoBrightnessTable[pattern[2]],
-        kAoBrightnessTable[pattern[3]],
+    const auto profileStartTime = Clock::now();
+    constexpr int dims[3] = {kChunkSizeX, kSubChunkSize, kChunkSizeZ};
+    std::vector<FaceMaskCell> mask(static_cast<std::size_t>(kChunkSizeX * kChunkSizeZ));
+
+    const auto emitGreedyQuad = [&](
+                                    int axis,
+                                    bool positiveNormal,
+                                    int slice,
+                                    int startU,
+                                    int startV,
+                                    int width,
+                                    int height,
+                                    int materialValue) {
+        const int u = (axis + 1) % 3;
+        const int v = (axis + 2) % 3;
+
+        Vec3 base{};
+        if (axis == 0) {
+            base.x = static_cast<float>(minWorldX + slice);
+        } else if (axis == 1) {
+            base.y = static_cast<float>(minWorldY + slice);
+        } else {
+            base.z = static_cast<float>(minWorldZ + slice);
+        }
+
+        if (u == 0) {
+            base.x = static_cast<float>(minWorldX + startU);
+        } else if (u == 1) {
+            base.y = static_cast<float>(minWorldY + startU);
+        } else {
+            base.z = static_cast<float>(minWorldZ + startU);
+        }
+
+        if (v == 0) {
+            base.x = static_cast<float>(minWorldX + startV);
+        } else if (v == 1) {
+            base.y = static_cast<float>(minWorldY + startV);
+        } else {
+            base.z = static_cast<float>(minWorldZ + startV);
+        }
+
+        Vec3 du{};
+        Vec3 dv{};
+        if (u == 0) {
+            du.x = static_cast<float>(width);
+        } else if (u == 1) {
+            du.y = static_cast<float>(width);
+        } else {
+            du.z = static_cast<float>(width);
+        }
+
+        if (v == 0) {
+            dv.x = static_cast<float>(height);
+        } else if (v == 1) {
+            dv.y = static_cast<float>(height);
+        } else {
+            dv.z = static_cast<float>(height);
+        }
+
+        Vec3 p0{};
+        Vec3 p1{};
+        Vec3 p2{};
+        Vec3 p3{};
+        const std::array<std::uint8_t, 4> baseAoPattern =
+            ComputeQuadAoPattern(sampleBlock, axis, positiveNormal, slice, startU, startV, width, height);
+        std::array<std::uint8_t, 4> vertexAoPattern{};
+        const std::uint16_t materialId = static_cast<std::uint16_t>(std::abs(materialValue));
+
+        if (axis == 0) {
+            if (positiveNormal) {
+                p0 = base + dv;
+                p1 = base;
+                p2 = base + du;
+                p3 = base + du + dv;
+                vertexAoPattern = {baseAoPattern[3], baseAoPattern[0], baseAoPattern[1], baseAoPattern[2]};
+            } else {
+                p0 = base;
+                p1 = base + dv;
+                p2 = base + du + dv;
+                p3 = base + du;
+                vertexAoPattern = {baseAoPattern[0], baseAoPattern[3], baseAoPattern[2], baseAoPattern[1]};
+            }
+        } else if (positiveNormal) {
+            p0 = base;
+            p1 = base + du;
+            p2 = base + du + dv;
+            p3 = base + dv;
+            vertexAoPattern = baseAoPattern;
+        } else {
+            p0 = base + du;
+            p1 = base;
+            p2 = base + dv;
+            p3 = base + du + dv;
+            vertexAoPattern = {baseAoPattern[1], baseAoPattern[0], baseAoPattern[3], baseAoPattern[2]};
+        }
+
+        const bool flipDiagonal =
+            (static_cast<int>(vertexAoPattern[0]) + static_cast<int>(vertexAoPattern[2])) >
+            (static_cast<int>(vertexAoPattern[1]) + static_cast<int>(vertexAoPattern[3]));
+        Vec3 expectedNormal{};
+        if (axis == 0) {
+            expectedNormal.x = positiveNormal ? 1.0f : -1.0f;
+        } else if (axis == 1) {
+            expectedNormal.y = positiveNormal ? 1.0f : -1.0f;
+        } else {
+            expectedNormal.z = positiveNormal ? 1.0f : -1.0f;
+        }
+        const Vec3 edge01 = SubtractVec3(p1, p0);
+        const Vec3 edge02 = SubtractVec3(p2, p0);
+        const bool reverseWinding = DotVec3(CrossVec3(edge01, edge02), expectedNormal) < 0.0f;
+        int localCellCoords[3] = {};
+        localCellCoords[axis] = positiveNormal ? (slice - 1) : slice;
+        localCellCoords[u] = startU;
+        localCellCoords[v] = startV;
+        AppendQuadRecord(
+            outQuads,
+            localCellCoords[0],
+            localCellCoords[1],
+            localCellCoords[2],
+            subChunkIndex,
+            axis,
+            positiveNormal,
+            width,
+            height,
+            materialId,
+            vertexAoPattern,
+            flipDiagonal,
+            reverseWinding
+        );
     };
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const int u = (axis + 1) % 3;
+        const int v = (axis + 2) % 3;
+
+        for (int slice = -1; slice < dims[axis]; ++slice) {
+            std::array<std::uint32_t, kSubChunkSize> rowBits{};
+            for (int j = 0; j < dims[v]; ++j) {
+                std::array<std::uint16_t, kSubChunkSize> rowValuesA{};
+                std::array<std::uint16_t, kSubChunkSize> rowValuesB{};
+                std::uint32_t solidMaskA = 0;
+                std::uint32_t solidMaskB = 0;
+
+                for (int i = 0; i < dims[u]; ++i) {
+                    int aCoords[3] = {};
+                    int bCoords[3] = {};
+                    aCoords[axis] = slice;
+                    bCoords[axis] = slice + 1;
+                    aCoords[u] = i;
+                    bCoords[u] = i;
+                    aCoords[v] = j;
+                    bCoords[v] = j;
+
+                    const std::uint16_t a = sampleBlock(aCoords[0], aCoords[1], aCoords[2]);
+                    const std::uint16_t b = sampleBlock(bCoords[0], bCoords[1], bCoords[2]);
+                    rowValuesA[static_cast<std::size_t>(i)] = a;
+                    rowValuesB[static_cast<std::size_t>(i)] = b;
+                    if (a != 0) {
+                        solidMaskA |= (1u << i);
+                    }
+                    if (b != 0) {
+                        solidMaskB |= (1u << i);
+                    }
+                    mask[static_cast<std::size_t>(i + j * dims[u])] = FaceMaskCell{};
+                }
+
+                std::uint32_t positiveMask = solidMaskA & ~solidMaskB;
+                std::uint32_t negativeMask = solidMaskB & ~solidMaskA;
+                if (slice < 0) {
+                    positiveMask = 0;
+                }
+                if ((slice + 1) >= dims[axis]) {
+                    negativeMask = 0;
+                }
+                positiveMask &= kFaceRowBitMask;
+                negativeMask &= kFaceRowBitMask;
+                rowBits[static_cast<std::size_t>(j)] = positiveMask | negativeMask;
+
+                std::uint32_t remainingRowBits = rowBits[static_cast<std::size_t>(j)];
+                while (remainingRowBits != 0) {
+                    const int i = CountTrailingZeros(remainingRowBits);
+                    FaceMaskCell face{};
+                    if ((positiveMask & (1u << i)) != 0) {
+                        face = MakeFaceMaskCell(
+                            rowValuesA[static_cast<std::size_t>(i)],
+                            true,
+                            PackAoPattern(ComputeQuadAoPattern(sampleBlock, axis, true, slice + 1, i, j, 1, 1))
+                        );
+                    } else if ((negativeMask & (1u << i)) != 0) {
+                        face = MakeFaceMaskCell(
+                            rowValuesB[static_cast<std::size_t>(i)],
+                            false,
+                            PackAoPattern(ComputeQuadAoPattern(sampleBlock, axis, false, slice + 1, i, j, 1, 1))
+                        );
+                    }
+                    mask[static_cast<std::size_t>(i + j * dims[u])] = face;
+                    remainingRowBits &= (remainingRowBits - 1);
+                }
+            }
+
+            for (int j = 0; j < dims[v]; ++j) {
+                while (rowBits[static_cast<std::size_t>(j)] != 0) {
+                    const int i = CountTrailingZeros(rowBits[static_cast<std::size_t>(j)]);
+                    const FaceMaskCell current = mask[static_cast<std::size_t>(i + j * dims[u])];
+
+                    int width = 1;
+                    while (i + width < dims[u] &&
+                           (rowBits[static_cast<std::size_t>(j)] & (1u << (i + width))) != 0 &&
+                           mask[static_cast<std::size_t>(i + width + j * dims[u])] == current) {
+                        ++width;
+                    }
+
+                    int height = 1;
+                    bool done = false;
+                    while (j + height < dims[v] && !done) {
+                        for (int k = 0; k < width; ++k) {
+                            if (mask[static_cast<std::size_t>(i + k + (j + height) * dims[u])] != current) {
+                                done = true;
+                                break;
+                            }
+                        }
+                        if (!done) {
+                            ++height;
+                        }
+                    }
+
+                    emitGreedyQuad(
+                        axis,
+                        IsPositiveFaceMaskCell(current),
+                        slice + 1,
+                        i,
+                        j,
+                        width,
+                        height,
+                        static_cast<int>(GetFaceMaskCellMaterialId(current))
+                    );
+
+                    const std::uint32_t rectMask = ((1u << width) - 1u) << i;
+                    for (int row = 0; row < height; ++row) {
+                        rowBits[static_cast<std::size_t>(j + row)] &= ~rectMask;
+                        for (int col = 0; col < width; ++col) {
+                            mask[static_cast<std::size_t>(i + col + (j + row) * dims[u])] = FaceMaskCell{};
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const auto profileEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gMeshBuildProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(profileEndTime - profileStartTime).count()
+        )
+    );
 }
 
 }  // namespace
 
 VoxelWorld::VoxelWorld() = default;
 VoxelWorld::~VoxelWorld() = default;
-VoxelWorld::VoxelWorld(VoxelWorld&&) noexcept = default;
-VoxelWorld& VoxelWorld::operator=(VoxelWorld&&) noexcept = default;
+VoxelWorld::VoxelWorld(VoxelWorld&& other) noexcept
+    : initialized_(other.initialized_),
+      terrainConfigLoaded_(other.terrainConfigLoaded_),
+      saveDirty_(other.saveDirty_),
+      streamingWindowInitialized_(other.streamingWindowInitialized_),
+      streamingCenterChunkX_(other.streamingCenterChunkX_),
+      streamingCenterChunkZ_(other.streamingCenterChunkZ_),
+      streamingKeepRadius_(other.streamingKeepRadius_),
+      terrainConfig_(std::move(other.terrainConfig_)),
+      chunkColumns_(std::move(other.chunkColumns_)),
+      desiredChunks_(std::move(other.desiredChunks_)),
+      retiringChunks_(std::move(other.retiringChunks_)),
+      inFlightChunkLoads_(std::move(other.inFlightChunkLoads_)),
+      pendingChunkLoadQueue_(std::move(other.pendingChunkLoadQueue_)),
+      queuedChunkLoads_(std::move(other.queuedChunkLoads_)),
+      dirtySubChunkQueue_(std::move(other.dirtySubChunkQueue_)),
+      queuedDirtySubChunks_(std::move(other.queuedDirtySubChunks_)),
+      inFlightDirtySubChunks_(std::move(other.inFlightDirtySubChunks_)),
+      activeRenderChunks_(std::move(other.activeRenderChunks_)),
+      pendingRenderChunkUpdates_(std::move(other.pendingRenderChunkUpdates_)),
+      pendingRenderChunkRemovals_(std::move(other.pendingRenderChunkRemovals_)),
+      renderStatsDirty_(other.renderStatsDirty_),
+      regionIndexCache_(std::move(other.regionIndexCache_)) {}
+
+VoxelWorld& VoxelWorld::operator=(VoxelWorld&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    initialized_ = other.initialized_;
+    terrainConfigLoaded_ = other.terrainConfigLoaded_;
+    saveDirty_ = other.saveDirty_;
+    streamingWindowInitialized_ = other.streamingWindowInitialized_;
+    streamingCenterChunkX_ = other.streamingCenterChunkX_;
+    streamingCenterChunkZ_ = other.streamingCenterChunkZ_;
+    streamingKeepRadius_ = other.streamingKeepRadius_;
+    terrainConfig_ = std::move(other.terrainConfig_);
+    chunkColumns_ = std::move(other.chunkColumns_);
+    desiredChunks_ = std::move(other.desiredChunks_);
+    retiringChunks_ = std::move(other.retiringChunks_);
+    inFlightChunkLoads_ = std::move(other.inFlightChunkLoads_);
+    pendingChunkLoadQueue_ = std::move(other.pendingChunkLoadQueue_);
+    queuedChunkLoads_ = std::move(other.queuedChunkLoads_);
+    dirtySubChunkQueue_ = std::move(other.dirtySubChunkQueue_);
+    queuedDirtySubChunks_ = std::move(other.queuedDirtySubChunks_);
+    inFlightDirtySubChunks_ = std::move(other.inFlightDirtySubChunks_);
+    activeRenderChunks_ = std::move(other.activeRenderChunks_);
+    pendingRenderChunkUpdates_ = std::move(other.pendingRenderChunkUpdates_);
+    pendingRenderChunkRemovals_ = std::move(other.pendingRenderChunkRemovals_);
+    renderStatsDirty_ = other.renderStatsDirty_;
+    regionIndexCache_ = std::move(other.regionIndexCache_);
+    return *this;
+}
+
+VoxelWorldRuntimeProfileSnapshot ConsumeVoxelWorldRuntimeProfileSnapshot() {
+    VoxelWorldRuntimeProfileSnapshot snapshot{};
+    snapshot.chunkLoad = ConsumeRuntimeProfileStage(gChunkLoadProfile);
+    snapshot.diskLoad = ConsumeRuntimeProfileStage(gDiskLoadProfile);
+    snapshot.generate = ConsumeRuntimeProfileStage(gGenerateProfile);
+    snapshot.meshBuild = ConsumeRuntimeProfileStage(gMeshBuildProfile);
+    snapshot.save = ConsumeRuntimeProfileStage(gSaveProfile);
+    return snapshot;
+}
 
 std::int64_t VoxelWorld::MakeChunkKey(int chunkX, int chunkZ) {
     const std::uint64_t key =
@@ -384,16 +806,41 @@ std::vector<PendingChunkId> VoxelWorld::AcquireChunkLoadRequests(std::size_t max
 }
 
 PreparedChunkColumn VoxelWorld::PrepareChunkColumn(int chunkX, int chunkZ) const {
+    const auto profileStartTime = Clock::now();
     PreparedChunkColumn prepared{};
     prepared.id = {chunkX, chunkZ};
 
+    const auto diskLoadStartTime = Clock::now();
     const bool loadedFromDisk = LoadChunkColumn(chunkX, chunkZ, prepared.column);
+    const auto diskLoadEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gDiskLoadProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(diskLoadEndTime - diskLoadStartTime).count()
+        )
+    );
+
     if (!loadedFromDisk) {
+        const auto generateStartTime = Clock::now();
         GenerateChunkColumn(chunkX, chunkZ, prepared.column);
+        const auto generateEndTime = Clock::now();
+        RecordRuntimeProfileSample(
+            gGenerateProfile,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(generateEndTime - generateStartTime).count()
+            )
+        );
         prepared.column.modified = true;
         prepared.generated = true;
     }
 
+    const auto profileEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gChunkLoadProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(profileEndTime - profileStartTime).count()
+        )
+    );
     return prepared;
 }
 
@@ -491,221 +938,17 @@ PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input
     PreparedSubChunkMesh preparedMesh{};
     preparedMesh.id = input.id;
 
-    constexpr int dims[3] = {kChunkSizeX, kSubChunkSize, kChunkSizeZ};
-    std::vector<FaceMaskCell> mask(static_cast<std::size_t>(kChunkSizeX * kChunkSizeZ));
-
     const auto sampleBlock = [&input](int localX, int localY, int localZ) -> std::uint16_t {
         return input.blocks[GetMeshBuildSampleIndex(localX + 1, localY + 1, localZ + 1)];
     };
-
-    if (sampleBlock(0, 0, 0) == 0) {
-        bool hasAnySolid = false;
-        for (std::uint16_t blockValue : input.blocks) {
-            if (blockValue != 0) {
-                hasAnySolid = true;
-                break;
-            }
-        }
-        if (!hasAnySolid) {
-            return preparedMesh;
-        }
-    }
-
-    const auto emitGreedyQuad = [&](
-                                    int axis,
-                                    bool positiveNormal,
-                                    int slice,
-                                    int startU,
-                                    int startV,
-                                    int width,
-                                    int height) {
-        const int u = (axis + 1) % 3;
-        const int v = (axis + 2) % 3;
-
-        Vec3 base{};
-        if (axis == 0) {
-            base.x = static_cast<float>(input.minWorldX + slice);
-        } else if (axis == 1) {
-            base.y = static_cast<float>(input.minWorldY + slice);
-        } else {
-            base.z = static_cast<float>(input.minWorldZ + slice);
-        }
-
-        if (u == 0) {
-            base.x = static_cast<float>(input.minWorldX + startU);
-        } else if (u == 1) {
-            base.y = static_cast<float>(input.minWorldY + startU);
-        } else {
-            base.z = static_cast<float>(input.minWorldZ + startU);
-        }
-
-        if (v == 0) {
-            base.x = static_cast<float>(input.minWorldX + startV);
-        } else if (v == 1) {
-            base.y = static_cast<float>(input.minWorldY + startV);
-        } else {
-            base.z = static_cast<float>(input.minWorldZ + startV);
-        }
-
-        Vec3 du{};
-        Vec3 dv{};
-        if (u == 0) {
-            du.x = static_cast<float>(width);
-        } else if (u == 1) {
-            du.y = static_cast<float>(width);
-        } else {
-            du.z = static_cast<float>(width);
-        }
-
-        if (v == 0) {
-            dv.x = static_cast<float>(height);
-        } else if (v == 1) {
-            dv.y = static_cast<float>(height);
-        } else {
-            dv.z = static_cast<float>(height);
-        }
-
-        Vec3 p0{};
-        Vec3 p1{};
-        Vec3 p2{};
-        Vec3 p3{};
-        float quadUMax = static_cast<float>(width);
-        float quadVMax = static_cast<float>(height);
-        const std::array<float, 4> baseAo =
-            ComputeQuadAoValues(sampleBlock, axis, positiveNormal, slice, startU, startV, width, height);
-        std::array<float, 4> vertexAo{};
-
-        if (axis == 0) {
-            quadUMax = static_cast<float>(height);
-            quadVMax = static_cast<float>(width);
-            if (positiveNormal) {
-                p0 = base + dv;
-                p1 = base;
-                p2 = base + du;
-                p3 = base + du + dv;
-                vertexAo = {baseAo[3], baseAo[0], baseAo[1], baseAo[2]};
-            } else {
-                p0 = base;
-                p1 = base + dv;
-                p2 = base + du + dv;
-                p3 = base + du;
-                vertexAo = {baseAo[0], baseAo[3], baseAo[2], baseAo[1]};
-            }
-        } else if (positiveNormal) {
-            p0 = base;
-            p1 = base + du;
-            p2 = base + du + dv;
-            p3 = base + dv;
-            vertexAo = baseAo;
-        } else {
-            p0 = base + du;
-            p1 = base;
-            p2 = base + dv;
-            p3 = base + du + dv;
-            vertexAo = {baseAo[1], baseAo[0], baseAo[3], baseAo[2]};
-        }
-
-        const bool flipDiagonal = (vertexAo[0] + vertexAo[2]) > (vertexAo[1] + vertexAo[3]);
-        Vec3 expectedNormal{};
-        if (axis == 0) {
-            expectedNormal.x = positiveNormal ? 1.0f : -1.0f;
-        } else if (axis == 1) {
-            expectedNormal.y = positiveNormal ? 1.0f : -1.0f;
-        } else {
-            expectedNormal.z = positiveNormal ? 1.0f : -1.0f;
-        }
-        const Vec3 edge01 = SubtractVec3(p1, p0);
-        const Vec3 edge02 = SubtractVec3(p2, p0);
-        const bool reverseWinding = DotVec3(CrossVec3(edge01, edge02), expectedNormal) < 0.0f;
-        AppendQuad(
-            preparedMesh,
-            p0,
-            p1,
-            p2,
-            p3,
-            quadUMax,
-            quadVMax,
-            vertexAo,
-            flipDiagonal,
-            reverseWinding
-        );
-    };
-
-    for (int axis = 0; axis < 3; ++axis) {
-        const int u = (axis + 1) % 3;
-        const int v = (axis + 2) % 3;
-
-        for (int slice = -1; slice < dims[axis]; ++slice) {
-            int maskIndex = 0;
-            for (int j = 0; j < dims[v]; ++j) {
-                for (int i = 0; i < dims[u]; ++i) {
-                    int aCoords[3] = {};
-                    int bCoords[3] = {};
-                    aCoords[axis] = slice;
-                    bCoords[axis] = slice + 1;
-                    aCoords[u] = i;
-                    bCoords[u] = i;
-                    aCoords[v] = j;
-                    bCoords[v] = j;
-
-                    const std::uint16_t a = sampleBlock(aCoords[0], aCoords[1], aCoords[2]);
-                    const std::uint16_t b = sampleBlock(bCoords[0], bCoords[1], bCoords[2]);
-
-                    FaceMaskCell face{};
-                    if (a != 0 && b == 0) {
-                        face.value = static_cast<int>(a);
-                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, true, slice + 1, i, j, 1, 1);
-                    } else if (a == 0 && b != 0) {
-                        face.value = -static_cast<int>(b);
-                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, false, slice + 1, i, j, 1, 1);
-                    }
-                    mask[static_cast<std::size_t>(maskIndex)] = face;
-
-                    ++maskIndex;
-                }
-            }
-
-            for (int j = 0; j < dims[v]; ++j) {
-                for (int i = 0; i < dims[u];) {
-                    const FaceMaskCell current = mask[static_cast<std::size_t>(i + j * dims[u])];
-                    if (current.value == 0) {
-                        ++i;
-                        continue;
-                    }
-
-                    int width = 1;
-                    while (i + width < dims[u] &&
-                           mask[static_cast<std::size_t>(i + width + j * dims[u])] == current) {
-                        ++width;
-                    }
-
-                    int height = 1;
-                    bool done = false;
-                    while (j + height < dims[v] && !done) {
-                        for (int k = 0; k < width; ++k) {
-                            if (mask[static_cast<std::size_t>(i + k + (j + height) * dims[u])] != current) {
-                                done = true;
-                                break;
-                            }
-                        }
-                        if (!done) {
-                            ++height;
-                        }
-                    }
-
-                    emitGreedyQuad(axis, current.value > 0, slice + 1, i, j, width, height);
-
-                    for (int row = 0; row < height; ++row) {
-                        for (int col = 0; col < width; ++col) {
-                            mask[static_cast<std::size_t>(i + col + (j + row) * dims[u])] = FaceMaskCell{};
-                        }
-                    }
-
-                    i += width;
-                }
-            }
-        }
-    }
+    BuildSubChunkQuadRecords(
+        sampleBlock,
+        input.minWorldX,
+        input.minWorldY,
+        input.minWorldZ,
+        input.id.subChunkIndex,
+        preparedMesh.quads
+    );
 
     return preparedMesh;
 }
@@ -726,8 +969,7 @@ bool VoxelWorld::CommitPreparedSubChunkMesh(PreparedSubChunkMesh&& preparedMesh)
     }
 
     SubChunkMeshData& mesh = columnIt->second.subChunkMeshes[static_cast<std::size_t>(id.subChunkIndex)];
-    mesh.vertices = std::move(preparedMesh.vertices);
-    mesh.indices = std::move(preparedMesh.indices);
+    mesh.quads = std::move(preparedMesh.quads);
     mesh.dirty = queuedDirtySubChunks_.contains(id);
     ++mesh.revision;
     if (!HasPendingMeshWorkForChunk(id.chunkX, id.chunkZ)) {
@@ -750,7 +992,10 @@ WorldRenderUpdate VoxelWorld::DrainRenderUpdates() {
 
     update.uploads.reserve(pendingRenderChunkUpdates_.size());
     for (const PendingChunkId& chunkId : pendingRenderChunkUpdates_) {
-        update.uploads.push_back(chunkId);
+        ChunkMeshBatchData batch{};
+        if (CopyChunkMeshBatch(chunkId.chunkX, chunkId.chunkZ, batch)) {
+            update.uploads.push_back(std::move(batch));
+        }
     }
     pendingRenderChunkUpdates_.clear();
     renderStatsDirty_ = false;
@@ -763,6 +1008,9 @@ bool VoxelWorld::HasPendingRenderUpdates() const {
 }
 
 std::size_t VoxelWorld::FinalizeStreamingWindow(int centerChunkX, int centerChunkZ, int keepRadius, std::size_t unloadBudget) {
+    (void)centerChunkX;
+    (void)centerChunkZ;
+    (void)keepRadius;
     const std::size_t remainingMissingCount = pendingChunkLoadQueue_.size() + inFlightChunkLoads_.size();
     const std::size_t remainingDirtyCount = dirtySubChunkQueue_.size() + inFlightDirtySubChunks_.size();
     UnloadRetiredChunks(unloadBudget);
@@ -852,8 +1100,7 @@ void VoxelWorld::InitializeSubChunkMeshes(ChunkColumnData& column, bool dirty) c
     column.subChunkMeshes.clear();
     column.subChunkMeshes.resize(kSubChunkCountY);
     for (SubChunkMeshData& subChunkMesh : column.subChunkMeshes) {
-        subChunkMesh.vertices.clear();
-        subChunkMesh.indices.clear();
+        subChunkMesh.quads.clear();
         subChunkMesh.dirty = dirty;
         subChunkMesh.revision = 0;
     }
@@ -1072,7 +1319,7 @@ void VoxelWorld::QueueRenderChunkUpdate(int chunkX, int chunkZ) {
 
     bool hasRenderableMesh = false;
     for (const SubChunkMeshData& mesh : columnIt->second.subChunkMeshes) {
-        if (!mesh.vertices.empty() && !mesh.indices.empty()) {
+        if (!mesh.quads.empty()) {
             hasRenderableMesh = true;
             break;
         }
@@ -1205,8 +1452,9 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
 
     for (auto& [regionKey, group] : unloadRegions) {
         (void)regionKey;
-        bool regionModified = false;
-        std::unordered_map<std::int64_t, const ChunkColumnData*> overrides;
+        RegionSaveTask saveTask{};
+        saveTask.regionX = group.regionX;
+        saveTask.regionZ = group.regionZ;
 
         for (const PendingUnload& unload : group.chunks) {
             auto columnIt = chunkColumns_.find(MakeChunkKey(unload.chunkX, unload.chunkZ));
@@ -1215,13 +1463,22 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
             }
 
             if (columnIt->second.modified) {
-                regionModified = true;
-                overrides[MakeChunkKey(unload.chunkX, unload.chunkZ)] = &columnIt->second;
+                RegionSaveChunkSnapshot snapshot{};
+                snapshot.id = {unload.chunkX, unload.chunkZ};
+                snapshot.column = columnIt->second;
+                {
+                    std::lock_guard lock(pendingSaveMutex_);
+                    snapshot.generation = nextPendingSaveGeneration_++;
+                    pendingSavedChunkColumns_[MakeChunkKey(unload.chunkX, unload.chunkZ)] =
+                        PendingSavedChunkState{snapshot.generation, snapshot.column};
+                }
+                saveTask.chunks.push_back(std::move(snapshot));
             }
         }
 
-        if (regionModified) {
-            SaveRegionOverrides(group.regionX, group.regionZ, overrides);
+        if (!saveTask.chunks.empty()) {
+            std::lock_guard lock(pendingSaveMutex_);
+            pendingSaveTasks_.push_back(std::move(saveTask));
         }
 
         for (const PendingUnload& unload : group.chunks) {
@@ -1249,6 +1506,7 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
             break;
         }
     }
+
 }
 
 void VoxelWorld::GenerateChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const {
@@ -1317,6 +1575,10 @@ void VoxelWorld::LoadOrCreateSave() {
     if (!valid) {
         std::filesystem::remove_all(regionDirectory);
         std::filesystem::create_directories(regionDirectory);
+        {
+            std::lock_guard lock(regionIndexCacheMutex_);
+            regionIndexCache_.clear();
+        }
         writeFreshLevel();
     }
 
@@ -1373,13 +1635,95 @@ void VoxelWorld::SaveAllDirtyChunks() {
 }
 
 bool VoxelWorld::LoadChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const {
-    const std::filesystem::path regionPath = GetRegionFilePath(GetRegionCoord(chunkX), GetRegionCoord(chunkZ));
-    if (!std::filesystem::exists(regionPath)) {
+    const std::int64_t chunkKey = MakeChunkKey(chunkX, chunkZ);
+    {
+        std::lock_guard lock(pendingSaveMutex_);
+        if (const auto pendingIt = pendingSavedChunkColumns_.find(chunkKey);
+            pendingIt != pendingSavedChunkColumns_.end()) {
+            outColumn = pendingIt->second.column;
+            outColumn.modified = false;
+            return true;
+        }
+    }
+
+    std::lock_guard regionFileLock(regionFileIoMutex_);
+    const int regionX = GetRegionCoord(chunkX);
+    const int regionZ = GetRegionCoord(chunkZ);
+    RegionChunkIndexMetadata indexMetadata{};
+    if (!TryGetRegionChunkIndexMetadata(regionX, regionZ, chunkX, chunkZ, indexMetadata)) {
         return false;
     }
+
+    const std::filesystem::path regionPath = GetRegionFilePath(regionX, regionZ);
     std::ifstream stream(regionPath, std::ios::binary);
     if (!stream.is_open()) {
-        throw std::runtime_error("Failed to open region file.");
+        InvalidateRegionIndexCacheEntry(regionX, regionZ);
+        return false;
+    }
+
+    stream.seekg(static_cast<std::streamoff>(indexMetadata.offset), std::ios::beg);
+    if (!stream) {
+        throw std::runtime_error("Region chunk offset is invalid.");
+    }
+
+    DeserializeChunkColumnPayload(stream, outColumn);
+    if (!stream) {
+        throw std::runtime_error("Region chunk payload ended unexpectedly.");
+    }
+
+    outColumn.modified = false;
+    return true;
+}
+
+bool VoxelWorld::TryGetRegionChunkIndexMetadata(
+    int regionX,
+    int regionZ,
+    int chunkX,
+    int chunkZ,
+    RegionChunkIndexMetadata& outMetadata
+) const {
+    const std::int64_t regionKey = MakeRegionKey(regionX, regionZ);
+    {
+        std::lock_guard lock(regionIndexCacheMutex_);
+        auto cacheIt = regionIndexCache_.find(regionKey);
+        if (cacheIt != regionIndexCache_.end()) {
+            if (!cacheIt->second.regionExists) {
+                return false;
+            }
+            const auto indexIt = cacheIt->second.chunkIndex.find(MakeChunkKey(chunkX, chunkZ));
+            if (indexIt == cacheIt->second.chunkIndex.end()) {
+                return false;
+            }
+            outMetadata = indexIt->second;
+            return true;
+        }
+    }
+
+    const std::filesystem::path regionPath = GetRegionFilePath(regionX, regionZ);
+    RefreshRegionIndexCacheEntry(regionX, regionZ, regionPath);
+
+    std::lock_guard lock(regionIndexCacheMutex_);
+    auto cacheIt = regionIndexCache_.find(regionKey);
+    if (cacheIt == regionIndexCache_.end() || !cacheIt->second.regionExists) {
+        return false;
+    }
+    const auto indexIt = cacheIt->second.chunkIndex.find(MakeChunkKey(chunkX, chunkZ));
+    if (indexIt == cacheIt->second.chunkIndex.end()) {
+        return false;
+    }
+    outMetadata = indexIt->second;
+    return true;
+}
+
+void VoxelWorld::RefreshRegionIndexCacheEntry(int regionX, int regionZ, const std::filesystem::path& regionPath) const {
+    std::lock_guard regionFileLock(regionFileIoMutex_);
+    std::ifstream stream(regionPath, std::ios::binary);
+    if (!stream.is_open()) {
+        RegionIndexCacheEntry missingEntry{};
+        missingEntry.regionExists = false;
+        std::lock_guard lock(regionIndexCacheMutex_);
+        regionIndexCache_[MakeRegionKey(regionX, regionZ)] = std::move(missingEntry);
+        return;
     }
 
     char magic[4] = {};
@@ -1391,39 +1735,42 @@ bool VoxelWorld::LoadChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outCol
     ReadBinary(stream, fileRegionZ);
     ReadBinary(stream, chunkCount);
 
-    const int regionX = GetRegionCoord(chunkX);
-    const int regionZ = GetRegionCoord(chunkZ);
     if (!stream || std::memcmp(magic, kRegionMagic, sizeof(kRegionMagic)) != 0 ||
         fileRegionX != regionX || fileRegionZ != regionZ) {
         throw std::runtime_error("Region file is corrupted or incompatible.");
     }
 
+    RegionIndexCacheEntry cacheEntry{};
+    cacheEntry.regionExists = true;
+    cacheEntry.chunkIndex.reserve(chunkCount);
     for (std::uint32_t chunkIndex = 0; chunkIndex < chunkCount; ++chunkIndex) {
         RegionChunkIndexEntry indexEntry{};
         ReadBinary(stream, indexEntry.chunkX);
         ReadBinary(stream, indexEntry.chunkZ);
         ReadBinary(stream, indexEntry.offset);
         ReadBinary(stream, indexEntry.size);
-
         if (!stream) {
             throw std::runtime_error("Region index is corrupted.");
         }
 
-        if (indexEntry.chunkX != chunkX || indexEntry.chunkZ != chunkZ) {
-            continue;
-        }
-
-        stream.seekg(static_cast<std::streamoff>(indexEntry.offset), std::ios::beg);
-        if (!stream) {
-            throw std::runtime_error("Region chunk offset is invalid.");
-        }
-
-        DeserializeChunkColumnPayload(stream, outColumn);
-        outColumn.modified = false;
-        return true;
+        cacheEntry.chunkIndex.emplace(
+            MakeChunkKey(indexEntry.chunkX, indexEntry.chunkZ),
+            RegionChunkIndexMetadata{
+                indexEntry.chunkX,
+                indexEntry.chunkZ,
+                indexEntry.offset,
+                indexEntry.size,
+            }
+        );
     }
 
-    return false;
+    std::lock_guard lock(regionIndexCacheMutex_);
+    regionIndexCache_[MakeRegionKey(regionX, regionZ)] = std::move(cacheEntry);
+}
+
+void VoxelWorld::InvalidateRegionIndexCacheEntry(int regionX, int regionZ) const {
+    std::lock_guard lock(regionIndexCacheMutex_);
+    regionIndexCache_.erase(MakeRegionKey(regionX, regionZ));
 }
 
 void VoxelWorld::SaveChunkColumn(int chunkX, int chunkZ, ChunkColumnData& column) {
@@ -1437,6 +1784,51 @@ void VoxelWorld::SaveChunkColumn(int chunkX, int chunkZ, ChunkColumnData& column
     overrides.emplace(MakeChunkKey(chunkX, chunkZ), &column);
     SaveRegionOverrides(regionX, regionZ, overrides);
     column.modified = false;
+}
+
+std::vector<RegionSaveTask> VoxelWorld::DrainPendingSaveTasks(std::size_t maxCount) {
+    std::lock_guard lock(pendingSaveMutex_);
+    std::vector<RegionSaveTask> tasks;
+    tasks.reserve(std::min(maxCount, pendingSaveTasks_.size()));
+    while (!pendingSaveTasks_.empty() && tasks.size() < maxCount) {
+        tasks.push_back(std::move(pendingSaveTasks_.front()));
+        pendingSaveTasks_.pop_front();
+    }
+    return tasks;
+}
+
+void VoxelWorld::CompletePendingSaveTask(const RegionSaveTask& completedTask) {
+    std::lock_guard lock(pendingSaveMutex_);
+    for (const RegionSaveChunkSnapshot& snapshot : completedTask.chunks) {
+        const std::int64_t chunkKey = MakeChunkKey(snapshot.id.chunkX, snapshot.id.chunkZ);
+        const auto pendingIt = pendingSavedChunkColumns_.find(chunkKey);
+        if (pendingIt != pendingSavedChunkColumns_.end() &&
+            pendingIt->second.generation == snapshot.generation) {
+            pendingSavedChunkColumns_.erase(pendingIt);
+        }
+    }
+}
+
+void VoxelWorld::ExecuteSaveTask(const RegionSaveTask& task) const {
+    const auto saveStartTime = Clock::now();
+    std::unordered_map<std::int64_t, const ChunkColumnData*> overrides;
+    overrides.reserve(task.chunks.size());
+    for (const RegionSaveChunkSnapshot& snapshot : task.chunks) {
+        overrides.emplace(MakeChunkKey(snapshot.id.chunkX, snapshot.id.chunkZ), &snapshot.column);
+    }
+    SaveRegionOverrides(task.regionX, task.regionZ, overrides);
+    const auto saveEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gSaveProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(saveEndTime - saveStartTime).count()
+        )
+    );
+}
+
+bool VoxelWorld::HasPendingSaveTasks() const {
+    std::lock_guard lock(pendingSaveMutex_);
+    return !pendingSaveTasks_.empty();
 }
 
 std::vector<std::uint8_t> VoxelWorld::SerializeChunkColumnPayload(const ChunkColumnData& column) const {
@@ -1520,6 +1912,8 @@ void VoxelWorld::SaveRegionOverrides(
     int regionZ,
     const std::unordered_map<std::int64_t, const ChunkColumnData*>& overrides
 ) const {
+    std::lock_guard regionFileLock(regionFileIoMutex_);
+
     struct SerializedRegionChunk {
         std::int32_t chunkX = 0;
         std::int32_t chunkZ = 0;
@@ -1548,61 +1942,60 @@ void VoxelWorld::SaveRegionOverrides(
     }
 
     const std::filesystem::path regionPath = GetRegionFilePath(regionX, regionZ);
-    if (std::filesystem::exists(regionPath)) {
+    {
         std::ifstream existingStream(regionPath, std::ios::binary);
-        if (!existingStream.is_open()) {
-            throw std::runtime_error("Failed to open region file.");
-        }
+        if (existingStream.is_open()) {
 
-        char magic[4] = {};
-        std::int32_t fileRegionX = 0;
-        std::int32_t fileRegionZ = 0;
-        std::uint32_t chunkCount = 0;
-        existingStream.read(magic, sizeof(magic));
-        ReadBinary(existingStream, fileRegionX);
-        ReadBinary(existingStream, fileRegionZ);
-        ReadBinary(existingStream, chunkCount);
+            char magic[4] = {};
+            std::int32_t fileRegionX = 0;
+            std::int32_t fileRegionZ = 0;
+            std::uint32_t chunkCount = 0;
+            existingStream.read(magic, sizeof(magic));
+            ReadBinary(existingStream, fileRegionX);
+            ReadBinary(existingStream, fileRegionZ);
+            ReadBinary(existingStream, chunkCount);
 
-        if (!existingStream || std::memcmp(magic, kRegionMagic, sizeof(kRegionMagic)) != 0 ||
-            fileRegionX != regionX || fileRegionZ != regionZ) {
-            throw std::runtime_error("Region file is corrupted or incompatible.");
-        }
-
-        std::vector<RegionChunkIndexEntry> indexEntries(chunkCount);
-        for (RegionChunkIndexEntry& indexEntry : indexEntries) {
-            ReadBinary(existingStream, indexEntry.chunkX);
-            ReadBinary(existingStream, indexEntry.chunkZ);
-            ReadBinary(existingStream, indexEntry.offset);
-            ReadBinary(existingStream, indexEntry.size);
-            if (!existingStream) {
-                throw std::runtime_error("Region index is corrupted.");
-            }
-        }
-
-        for (const RegionChunkIndexEntry& indexEntry : indexEntries) {
-            const std::int64_t key = MakeChunkKey(indexEntry.chunkX, indexEntry.chunkZ);
-            if (includedKeys.contains(key)) {
-                continue;
+            if (!existingStream || std::memcmp(magic, kRegionMagic, sizeof(kRegionMagic)) != 0 ||
+                fileRegionX != regionX || fileRegionZ != regionZ) {
+                throw std::runtime_error("Region file is corrupted or incompatible.");
             }
 
-            existingStream.seekg(static_cast<std::streamoff>(indexEntry.offset), std::ios::beg);
-            if (!existingStream) {
-                throw std::runtime_error("Region chunk offset is invalid.");
+            std::vector<RegionChunkIndexEntry> indexEntries(chunkCount);
+            for (RegionChunkIndexEntry& indexEntry : indexEntries) {
+                ReadBinary(existingStream, indexEntry.chunkX);
+                ReadBinary(existingStream, indexEntry.chunkZ);
+                ReadBinary(existingStream, indexEntry.offset);
+                ReadBinary(existingStream, indexEntry.size);
+                if (!existingStream) {
+                    throw std::runtime_error("Region index is corrupted.");
+                }
             }
 
-            SerializedRegionChunk serializedChunk{};
-            serializedChunk.chunkX = indexEntry.chunkX;
-            serializedChunk.chunkZ = indexEntry.chunkZ;
-            serializedChunk.payload.resize(indexEntry.size);
-            existingStream.read(
-                reinterpret_cast<char*>(serializedChunk.payload.data()),
-                static_cast<std::streamsize>(serializedChunk.payload.size())
-            );
-            if (!existingStream) {
-                throw std::runtime_error("Failed to read existing region chunk payload.");
-            }
+            for (const RegionChunkIndexEntry& indexEntry : indexEntries) {
+                const std::int64_t key = MakeChunkKey(indexEntry.chunkX, indexEntry.chunkZ);
+                if (includedKeys.contains(key)) {
+                    continue;
+                }
 
-            serializedChunks.push_back(std::move(serializedChunk));
+                existingStream.seekg(static_cast<std::streamoff>(indexEntry.offset), std::ios::beg);
+                if (!existingStream) {
+                    throw std::runtime_error("Region chunk offset is invalid.");
+                }
+
+                SerializedRegionChunk serializedChunk{};
+                serializedChunk.chunkX = indexEntry.chunkX;
+                serializedChunk.chunkZ = indexEntry.chunkZ;
+                serializedChunk.payload.resize(indexEntry.size);
+                existingStream.read(
+                    reinterpret_cast<char*>(serializedChunk.payload.data()),
+                    static_cast<std::streamsize>(serializedChunk.payload.size())
+                );
+                if (!existingStream) {
+                    throw std::runtime_error("Failed to read existing region chunk payload.");
+                }
+
+                serializedChunks.push_back(std::move(serializedChunk));
+            }
         }
     }
 
@@ -1613,59 +2006,76 @@ void VoxelWorld::SaveRegionOverrides(
         return lhs.chunkX < rhs.chunkX;
     });
 
-    std::ofstream stream(regionPath, std::ios::binary | std::ios::trunc);
-    if (!stream.is_open()) {
-        throw std::runtime_error("Failed to write region file.");
+    const std::filesystem::path tempRegionPath = regionPath.string() + ".tmp";
+    {
+        std::ofstream stream(tempRegionPath, std::ios::binary | std::ios::trunc);
+        if (!stream.is_open()) {
+            throw std::runtime_error("Failed to write region file.");
+        }
+
+        stream.write(kRegionMagic, sizeof(kRegionMagic));
+        WriteBinary(stream, static_cast<std::int32_t>(regionX));
+        WriteBinary(stream, static_cast<std::int32_t>(regionZ));
+        WriteBinary(stream, static_cast<std::uint32_t>(serializedChunks.size()));
+
+        const std::uint64_t headerSize =
+            sizeof(kRegionMagic) +
+            sizeof(std::int32_t) +
+            sizeof(std::int32_t) +
+            sizeof(std::uint32_t);
+        const std::uint64_t indexEntrySize =
+            sizeof(std::int32_t) +
+            sizeof(std::int32_t) +
+            sizeof(std::uint64_t) +
+            sizeof(std::uint32_t);
+        std::uint64_t currentOffset =
+            headerSize + indexEntrySize * static_cast<std::uint64_t>(serializedChunks.size());
+
+        for (const SerializedRegionChunk& serializedChunk : serializedChunks) {
+            WriteBinary(stream, serializedChunk.chunkX);
+            WriteBinary(stream, serializedChunk.chunkZ);
+            WriteBinary(stream, currentOffset);
+            WriteBinary(stream, static_cast<std::uint32_t>(serializedChunk.payload.size()));
+            currentOffset += static_cast<std::uint64_t>(serializedChunk.payload.size());
+        }
+
+        for (const SerializedRegionChunk& serializedChunk : serializedChunks) {
+            stream.write(
+                reinterpret_cast<const char*>(serializedChunk.payload.data()),
+                static_cast<std::streamsize>(serializedChunk.payload.size())
+            );
+        }
+
+        if (!stream) {
+            throw std::runtime_error("Failed while saving region data.");
+        }
+        stream.flush();
+        stream.close();
+
+        std::error_code replaceError;
+        std::filesystem::rename(tempRegionPath, regionPath, replaceError);
+        if (replaceError) {
+            std::filesystem::remove(regionPath, replaceError);
+            replaceError.clear();
+            std::filesystem::rename(tempRegionPath, regionPath, replaceError);
+            if (replaceError) {
+                std::filesystem::remove(tempRegionPath, replaceError);
+                throw std::runtime_error("Failed to replace region file.");
+            }
+        }
     }
 
-    stream.write(kRegionMagic, sizeof(kRegionMagic));
-    WriteBinary(stream, static_cast<std::int32_t>(regionX));
-    WriteBinary(stream, static_cast<std::int32_t>(regionZ));
-    WriteBinary(stream, static_cast<std::uint32_t>(serializedChunks.size()));
-
-    const std::uint64_t headerSize =
-        sizeof(kRegionMagic) +
-        sizeof(std::int32_t) +
-        sizeof(std::int32_t) +
-        sizeof(std::uint32_t);
-    const std::uint64_t indexEntrySize =
-        sizeof(std::int32_t) +
-        sizeof(std::int32_t) +
-        sizeof(std::uint64_t) +
-        sizeof(std::uint32_t);
-    std::uint64_t currentOffset = headerSize + indexEntrySize * static_cast<std::uint64_t>(serializedChunks.size());
-
-    for (const SerializedRegionChunk& serializedChunk : serializedChunks) {
-        WriteBinary(stream, serializedChunk.chunkX);
-        WriteBinary(stream, serializedChunk.chunkZ);
-        WriteBinary(stream, currentOffset);
-        WriteBinary(stream, static_cast<std::uint32_t>(serializedChunk.payload.size()));
-        currentOffset += static_cast<std::uint64_t>(serializedChunk.payload.size());
-    }
-
-    for (const SerializedRegionChunk& serializedChunk : serializedChunks) {
-        stream.write(
-            reinterpret_cast<const char*>(serializedChunk.payload.data()),
-            static_cast<std::streamsize>(serializedChunk.payload.size())
-        );
-    }
-
-    if (!stream) {
-        throw std::runtime_error("Failed while saving region data.");
-    }
+    InvalidateRegionIndexCacheEntry(regionX, regionZ);
 }
 
 void VoxelWorld::LoadRegionFile(int regionX, int regionZ, std::unordered_map<std::int64_t, ChunkColumnData>& outColumns) const {
     outColumns.clear();
 
     const std::filesystem::path regionPath = GetRegionFilePath(regionX, regionZ);
-    if (!std::filesystem::exists(regionPath)) {
-        return;
-    }
-
+    std::lock_guard regionFileLock(regionFileIoMutex_);
     std::ifstream stream(regionPath, std::ios::binary);
     if (!stream.is_open()) {
-        throw std::runtime_error("Failed to open region file.");
+        return;
     }
 
     char magic[4] = {};
@@ -1708,6 +2118,7 @@ void VoxelWorld::LoadRegionFile(int regionX, int regionZ, std::unordered_map<std
 void VoxelWorld::SaveRegionFile(int regionX, int regionZ, const std::unordered_map<std::int64_t, ChunkColumnData>& columns) const {
     std::filesystem::create_directories(GetRegionDirectoryPath());
 
+    std::lock_guard regionFileLock(regionFileIoMutex_);
     std::ofstream stream(GetRegionFilePath(regionX, regionZ), std::ios::binary | std::ios::trunc);
     if (!stream.is_open()) {
         throw std::runtime_error("Failed to write region file.");
@@ -1871,36 +2282,27 @@ bool VoxelWorld::CopyChunkMeshBatch(int chunkX, int chunkZ, ChunkMeshBatchData& 
     }
 
     outBatch.id = {chunkX, chunkZ};
-    outBatch.vertices.clear();
-    outBatch.indices.clear();
+    outBatch.quads.clear();
 
-    std::size_t totalVertexCount = 0;
-    std::size_t totalIndexCount = 0;
+    std::size_t totalQuadCount = 0;
     for (const SubChunkMeshData& subChunkMesh : columnIt->second.subChunkMeshes) {
-        totalVertexCount += subChunkMesh.vertices.size();
-        totalIndexCount += subChunkMesh.indices.size();
+        totalQuadCount += subChunkMesh.quads.size();
     }
 
-    if (totalVertexCount == 0 || totalIndexCount == 0) {
+    if (totalQuadCount == 0) {
         return false;
     }
 
-    outBatch.vertices.reserve(totalVertexCount);
-    outBatch.indices.reserve(totalIndexCount);
+    outBatch.quads.reserve(totalQuadCount);
 
     for (const SubChunkMeshData& subChunkMesh : columnIt->second.subChunkMeshes) {
-        if (subChunkMesh.vertices.empty() || subChunkMesh.indices.empty()) {
+        if (subChunkMesh.quads.empty()) {
             continue;
         }
-
-        const std::uint32_t vertexOffset = static_cast<std::uint32_t>(outBatch.vertices.size());
-        outBatch.vertices.insert(outBatch.vertices.end(), subChunkMesh.vertices.begin(), subChunkMesh.vertices.end());
-        for (std::uint32_t index : subChunkMesh.indices) {
-            outBatch.indices.push_back(vertexOffset + index);
-        }
+        outBatch.quads.insert(outBatch.quads.end(), subChunkMesh.quads.begin(), subChunkMesh.quads.end());
     }
 
-    return !outBatch.vertices.empty() && !outBatch.indices.empty();
+    return !outBatch.quads.empty();
 }
 
 void VoxelWorld::Save() {
@@ -2024,7 +2426,7 @@ void VoxelWorld::BuildVisibleMesh(
 
             for (int subChunkIndex = 0; subChunkIndex < kSubChunkCountY; ++subChunkIndex) {
                 const SubChunkMeshData& subChunkMesh = columnIt->second.subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
-                if (subChunkMesh.vertices.empty() || subChunkMesh.indices.empty()) {
+                if (subChunkMesh.quads.empty()) {
                     continue;
                 }
 
@@ -2032,8 +2434,8 @@ void VoxelWorld::BuildVisibleMesh(
                 batch.id = {chunkX, chunkZ, subChunkIndex};
                 batch.revision = subChunkMesh.revision;
 
-                outMesh.totalVertexCount += static_cast<std::uint32_t>(subChunkMesh.vertices.size());
-                outMesh.totalIndexCount += static_cast<std::uint32_t>(subChunkMesh.indices.size());
+                outMesh.totalVertexCount += static_cast<std::uint32_t>(subChunkMesh.quads.size() * 4);
+                outMesh.totalIndexCount += static_cast<std::uint32_t>(subChunkMesh.quads.size() * 6);
                 outMesh.batches.push_back(std::move(batch));
             }
         }
@@ -2059,41 +2461,6 @@ void VoxelWorld::EnsureTerrainConfigLoaded() {
     terrainConfigLoaded_ = true;
 }
 
-void VoxelWorld::AppendFaceQuad(
-    SubChunkMeshData& mesh,
-    float worldX,
-    float worldY,
-    float worldZ,
-    int faceIndex
-) const {
-    const float x = worldX;
-    const float y = worldY;
-    const float z = worldZ;
-
-    switch (faceIndex) {
-    case 0:
-        AppendQuad(mesh, {x, y + 1.0f, z}, {x, y + 1.0f, z + 1.0f}, {x + 1.0f, y + 1.0f, z + 1.0f}, {x + 1.0f, y + 1.0f, z}, 1.0f, 1.0f);
-        break;
-    case 1:
-        AppendQuad(mesh, {x, y, z + 1.0f}, {x, y, z}, {x + 1.0f, y, z}, {x + 1.0f, y, z + 1.0f}, 1.0f, 1.0f);
-        break;
-    case 2:
-        AppendQuad(mesh, {x + 1.0f, y, z}, {x, y, z}, {x, y + 1.0f, z}, {x + 1.0f, y + 1.0f, z}, 1.0f, 1.0f);
-        break;
-    case 3:
-        AppendQuad(mesh, {x, y, z + 1.0f}, {x + 1.0f, y, z + 1.0f}, {x + 1.0f, y + 1.0f, z + 1.0f}, {x, y + 1.0f, z + 1.0f}, 1.0f, 1.0f);
-        break;
-    case 4:
-        AppendQuad(mesh, {x, y, z}, {x, y, z + 1.0f}, {x, y + 1.0f, z + 1.0f}, {x, y + 1.0f, z}, 1.0f, 1.0f);
-        break;
-    case 5:
-        AppendQuad(mesh, {x + 1.0f, y, z + 1.0f}, {x + 1.0f, y, z}, {x + 1.0f, y + 1.0f, z}, {x + 1.0f, y + 1.0f, z + 1.0f}, 1.0f, 1.0f);
-        break;
-    default:
-        break;
-    }
-}
-
 void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) {
     auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
     if (columnIt == chunkColumns_.end()) {
@@ -2110,11 +2477,9 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
 
     SubChunkMeshData& mesh = column.subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
     const SubChunkVoxelData& voxelSubChunk = column.subChunks[static_cast<std::size_t>(subChunkIndex)];
-    mesh.vertices.clear();
-    mesh.indices.clear();
+    mesh.quads.clear();
 
     const int minWorldY = subChunkIndex * kSubChunkSize;
-    const int maxWorldY = std::min(minWorldY + kSubChunkSize, kWorldSizeY);
     const int minWorldX = chunkX * kChunkSizeX;
     const int minWorldZ = chunkZ * kChunkSizeZ;
 
@@ -2123,9 +2488,6 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
         ++mesh.revision;
         return;
     }
-
-    constexpr int dims[3] = {kChunkSizeX, kSubChunkSize, kChunkSizeZ};
-    std::vector<FaceMaskCell> mask(static_cast<std::size_t>(kChunkSizeX * kChunkSizeZ));
 
     const auto sampleBlock = [&](int localX, int localY, int localZ) -> std::uint16_t {
         if (localX >= 0 && localX < kChunkSizeX &&
@@ -2136,202 +2498,7 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
 
         return GetBlock(minWorldX + localX, minWorldY + localY, minWorldZ + localZ);
     };
-
-    const auto emitGreedyQuad = [&](
-                                    int axis,
-                                    bool positiveNormal,
-                                    int slice,
-                                    int startU,
-                                    int startV,
-                                    int width,
-                                    int height) {
-        const int u = (axis + 1) % 3;
-        const int v = (axis + 2) % 3;
-
-        Vec3 base{};
-        if (axis == 0) {
-            base.x = static_cast<float>(minWorldX + slice);
-        } else if (axis == 1) {
-            base.y = static_cast<float>(minWorldY + slice);
-        } else {
-            base.z = static_cast<float>(minWorldZ + slice);
-        }
-
-        if (u == 0) {
-            base.x = static_cast<float>(minWorldX + startU);
-        } else if (u == 1) {
-            base.y = static_cast<float>(minWorldY + startU);
-        } else {
-            base.z = static_cast<float>(minWorldZ + startU);
-        }
-
-        if (v == 0) {
-            base.x = static_cast<float>(minWorldX + startV);
-        } else if (v == 1) {
-            base.y = static_cast<float>(minWorldY + startV);
-        } else {
-            base.z = static_cast<float>(minWorldZ + startV);
-        }
-
-        Vec3 du{};
-        Vec3 dv{};
-        if (u == 0) {
-            du.x = static_cast<float>(width);
-        } else if (u == 1) {
-            du.y = static_cast<float>(width);
-        } else {
-            du.z = static_cast<float>(width);
-        }
-
-        if (v == 0) {
-            dv.x = static_cast<float>(height);
-        } else if (v == 1) {
-            dv.y = static_cast<float>(height);
-        } else {
-            dv.z = static_cast<float>(height);
-        }
-
-        Vec3 p0{};
-        Vec3 p1{};
-        Vec3 p2{};
-        Vec3 p3{};
-        float quadUMax = static_cast<float>(width);
-        float quadVMax = static_cast<float>(height);
-        const std::array<float, 4> baseAo =
-            ComputeQuadAoValues(sampleBlock, axis, positiveNormal, slice, startU, startV, width, height);
-        std::array<float, 4> vertexAo{};
-
-        if (axis == 0) {
-            quadUMax = static_cast<float>(height);
-            quadVMax = static_cast<float>(width);
-            if (positiveNormal) {
-                p0 = base + dv;
-                p1 = base;
-                p2 = base + du;
-                p3 = base + du + dv;
-                vertexAo = {baseAo[3], baseAo[0], baseAo[1], baseAo[2]};
-            } else {
-                p0 = base;
-                p1 = base + dv;
-                p2 = base + du + dv;
-                p3 = base + du;
-                vertexAo = {baseAo[0], baseAo[3], baseAo[2], baseAo[1]};
-            }
-        } else if (positiveNormal) {
-            p0 = base;
-            p1 = base + du;
-            p2 = base + du + dv;
-            p3 = base + dv;
-            vertexAo = baseAo;
-        } else {
-            p0 = base + du;
-            p1 = base;
-            p2 = base + dv;
-            p3 = base + du + dv;
-            vertexAo = {baseAo[1], baseAo[0], baseAo[3], baseAo[2]};
-        }
-
-        const bool flipDiagonal = (vertexAo[0] + vertexAo[2]) > (vertexAo[1] + vertexAo[3]);
-        Vec3 expectedNormal{};
-        if (axis == 0) {
-            expectedNormal.x = positiveNormal ? 1.0f : -1.0f;
-        } else if (axis == 1) {
-            expectedNormal.y = positiveNormal ? 1.0f : -1.0f;
-        } else {
-            expectedNormal.z = positiveNormal ? 1.0f : -1.0f;
-        }
-        const Vec3 edge01 = SubtractVec3(p1, p0);
-        const Vec3 edge02 = SubtractVec3(p2, p0);
-        const bool reverseWinding = DotVec3(CrossVec3(edge01, edge02), expectedNormal) < 0.0f;
-        AppendQuad(
-            mesh,
-            p0,
-            p1,
-            p2,
-            p3,
-            quadUMax,
-            quadVMax,
-            vertexAo,
-            flipDiagonal,
-            reverseWinding
-        );
-    };
-
-    for (int axis = 0; axis < 3; ++axis) {
-        const int u = (axis + 1) % 3;
-        const int v = (axis + 2) % 3;
-
-        for (int slice = -1; slice < dims[axis]; ++slice) {
-            int maskIndex = 0;
-            for (int j = 0; j < dims[v]; ++j) {
-                for (int i = 0; i < dims[u]; ++i) {
-                    int aCoords[3] = {};
-                    int bCoords[3] = {};
-                    aCoords[axis] = slice;
-                    bCoords[axis] = slice + 1;
-                    aCoords[u] = i;
-                    bCoords[u] = i;
-                    aCoords[v] = j;
-                    bCoords[v] = j;
-
-                    const std::uint16_t a = sampleBlock(aCoords[0], aCoords[1], aCoords[2]);
-                    const std::uint16_t b = sampleBlock(bCoords[0], bCoords[1], bCoords[2]);
-
-                    FaceMaskCell face{};
-                    if (a != 0 && b == 0) {
-                        face.value = static_cast<int>(a);
-                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, true, slice + 1, i, j, 1, 1);
-                    } else if (a == 0 && b != 0) {
-                        face.value = -static_cast<int>(b);
-                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, false, slice + 1, i, j, 1, 1);
-                    }
-                    mask[static_cast<std::size_t>(maskIndex)] = face;
-
-                    ++maskIndex;
-                }
-            }
-
-            for (int j = 0; j < dims[v]; ++j) {
-                for (int i = 0; i < dims[u];) {
-                    const FaceMaskCell current = mask[static_cast<std::size_t>(i + j * dims[u])];
-                    if (current.value == 0) {
-                        ++i;
-                        continue;
-                    }
-
-                    int width = 1;
-                    while (i + width < dims[u] &&
-                           mask[static_cast<std::size_t>(i + width + j * dims[u])] == current) {
-                        ++width;
-                    }
-
-                    int height = 1;
-                    bool done = false;
-                    while (j + height < dims[v] && !done) {
-                        for (int k = 0; k < width; ++k) {
-                            if (mask[static_cast<std::size_t>(i + k + (j + height) * dims[u])] != current) {
-                                done = true;
-                                break;
-                            }
-                        }
-                        if (!done) {
-                            ++height;
-                        }
-                    }
-
-                    emitGreedyQuad(axis, current.value > 0, slice + 1, i, j, width, height);
-
-                    for (int row = 0; row < height; ++row) {
-                        for (int col = 0; col < width; ++col) {
-                            mask[static_cast<std::size_t>(i + col + (j + row) * dims[u])] = FaceMaskCell{};
-                        }
-                    }
-
-                    i += width;
-                }
-            }
-        }
-    }
+    BuildSubChunkQuadRecords(sampleBlock, minWorldX, minWorldY, minWorldZ, subChunkIndex, mesh.quads);
 
     mesh.dirty = false;
     ++mesh.revision;

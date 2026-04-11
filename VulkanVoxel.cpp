@@ -298,6 +298,30 @@ std::string FormatUsageLine(
     return label + " USED: " + FormatGigabytes(usedBytes) + " / " + FormatGigabytes(totalBytes) + " GB";
 }
 
+std::string FormatRuntimeProfileLine(const std::string& label, const RuntimeProfileStage& stage) {
+    std::ostringstream stream;
+    stream << label << ": ";
+    if (stage.samples == 0) {
+        stream << "0.000 / 0.000 MS";
+    } else {
+        stream << std::fixed << std::setprecision(3)
+               << stage.averageMs << " / " << stage.maxMs << " MS";
+    }
+    return stream.str();
+}
+
+std::string FormatRuntimeCountLine(const std::string& label, const RuntimeProfileStage& stage) {
+    std::ostringstream stream;
+    stream << label << ": ";
+    if (stage.samples == 0) {
+        stream << "0.000 / 0.000";
+    } else {
+        stream << std::fixed << std::setprecision(3)
+               << stage.averageMs << " / " << stage.maxMs;
+    }
+    return stream.str();
+}
+
 Vec3 LerpVec3(const Vec3& a, const Vec3& b, float t) {
     return {
         a.x + (b.x - a.x) * t,
@@ -588,6 +612,17 @@ void VulkanVoxelApp::MainLoop() {
 void VulkanVoxelApp::Cleanup() {
     StopWorldMeshWorker();
 
+    std::vector<RegionSaveTask> remainingSaveTasks;
+    {
+        std::unique_lock lock(worldMutex_);
+        remainingSaveTasks = world_.DrainPendingSaveTasks(std::numeric_limits<std::size_t>::max());
+    }
+    for (const RegionSaveTask& saveTask : remainingSaveTasks) {
+        world_.ExecuteSaveTask(saveTask);
+        std::unique_lock lock(worldMutex_);
+        world_.CompletePendingSaveTask(saveTask);
+    }
+
     try {
         std::unique_lock lock(worldMutex_);
         world_.Save();
@@ -786,6 +821,14 @@ void VulkanVoxelApp::CleanupSwapChain() {
         vkDestroyPipelineLayout(device_, selectionPipelineLayout_, nullptr);
         selectionPipelineLayout_ = VK_NULL_HANDLE;
     }
+    if (terrainPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, terrainPipeline_, nullptr);
+        terrainPipeline_ = VK_NULL_HANDLE;
+    }
+    if (terrainPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, terrainPipelineLayout_, nullptr);
+        terrainPipelineLayout_ = VK_NULL_HANDLE;
+    }
     if (worldPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, worldPipeline_, nullptr);
         worldPipeline_ = VK_NULL_HANDLE;
@@ -967,7 +1010,7 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
     cameraYaw_ += static_cast<float>(deltaX) * kMouseSensitivity;
     cameraPitch_ -= static_cast<float>(deltaY) * kMouseSensitivity;
     cameraYaw_ = WrapAngle180(cameraYaw_);
-    cameraPitch_ = std::clamp(cameraPitch_, -89.0f, 89.0f);
+    cameraPitch_ = std::clamp(cameraPitch_, -90.0f, 90.0f);
 
     const bool isSpacePressed = glfwGetKey(window_, GLFW_KEY_SPACE) == GLFW_PRESS;
     const bool isSpaceJustPressed = isSpacePressed && !previousSpacePressed_;
@@ -1296,6 +1339,7 @@ void VulkanVoxelApp::UpdateOverlayText(float deltaTime) {
         frameCounter_ = 0;
         fpsAccumulatorSeconds_ = 0.0;
         RefreshSystemUsageStats();
+        RefreshRuntimeProfileStats();
         statsUpdated = true;
     }
 
@@ -1317,6 +1361,193 @@ void VulkanVoxelApp::RefreshSystemUsageStats() {
     }
 
     usedVramBytes_ = QueryVideoMemoryUsageBytes();
+}
+
+void VulkanVoxelApp::AccumulateRuntimeProfileSample(
+    double elapsedMs,
+    double& totalMs,
+    double& maxMs,
+    std::uint32_t& count
+) {
+    totalMs += elapsedMs;
+    maxMs = std::max(maxMs, elapsedMs);
+    ++count;
+}
+
+void VulkanVoxelApp::RefreshRuntimeProfileStats() {
+    const VoxelWorldRuntimeProfileSnapshot worldProfile = ConsumeVoxelWorldRuntimeProfileSnapshot();
+    if (worldProfile.chunkLoad.samples > 0) {
+        chunkLoadProfileCumulativeMs_ += worldProfile.chunkLoad.averageMs * static_cast<double>(worldProfile.chunkLoad.samples);
+        chunkLoadProfileCumulativeSamples_ += worldProfile.chunkLoad.samples;
+        chunkLoadProfile_.samples = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(chunkLoadProfileCumulativeSamples_, static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+        );
+        chunkLoadProfile_.averageMs = chunkLoadProfileCumulativeMs_ / static_cast<double>(chunkLoadProfileCumulativeSamples_);
+        chunkLoadProfile_.maxMs = std::max(chunkLoadProfile_.maxMs, worldProfile.chunkLoad.maxMs);
+    }
+    if (worldProfile.diskLoad.samples > 0) {
+        diskLoadProfileCumulativeMs_ += worldProfile.diskLoad.averageMs * static_cast<double>(worldProfile.diskLoad.samples);
+        diskLoadProfileCumulativeSamples_ += worldProfile.diskLoad.samples;
+        diskLoadProfile_.samples = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(diskLoadProfileCumulativeSamples_, static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+        );
+        diskLoadProfile_.averageMs = diskLoadProfileCumulativeMs_ / static_cast<double>(diskLoadProfileCumulativeSamples_);
+        diskLoadProfile_.maxMs = std::max(diskLoadProfile_.maxMs, worldProfile.diskLoad.maxMs);
+    }
+    if (worldProfile.generate.samples > 0) {
+        generateProfileCumulativeMs_ += worldProfile.generate.averageMs * static_cast<double>(worldProfile.generate.samples);
+        generateProfileCumulativeSamples_ += worldProfile.generate.samples;
+        generateProfile_.samples = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(generateProfileCumulativeSamples_, static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+        );
+        generateProfile_.averageMs = generateProfileCumulativeMs_ / static_cast<double>(generateProfileCumulativeSamples_);
+        generateProfile_.maxMs = std::max(generateProfile_.maxMs, worldProfile.generate.maxMs);
+    }
+    if (worldProfile.meshBuild.samples > 0) {
+        meshBuildProfileCumulativeMs_ += worldProfile.meshBuild.averageMs * static_cast<double>(worldProfile.meshBuild.samples);
+        meshBuildProfileCumulativeSamples_ += worldProfile.meshBuild.samples;
+        meshBuildProfile_.samples = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(meshBuildProfileCumulativeSamples_, static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+        );
+        meshBuildProfile_.averageMs = meshBuildProfileCumulativeMs_ / static_cast<double>(meshBuildProfileCumulativeSamples_);
+        meshBuildProfile_.maxMs = std::max(meshBuildProfile_.maxMs, worldProfile.meshBuild.maxMs);
+    }
+    if (worldProfile.save.samples > 0) {
+        saveProfileCumulativeMs_ += worldProfile.save.averageMs * static_cast<double>(worldProfile.save.samples);
+        saveProfileCumulativeSamples_ += worldProfile.save.samples;
+        saveProfile_.samples = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(saveProfileCumulativeSamples_, static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+        );
+        saveProfile_.averageMs = saveProfileCumulativeMs_ / static_cast<double>(saveProfileCumulativeSamples_);
+        saveProfile_.maxMs = std::max(saveProfile_.maxMs, worldProfile.save.maxMs);
+    }
+
+    const auto finalizeStage = [](
+        RuntimeProfileStage& stage,
+        double& cumulativeMs,
+        std::uint64_t& cumulativeSamples,
+        double& totalMs,
+        double& maxMs,
+        std::uint32_t& count
+    ) {
+        if (count > 0) {
+            cumulativeMs += totalMs;
+            cumulativeSamples += count;
+            stage.samples = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(cumulativeSamples, static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+            );
+            stage.averageMs = cumulativeMs / static_cast<double>(cumulativeSamples);
+            stage.maxMs = std::max(stage.maxMs, maxMs);
+        }
+        totalMs = 0.0;
+        maxMs = 0.0;
+        count = 0;
+    };
+
+    finalizeStage(
+        uploadProfile_,
+        uploadProfileCumulativeMs_,
+        uploadProfileCumulativeSamples_,
+        uploadProfileTotalMs_,
+        uploadProfileMaxMs_,
+        uploadProfileSamples_
+    );
+    finalizeStage(
+        uploadChunkProfile_,
+        uploadChunkProfileCumulativeMs_,
+        uploadChunkProfileCumulativeSamples_,
+        uploadChunkProfileTotalMs_,
+        uploadChunkProfileMaxMs_,
+        uploadChunkProfileSamples_
+    );
+    finalizeStage(
+        uploadCountProfile_,
+        uploadCountProfileCumulativeValue_,
+        uploadCountProfileCumulativeSamples_,
+        uploadCountProfileTotalValue_,
+        uploadCountProfileMaxValue_,
+        uploadCountProfileSamples_
+    );
+    finalizeStage(
+        uploadRemoveProfile_,
+        uploadRemoveProfileCumulativeMs_,
+        uploadRemoveProfileCumulativeSamples_,
+        uploadRemoveProfileTotalMs_,
+        uploadRemoveProfileMaxMs_,
+        uploadRemoveProfileSamples_
+    );
+    finalizeStage(
+        uploadInsertProfile_,
+        uploadInsertProfileCumulativeMs_,
+        uploadInsertProfileCumulativeSamples_,
+        uploadInsertProfileTotalMs_,
+        uploadInsertProfileMaxMs_,
+        uploadInsertProfileSamples_
+    );
+    finalizeStage(
+        uploadAllocProfile_,
+        uploadAllocProfileCumulativeMs_,
+        uploadAllocProfileCumulativeSamples_,
+        uploadAllocProfileTotalMs_,
+        uploadAllocProfileMaxMs_,
+        uploadAllocProfileSamples_
+    );
+    finalizeStage(
+        uploadCopyProfile_,
+        uploadCopyProfileCumulativeMs_,
+        uploadCopyProfileCumulativeSamples_,
+        uploadCopyProfileTotalMs_,
+        uploadCopyProfileMaxMs_,
+        uploadCopyProfileSamples_
+    );
+    finalizeStage(
+        drawCpuProfile_,
+        drawCpuProfileCumulativeMs_,
+        drawCpuProfileCumulativeSamples_,
+        drawCpuProfileTotalMs_,
+        drawCpuProfileMaxMs_,
+        drawCpuProfileSamples_
+    );
+    finalizeStage(
+        waitProfile_,
+        waitProfileCumulativeMs_,
+        waitProfileCumulativeSamples_,
+        waitProfileTotalMs_,
+        waitProfileMaxMs_,
+        waitProfileSamples_
+    );
+    finalizeStage(
+        acquireProfile_,
+        acquireProfileCumulativeMs_,
+        acquireProfileCumulativeSamples_,
+        acquireProfileTotalMs_,
+        acquireProfileMaxMs_,
+        acquireProfileSamples_
+    );
+    finalizeStage(
+        submitProfile_,
+        submitProfileCumulativeMs_,
+        submitProfileCumulativeSamples_,
+        submitProfileTotalMs_,
+        submitProfileMaxMs_,
+        submitProfileSamples_
+    );
+    finalizeStage(
+        presentProfile_,
+        presentProfileCumulativeMs_,
+        presentProfileCumulativeSamples_,
+        presentProfileTotalMs_,
+        presentProfileMaxMs_,
+        presentProfileSamples_
+    );
+    finalizeStage(
+        frameProfile_,
+        frameProfileCumulativeMs_,
+        frameProfileCumulativeSamples_,
+        frameProfileTotalMs_,
+        frameProfileMaxMs_,
+        frameProfileSamples_
+    );
 }
 
 void VulkanVoxelApp::LoadStaticDebugInfo() {
@@ -1399,6 +1630,7 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     const std::uint32_t faceCount = worldIndexCount_ / 6;
     const std::uint32_t triangleCount = worldIndexCount_ / 3;
     std::vector<std::string> leftLines;
+    std::vector<std::string> lowerLeftLines;
     std::vector<std::string> rightLines;
 
     {
@@ -1425,6 +1657,25 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     leftLines.push_back("LOADED CHUNKS: " + std::to_string(loadedChunkCount_));
     leftLines.push_back("FACE COUNT: " + std::to_string(faceCount));
     leftLines.push_back(FormatGameTime(globalTick_));
+
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("LOAD", chunkLoadProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("DISKLOAD", diskLoadProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("GENERATE", generateProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("MESH", meshBuildProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("SAVE", saveProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("UPCALL", uploadProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("UPCHUNK", uploadChunkProfile_));
+    lowerLeftLines.push_back(FormatRuntimeCountLine("UPCOUNT", uploadCountProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("UPREMOVE", uploadRemoveProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("UPINSERT", uploadInsertProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("UPALLOC", uploadAllocProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("UPCOPY", uploadCopyProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("WAIT", waitProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("ACQUIRE", acquireProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("SUBMIT", submitProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("PRESENT", presentProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("DRAWCPU", drawCpuProfile_));
+    lowerLeftLines.push_back(FormatRuntimeProfileLine("FRAME", frameProfile_));
 
     rightLines.push_back("GPU: " + gpuName_);
     rightLines.push_back("CPU: " + cpuName_);
@@ -1474,6 +1725,23 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
             swapChainExtent_
         );
         rightY += static_cast<float>(overlayFontLineHeight_) * kOverlayGlyphScale + kOverlayLineGap;
+    }
+
+    const float lineAdvance = static_cast<float>(overlayFontLineHeight_) * kOverlayGlyphScale + kOverlayLineGap;
+    float lowerLeftY = static_cast<float>(swapChainExtent_.height) - kOverlayMargin -
+                       lineAdvance * static_cast<float>(lowerLeftLines.size());
+    for (const std::string& rawLine : lowerLeftLines) {
+        const std::string line = SanitizeOverlayText(rawLine, overlayFontGlyphs_);
+        AppendOutlinedText(
+            overlayVertices_,
+            overlayFontGlyphs_,
+            line,
+            kOverlayMargin,
+            lowerLeftY,
+            kOverlayGlyphScale,
+            swapChainExtent_
+        );
+        lowerLeftY += lineAdvance;
     }
 
     if (overlayVertices_.size() > kMaxOverlayVertexCount) {

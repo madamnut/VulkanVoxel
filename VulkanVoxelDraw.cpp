@@ -44,16 +44,33 @@ struct ScreenshotComScope {
 }  // namespace
 
 void VulkanVoxelApp::DrawFrame() {
+    const auto frameStartTime = std::chrono::steady_clock::now();
+    const auto waitStartTime = std::chrono::steady_clock::now();
     vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
+    const auto waitEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(waitEndTime - waitStartTime).count(),
+        waitProfileTotalMs_,
+        waitProfileMaxMs_,
+        waitProfileSamples_
+    );
     TryCleanupRetiredWorldRenderBatches();
 
     if (overlayDirty_) {
+        const auto overlayWaitStartTime = std::chrono::steady_clock::now();
         vkWaitForFences(
             device_,
             static_cast<std::uint32_t>(inFlightFences_.size()),
             inFlightFences_.data(),
             VK_TRUE,
             UINT64_MAX
+        );
+        const auto overlayWaitEndTime = std::chrono::steady_clock::now();
+        AccumulateRuntimeProfileSample(
+            std::chrono::duration<double, std::milli>(overlayWaitEndTime - overlayWaitStartTime).count(),
+            waitProfileTotalMs_,
+            waitProfileMaxMs_,
+            waitProfileSamples_
         );
         UploadOverlayVertices();
         overlayDirty_ = false;
@@ -64,6 +81,7 @@ void VulkanVoxelApp::DrawFrame() {
     UpdateUniformBuffer(static_cast<std::uint32_t>(currentFrame_));
 
     std::uint32_t imageIndex = 0;
+    const auto acquireStartTime = std::chrono::steady_clock::now();
     const VkResult acquireResult = vkAcquireNextImageKHR(
         device_,
         swapChain_,
@@ -71,6 +89,13 @@ void VulkanVoxelApp::DrawFrame() {
         imageAvailableSemaphores_[currentFrame_],
         VK_NULL_HANDLE,
         &imageIndex
+    );
+    const auto acquireEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(acquireEndTime - acquireStartTime).count(),
+        acquireProfileTotalMs_,
+        acquireProfileMaxMs_,
+        acquireProfileSamples_
     );
 
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -82,7 +107,15 @@ void VulkanVoxelApp::DrawFrame() {
     }
 
     if (imagesInFlight_[imageIndex] != VK_NULL_HANDLE) {
+        const auto imageWaitStartTime = std::chrono::steady_clock::now();
         vkWaitForFences(device_, 1, &imagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX);
+        const auto imageWaitEndTime = std::chrono::steady_clock::now();
+        AccumulateRuntimeProfileSample(
+            std::chrono::duration<double, std::milli>(imageWaitEndTime - imageWaitStartTime).count(),
+            waitProfileTotalMs_,
+            waitProfileMaxMs_,
+            waitProfileSamples_
+        );
     }
     imagesInFlight_[imageIndex] = inFlightFences_[currentFrame_];
 
@@ -108,9 +141,17 @@ void VulkanVoxelApp::DrawFrame() {
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = signalSemaphores;
 
+    const auto submitStartTime = std::chrono::steady_clock::now();
     if (vkQueueSubmit(graphicsQueue_, 1, &submitInfo, inFlightFences_[currentFrame_]) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit draw commands.");
     }
+    const auto submitEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(submitEndTime - submitStartTime).count(),
+        submitProfileTotalMs_,
+        submitProfileMaxMs_,
+        submitProfileSamples_
+    );
 
     const VkSwapchainKHR swapChains[] = {swapChain_};
     VkPresentInfoKHR presentInfo{};
@@ -121,7 +162,15 @@ void VulkanVoxelApp::DrawFrame() {
     presentInfo.pSwapchains = swapChains;
     presentInfo.pImageIndices = &imageIndex;
 
+    const auto presentStartTime = std::chrono::steady_clock::now();
     const VkResult presentResult = vkQueuePresentKHR(presentQueue_, &presentInfo);
+    const auto presentEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(presentEndTime - presentStartTime).count(),
+        presentProfileTotalMs_,
+        presentProfileMaxMs_,
+        presentProfileSamples_
+    );
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
         RecreateSwapChain();
     } else if (presentResult != VK_SUCCESS) {
@@ -129,10 +178,25 @@ void VulkanVoxelApp::DrawFrame() {
     }
 
     if (screenshotCapturePending_) {
+        const auto screenshotWaitStartTime = std::chrono::steady_clock::now();
         vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
+        const auto screenshotWaitEndTime = std::chrono::steady_clock::now();
+        AccumulateRuntimeProfileSample(
+            std::chrono::duration<double, std::milli>(screenshotWaitEndTime - screenshotWaitStartTime).count(),
+            waitProfileTotalMs_,
+            waitProfileMaxMs_,
+            waitProfileSamples_
+        );
         FinalizeScreenshotCapture();
     }
 
+    const auto frameEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(frameEndTime - frameStartTime).count(),
+        frameProfileTotalMs_,
+        frameProfileMaxMs_,
+        frameProfileSamples_
+    );
     currentFrame_ = (currentFrame_ + 1) % kMaxFramesInFlight;
 }
 
@@ -410,6 +474,7 @@ void VulkanVoxelApp::UpdateUniformBuffer(std::uint32_t frameIndex) {
 }
 
 void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex) {
+    const auto drawCpuStartTime = std::chrono::steady_clock::now();
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 
@@ -492,11 +557,11 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
     }
 
     if (!worldRenderBatches_.empty()) {
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldPipeline_);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline_);
         vkCmdBindDescriptorSets(
             commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
-            worldPipelineLayout_,
+            terrainPipelineLayout_,
             0,
             1,
             &descriptorSets_[currentFrame_],
@@ -506,15 +571,33 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
 
         for (const auto& [id, batch] : worldRenderBatches_) {
             (void)id;
-            if (batch.vertexCount == 0 || batch.indexCount == 0) {
+            if (batch.quadCount == 0 || batch.poolIndex >= worldQuadPools_.size()) {
+                continue;
+            }
+            const WorldQuadPool& pool = worldQuadPools_[batch.poolIndex];
+            if (pool.buffer == VK_NULL_HANDLE) {
                 continue;
             }
 
-            const VkBuffer worldVertexBuffers[] = {batch.vertexBuffer};
-            const VkDeviceSize worldOffsets[] = {0};
+            const TerrainPushConstants terrainPushConstants{
+                id.chunkX * kChunkSizeX,
+                id.chunkZ * kChunkSizeZ,
+            };
+            vkCmdPushConstants(
+                commandBuffer,
+                terrainPipelineLayout_,
+                VK_SHADER_STAGE_VERTEX_BIT,
+                0,
+                sizeof(terrainPushConstants),
+                &terrainPushConstants
+            );
+
+            const VkBuffer worldVertexBuffers[] = {pool.buffer};
+            const VkDeviceSize worldOffsets[] = {
+                sizeof(WorldQuadRecord) * static_cast<VkDeviceSize>(batch.quadOffset)
+            };
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, worldVertexBuffers, worldOffsets);
-            vkCmdBindIndexBuffer(commandBuffer, batch.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(commandBuffer, batch.indexCount, 1, 0, 0, 0);
+            vkCmdDraw(commandBuffer, 6, batch.quadCount, 0, 0);
             ++drawCallCount_;
         }
     }
@@ -607,6 +690,14 @@ void VulkanVoxelApp::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uin
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
         throw std::runtime_error("Failed to end command buffer.");
     }
+
+    const auto drawCpuEndTime = std::chrono::steady_clock::now();
+    AccumulateRuntimeProfileSample(
+        std::chrono::duration<double, std::milli>(drawCpuEndTime - drawCpuStartTime).count(),
+        drawCpuProfileTotalMs_,
+        drawCpuProfileMaxMs_,
+        drawCpuProfileSamples_
+    );
 }
 
 void VulkanVoxelApp::CopyBuffer(VkBuffer sourceBuffer, VkBuffer destinationBuffer, VkDeviceSize size) const {

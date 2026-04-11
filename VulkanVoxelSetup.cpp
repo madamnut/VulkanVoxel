@@ -302,6 +302,7 @@ void VulkanVoxelApp::CreateRenderPass() {
 void VulkanVoxelApp::CreatePipelines() {
     const std::vector<char> skyVertShaderCode = ReadFile(SHADER_DIR "/sky.vert.spv");
     const std::vector<char> skyFragShaderCode = ReadFile(SHADER_DIR "/sky.frag.spv");
+    const std::vector<char> terrainVertShaderCode = ReadFile(SHADER_DIR "/terrain.vert.spv");
     const std::vector<char> worldVertShaderCode = ReadFile(SHADER_DIR "/world.vert.spv");
     const std::vector<char> worldFragShaderCode = ReadFile(SHADER_DIR "/world.frag.spv");
     const std::vector<char> overlayVertShaderCode = ReadFile(SHADER_DIR "/overlay.vert.spv");
@@ -311,6 +312,7 @@ void VulkanVoxelApp::CreatePipelines() {
 
     const VkShaderModule skyVertShaderModule = CreateShaderModule(skyVertShaderCode);
     const VkShaderModule skyFragShaderModule = CreateShaderModule(skyFragShaderCode);
+    const VkShaderModule terrainVertShaderModule = CreateShaderModule(terrainVertShaderCode);
     const VkShaderModule worldVertShaderModule = CreateShaderModule(worldVertShaderCode);
     const VkShaderModule worldFragShaderModule = CreateShaderModule(worldFragShaderCode);
     const VkShaderModule overlayVertShaderModule = CreateShaderModule(overlayVertShaderCode);
@@ -332,6 +334,17 @@ void VulkanVoxelApp::CreatePipelines() {
 
     const std::array<VkPipelineShaderStageCreateInfo, 2> worldStages = {
         worldVertStage,
+        worldFragStage,
+    };
+
+    VkPipelineShaderStageCreateInfo terrainVertStage{};
+    terrainVertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    terrainVertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    terrainVertStage.module = terrainVertShaderModule;
+    terrainVertStage.pName = "main";
+
+    const std::array<VkPipelineShaderStageCreateInfo, 2> terrainStages = {
+        terrainVertStage,
         worldFragStage,
     };
 
@@ -360,6 +373,28 @@ void VulkanVoxelApp::CreatePipelines() {
     worldVertexInput.pVertexBindingDescriptions = &worldBindingDescription;
     worldVertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(worldAttributes.size());
     worldVertexInput.pVertexAttributeDescriptions = worldAttributes.data();
+
+    VkVertexInputBindingDescription terrainBindingDescription{};
+    terrainBindingDescription.binding = 0;
+    terrainBindingDescription.stride = sizeof(WorldQuadRecord);
+    terrainBindingDescription.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+
+    std::array<VkVertexInputAttributeDescription, 2> terrainAttributes{};
+    terrainAttributes[0].binding = 0;
+    terrainAttributes[0].location = 0;
+    terrainAttributes[0].format = VK_FORMAT_R32_UINT;
+    terrainAttributes[0].offset = offsetof(WorldQuadRecord, packed0);
+    terrainAttributes[1].binding = 0;
+    terrainAttributes[1].location = 1;
+    terrainAttributes[1].format = VK_FORMAT_R32_UINT;
+    terrainAttributes[1].offset = offsetof(WorldQuadRecord, packed1);
+
+    VkPipelineVertexInputStateCreateInfo terrainVertexInput{};
+    terrainVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    terrainVertexInput.vertexBindingDescriptionCount = 1;
+    terrainVertexInput.pVertexBindingDescriptions = &terrainBindingDescription;
+    terrainVertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(terrainAttributes.size());
+    terrainVertexInput.pVertexAttributeDescriptions = terrainAttributes.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -497,6 +532,44 @@ void VulkanVoxelApp::CreatePipelines() {
 
     if (vkCreatePipelineLayout(device_, &worldLayoutInfo, nullptr, &worldPipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create world pipeline layout.");
+    }
+
+    VkPushConstantRange terrainPushConstantRange{};
+    terrainPushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    terrainPushConstantRange.offset = 0;
+    terrainPushConstantRange.size = sizeof(TerrainPushConstants);
+
+    VkPipelineLayoutCreateInfo terrainLayoutInfo = worldLayoutInfo;
+    terrainLayoutInfo.pushConstantRangeCount = 1;
+    terrainLayoutInfo.pPushConstantRanges = &terrainPushConstantRange;
+
+    if (vkCreatePipelineLayout(device_, &terrainLayoutInfo, nullptr, &terrainPipelineLayout_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create terrain pipeline layout.");
+    }
+
+    VkGraphicsPipelineCreateInfo terrainPipelineInfo{};
+    terrainPipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    terrainPipelineInfo.stageCount = static_cast<std::uint32_t>(terrainStages.size());
+    terrainPipelineInfo.pStages = terrainStages.data();
+    terrainPipelineInfo.pVertexInputState = &terrainVertexInput;
+    terrainPipelineInfo.pInputAssemblyState = &inputAssembly;
+    terrainPipelineInfo.pViewportState = &viewportState;
+    terrainPipelineInfo.pRasterizationState = &rasterizer;
+    terrainPipelineInfo.pMultisampleState = &multisampling;
+    terrainPipelineInfo.pDepthStencilState = &worldDepthStencil;
+    terrainPipelineInfo.pColorBlendState = &colorBlending;
+    terrainPipelineInfo.layout = terrainPipelineLayout_;
+    terrainPipelineInfo.renderPass = renderPass_;
+    terrainPipelineInfo.subpass = 0;
+
+    if (vkCreateGraphicsPipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1,
+            &terrainPipelineInfo,
+            nullptr,
+            &terrainPipeline_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create terrain pipeline.");
     }
 
     VkGraphicsPipelineCreateInfo worldPipelineInfo{};
@@ -696,6 +769,7 @@ void VulkanVoxelApp::CreatePipelines() {
     vkDestroyShaderModule(device_, overlayFragShaderModule, nullptr);
     vkDestroyShaderModule(device_, overlayVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, worldFragShaderModule, nullptr);
+    vkDestroyShaderModule(device_, terrainVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, worldVertShaderModule, nullptr);
 }
 
@@ -854,13 +928,8 @@ VkSurfaceFormatKHR VulkanVoxelApp::ChooseSwapSurfaceFormat(const std::vector<VkS
 }
 
 VkPresentModeKHR VulkanVoxelApp::ChooseSwapPresentMode(const std::vector<VkPresentModeKHR>& presentModes) const {
-    for (VkPresentModeKHR presentMode : presentModes) {
-        if (presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
-            return presentMode;
-        }
-    }
-
-    return VK_PRESENT_MODE_FIFO_KHR;
+    (void)presentModes;
+    return VK_PRESENT_MODE_IMMEDIATE_KHR;
 }
 
 VkExtent2D VulkanVoxelApp::ChooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities) const {

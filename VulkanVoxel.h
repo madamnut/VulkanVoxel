@@ -11,12 +11,14 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <array>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 struct QueueFamilyIndices {
@@ -40,20 +42,37 @@ struct UniformBufferObject {
     float projectionParams[4];
 };
 
+struct TerrainPushConstants {
+    std::int32_t chunkMinX = 0;
+    std::int32_t chunkMinZ = 0;
+};
+
 struct SelectionVertex {
     float position[3];
 };
 
 struct WorldRenderBatch {
     PendingChunkId id{};
-    VkBuffer vertexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
-    VkDeviceSize vertexBufferCapacity = 0;
+    std::uint32_t poolIndex = 0;
+    std::uint32_t quadOffset = 0;
+    std::uint32_t quadCapacity = 0;
+    std::uint32_t quadCount = 0;
     std::uint32_t vertexCount = 0;
-    VkBuffer indexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
-    VkDeviceSize indexBufferCapacity = 0;
     std::uint32_t indexCount = 0;
+};
+
+struct WorldQuadRange {
+    std::uint32_t offset = 0;
+    std::uint32_t count = 0;
+};
+
+struct WorldQuadPool {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mappedData = nullptr;
+    std::uint32_t capacityQuads = 0;
+    std::uint32_t committedQuads = 0;
+    std::vector<WorldQuadRange> freeRanges;
 };
 
 enum class CameraViewMode {
@@ -131,8 +150,12 @@ private:
     void UploadWorldRenderUpdate(const WorldRenderUpdate& update);
     void DestroyWorldMeshBuffers();
     void DestroyWorldRenderBatch(WorldRenderBatch& batch);
+    void DestroyWorldQuadPool(WorldQuadPool& pool);
     void UploadWorldRenderBatch(WorldRenderBatch& batch, const ChunkMeshBatchData& batchData);
     void TryCleanupRetiredWorldRenderBatches();
+    std::uint32_t CreateWorldQuadPool(std::uint32_t capacityQuads);
+    WorldQuadRange AllocateWorldQuadRange(WorldQuadPool& pool, std::uint32_t quadCount);
+    void ReleaseWorldQuadRange(WorldQuadPool& pool, std::uint32_t offset, std::uint32_t count);
     void CreateOverlayBuffer();
     void CreateUniformBuffers();
     void CreateDescriptorPool();
@@ -154,6 +177,8 @@ private:
     void UpdateOverlayText(float deltaTime);
     void UpdateCelestialVertices(std::uint32_t frameIndex);
     void RefreshSystemUsageStats();
+    void AccumulateRuntimeProfileSample(double elapsedMs, double& totalMs, double& maxMs, std::uint32_t& count);
+    void RefreshRuntimeProfileStats();
     void LoadStaticDebugInfo();
     void RebuildOverlayVertices();
     void UploadOverlayVertices();
@@ -236,6 +261,8 @@ private:
 
     VkPipelineLayout worldPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline worldPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout terrainPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline terrainPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout skyPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline skyPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout overlayPipelineLayout_ = VK_NULL_HANDLE;
@@ -272,8 +299,8 @@ private:
 
     std::uint32_t worldVertexCount_ = 0;
     std::uint32_t worldIndexCount_ = 0;
+    std::vector<WorldQuadPool> worldQuadPools_;
     std::unordered_map<PendingChunkId, WorldRenderBatch, PendingChunkIdHash> worldRenderBatches_;
-    std::vector<WorldRenderBatch> retiredWorldRenderBatches_;
     std::vector<VkBuffer> playerVertexBuffers_;
     std::vector<VkDeviceMemory> playerVertexBuffersMemory_;
     std::vector<VkDeviceSize> playerVertexBufferCapacities_;
@@ -367,6 +394,99 @@ private:
     double currentFrameTimeMs_ = 0.0;
     double fpsAccumulatorSeconds_ = 0.0;
     double overlayRefreshAccumulatorSeconds_ = 0.0;
+    RuntimeProfileStage chunkLoadProfile_{};
+    RuntimeProfileStage diskLoadProfile_{};
+    RuntimeProfileStage generateProfile_{};
+    RuntimeProfileStage meshBuildProfile_{};
+    RuntimeProfileStage saveProfile_{};
+    RuntimeProfileStage uploadProfile_{};
+    RuntimeProfileStage uploadChunkProfile_{};
+    RuntimeProfileStage uploadCountProfile_{};
+    RuntimeProfileStage uploadRemoveProfile_{};
+    RuntimeProfileStage uploadInsertProfile_{};
+    RuntimeProfileStage uploadAllocProfile_{};
+    RuntimeProfileStage uploadCopyProfile_{};
+    RuntimeProfileStage drawCpuProfile_{};
+    RuntimeProfileStage waitProfile_{};
+    RuntimeProfileStage acquireProfile_{};
+    RuntimeProfileStage submitProfile_{};
+    RuntimeProfileStage presentProfile_{};
+    RuntimeProfileStage frameProfile_{};
+    double chunkLoadProfileCumulativeMs_ = 0.0;
+    std::uint64_t chunkLoadProfileCumulativeSamples_ = 0;
+    double diskLoadProfileCumulativeMs_ = 0.0;
+    std::uint64_t diskLoadProfileCumulativeSamples_ = 0;
+    double generateProfileCumulativeMs_ = 0.0;
+    std::uint64_t generateProfileCumulativeSamples_ = 0;
+    double meshBuildProfileCumulativeMs_ = 0.0;
+    std::uint64_t meshBuildProfileCumulativeSamples_ = 0;
+    double saveProfileCumulativeMs_ = 0.0;
+    std::uint64_t saveProfileCumulativeSamples_ = 0;
+    double uploadProfileCumulativeMs_ = 0.0;
+    std::uint64_t uploadProfileCumulativeSamples_ = 0;
+    double uploadChunkProfileCumulativeMs_ = 0.0;
+    std::uint64_t uploadChunkProfileCumulativeSamples_ = 0;
+    double uploadCountProfileCumulativeValue_ = 0.0;
+    std::uint64_t uploadCountProfileCumulativeSamples_ = 0;
+    double uploadRemoveProfileCumulativeMs_ = 0.0;
+    std::uint64_t uploadRemoveProfileCumulativeSamples_ = 0;
+    double uploadInsertProfileCumulativeMs_ = 0.0;
+    std::uint64_t uploadInsertProfileCumulativeSamples_ = 0;
+    double uploadAllocProfileCumulativeMs_ = 0.0;
+    std::uint64_t uploadAllocProfileCumulativeSamples_ = 0;
+    double uploadCopyProfileCumulativeMs_ = 0.0;
+    std::uint64_t uploadCopyProfileCumulativeSamples_ = 0;
+    double drawCpuProfileCumulativeMs_ = 0.0;
+    std::uint64_t drawCpuProfileCumulativeSamples_ = 0;
+    double waitProfileCumulativeMs_ = 0.0;
+    std::uint64_t waitProfileCumulativeSamples_ = 0;
+    double acquireProfileCumulativeMs_ = 0.0;
+    std::uint64_t acquireProfileCumulativeSamples_ = 0;
+    double submitProfileCumulativeMs_ = 0.0;
+    std::uint64_t submitProfileCumulativeSamples_ = 0;
+    double presentProfileCumulativeMs_ = 0.0;
+    std::uint64_t presentProfileCumulativeSamples_ = 0;
+    double frameProfileCumulativeMs_ = 0.0;
+    std::uint64_t frameProfileCumulativeSamples_ = 0;
+    double uploadProfileTotalMs_ = 0.0;
+    double uploadProfileMaxMs_ = 0.0;
+    std::uint32_t uploadProfileSamples_ = 0;
+    double uploadChunkProfileTotalMs_ = 0.0;
+    double uploadChunkProfileMaxMs_ = 0.0;
+    std::uint32_t uploadChunkProfileSamples_ = 0;
+    double uploadCountProfileTotalValue_ = 0.0;
+    double uploadCountProfileMaxValue_ = 0.0;
+    std::uint32_t uploadCountProfileSamples_ = 0;
+    double uploadRemoveProfileTotalMs_ = 0.0;
+    double uploadRemoveProfileMaxMs_ = 0.0;
+    std::uint32_t uploadRemoveProfileSamples_ = 0;
+    double uploadInsertProfileTotalMs_ = 0.0;
+    double uploadInsertProfileMaxMs_ = 0.0;
+    std::uint32_t uploadInsertProfileSamples_ = 0;
+    double uploadAllocProfileTotalMs_ = 0.0;
+    double uploadAllocProfileMaxMs_ = 0.0;
+    std::uint32_t uploadAllocProfileSamples_ = 0;
+    double uploadCopyProfileTotalMs_ = 0.0;
+    double uploadCopyProfileMaxMs_ = 0.0;
+    std::uint32_t uploadCopyProfileSamples_ = 0;
+    double drawCpuProfileTotalMs_ = 0.0;
+    double drawCpuProfileMaxMs_ = 0.0;
+    std::uint32_t drawCpuProfileSamples_ = 0;
+    double waitProfileTotalMs_ = 0.0;
+    double waitProfileMaxMs_ = 0.0;
+    std::uint32_t waitProfileSamples_ = 0;
+    double acquireProfileTotalMs_ = 0.0;
+    double acquireProfileMaxMs_ = 0.0;
+    std::uint32_t acquireProfileSamples_ = 0;
+    double submitProfileTotalMs_ = 0.0;
+    double submitProfileMaxMs_ = 0.0;
+    std::uint32_t submitProfileSamples_ = 0;
+    double presentProfileTotalMs_ = 0.0;
+    double presentProfileMaxMs_ = 0.0;
+    std::uint32_t presentProfileSamples_ = 0;
+    double frameProfileTotalMs_ = 0.0;
+    double frameProfileMaxMs_ = 0.0;
+    std::uint32_t frameProfileSamples_ = 0;
     std::size_t loadedChunkCount_ = 0;
     int lastMeshChunkX_ = -1;
     int lastMeshChunkZ_ = -1;
@@ -427,6 +547,7 @@ private:
     };
 
     std::thread worldMeshWorkerThread_;
+    std::thread worldSaveWorkerThread_;
     std::vector<std::thread> chunkLoadWorkerThreads_;
     std::vector<std::thread> meshWorkerThreads_;
     std::mutex worldMeshWorkerMutex_;
@@ -440,4 +561,13 @@ private:
     std::uint64_t uploadedWorldMeshSerial_ = 0;
     WorldMeshBuildRequest pendingWorldMeshRequest_{};
     std::optional<WorldRenderUpdate> completedWorldRenderUpdate_;
+    std::deque<PendingChunkId> pendingStorageChunkRequests_;
+    std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingStorageChunkRequestSet_;
+    std::deque<PreparedChunkColumn> completedPreparedChunkColumns_;
+    std::deque<RegionSaveTask> pendingWorldSaveTasks_;
+    std::vector<ChunkMeshBatchData> pendingWorldRenderUploads_;
+    std::vector<PendingChunkId> pendingWorldRenderRemovals_;
+    std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingWorldRenderUploadSet_;
+    std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingWorldRenderRemovalSet_;
+    std::size_t pendingWorldRenderLoadedChunkCount_ = 0;
 };
