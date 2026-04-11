@@ -8,6 +8,11 @@ struct TerrainConfig {
     int seaLevel = 0;
     int flatGroundHeight = 0;
     float solidThreshold = 0.0f;
+    float waveAmplitude = 0.0f;
+    float waveFrequencyX = 0.0f;
+    float waveFrequencyZ = 0.0f;
+    float wavePhaseX = 0.0f;
+    float wavePhaseZ = 0.0f;
 
     float noiseFeatureScale = 0.0f;
     float noiseOutputMin = 0.0f;

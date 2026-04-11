@@ -90,6 +90,11 @@ TerrainConfig LoadTerrainConfig(const std::string& path) {
     config.seaLevel = ReadJsonInt(json, "sea_level", 169);
     config.flatGroundHeight = ReadJsonInt(json, "flat_ground_height", 256);
     config.solidThreshold = ReadJsonFloat(json, "solid_threshold", 0.0f);
+    config.waveAmplitude = ReadJsonFloat(json, "wave_amplitude", 12.0f);
+    config.waveFrequencyX = ReadJsonFloat(json, "wave_frequency_x", 0.02f);
+    config.waveFrequencyZ = ReadJsonFloat(json, "wave_frequency_z", 0.02f);
+    config.wavePhaseX = ReadJsonFloat(json, "wave_phase_x", 0.0f);
+    config.wavePhaseZ = ReadJsonFloat(json, "wave_phase_z", 0.0f);
 
     config.noiseFeatureScale = ReadJsonFloat(json, "noise_feature_scale", 600.0f);
     config.noiseOutputMin = ReadJsonFloat(json, "noise_output_min", -1.0f);

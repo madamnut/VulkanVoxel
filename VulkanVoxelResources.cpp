@@ -48,6 +48,11 @@ struct LoadedImage {
     std::vector<std::uint8_t> pixels;
 };
 
+struct SerializedPlayerVertex {
+    float position[3];
+    float uv[2];
+};
+
 bool PendingChunkIdEquals(const PendingChunkId& lhs, const PendingChunkId& rhs) {
     return lhs.chunkX == rhs.chunkX && lhs.chunkZ == rhs.chunkZ;
 }
@@ -330,6 +335,9 @@ void VulkanVoxelApp::CreateTextureImage() {
     const std::string path = texturePath.string();
     const LoadedImage image = LoadImageRgba(path);
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(image.pixels.size());
+    textureMipLevels_ = static_cast<std::uint32_t>(
+        std::floor(std::log2(static_cast<float>(std::max(image.width, image.height))))
+    ) + 1;
 
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
@@ -354,39 +362,36 @@ void VulkanVoxelApp::CreateTextureImage() {
         image.height,
         VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         textureImage_,
-        textureImageMemory_
+        textureImageMemory_,
+        textureMipLevels_
     );
 
     TransitionImageLayout(
         textureImage_,
         VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        textureMipLevels_
     );
     CopyBufferToImage(stagingBuffer, textureImage_, image.width, image.height);
-    TransitionImageLayout(
-        textureImage_,
-        VK_FORMAT_R8G8B8A8_UNORM,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-    );
+    GenerateMipmaps(textureImage_, VK_FORMAT_R8G8B8A8_UNORM, image.width, image.height, textureMipLevels_);
 
     vkDestroyBuffer(device_, stagingBuffer, nullptr);
     vkFreeMemory(device_, stagingBufferMemory, nullptr);
 }
 
 void VulkanVoxelApp::CreateTextureImageView() {
-    textureImageView_ = CreateImageView(textureImage_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    textureImageView_ = CreateImageView(textureImage_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, textureMipLevels_);
 }
 
 void VulkanVoxelApp::CreateTextureSampler() {
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_NEAREST;
-    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -395,9 +400,9 @@ void VulkanVoxelApp::CreateTextureSampler() {
     samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
     samplerInfo.compareEnable = VK_FALSE;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = 0.0f;
+    samplerInfo.maxLod = static_cast<float>(textureMipLevels_);
 
     if (vkCreateSampler(device_, &samplerInfo, nullptr, &textureSampler_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create texture sampler.");
@@ -421,13 +426,14 @@ void VulkanVoxelApp::LoadPlayerMesh() {
         throw std::runtime_error("Invalid extracted player mesh format.");
     }
 
+    std::vector<SerializedPlayerVertex> serializedVertices(vertexCount);
     playerBaseVertices_.resize(vertexCount);
     playerRenderVertices_.resize(vertexCount);
     playerIndices_.resize(indexCount);
 
     file.read(
-        reinterpret_cast<char*>(playerBaseVertices_.data()),
-        static_cast<std::streamsize>(sizeof(WorldVertex) * playerBaseVertices_.size())
+        reinterpret_cast<char*>(serializedVertices.data()),
+        static_cast<std::streamsize>(sizeof(SerializedPlayerVertex) * serializedVertices.size())
     );
     file.read(
         reinterpret_cast<char*>(playerIndices_.data()),
@@ -436,6 +442,17 @@ void VulkanVoxelApp::LoadPlayerMesh() {
 
     if (!file) {
         throw std::runtime_error("Failed to read extracted player mesh data.");
+    }
+
+    for (std::size_t i = 0; i < serializedVertices.size(); ++i) {
+        const SerializedPlayerVertex& src = serializedVertices[i];
+        WorldVertex& dst = playerBaseVertices_[i];
+        dst.position[0] = src.position[0];
+        dst.position[1] = src.position[1];
+        dst.position[2] = src.position[2];
+        dst.uv[0] = src.uv[0];
+        dst.uv[1] = src.uv[1];
+        dst.ao = 1.0f;
     }
 
     playerIndexCount_ = indexCount;
@@ -1190,6 +1207,7 @@ void VulkanVoxelApp::UpdatePlayerRenderMesh() {
         dst.position[2] = playerFeet.z + rotatedZ;
         dst.uv[0] = src.uv[0];
         dst.uv[1] = src.uv[1];
+        dst.ao = src.ao;
     }
 
     const VkDeviceSize vertexBufferSize =
@@ -1868,7 +1886,8 @@ void VulkanVoxelApp::CreateImage(
     VkImageUsageFlags usage,
     VkMemoryPropertyFlags properties,
     VkImage& image,
-    VkDeviceMemory& imageMemory
+    VkDeviceMemory& imageMemory,
+    std::uint32_t mipLevels
 ) const {
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1876,7 +1895,7 @@ void VulkanVoxelApp::CreateImage(
     imageInfo.extent.width = width;
     imageInfo.extent.height = height;
     imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = 1;
+    imageInfo.mipLevels = mipLevels;
     imageInfo.arrayLayers = 1;
     imageInfo.format = format;
     imageInfo.tiling = tiling;
@@ -1904,7 +1923,12 @@ void VulkanVoxelApp::CreateImage(
     vkBindImageMemory(device_, image, imageMemory, 0);
 }
 
-VkImageView VulkanVoxelApp::CreateImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags) const {
+VkImageView VulkanVoxelApp::CreateImageView(
+    VkImage image,
+    VkFormat format,
+    VkImageAspectFlags aspectFlags,
+    std::uint32_t mipLevels
+) const {
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = image;
@@ -1912,7 +1936,7 @@ VkImageView VulkanVoxelApp::CreateImageView(VkImage image, VkFormat format, VkIm
     viewInfo.format = format;
     viewInfo.subresourceRange.aspectMask = aspectFlags;
     viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.levelCount = mipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = 1;
 

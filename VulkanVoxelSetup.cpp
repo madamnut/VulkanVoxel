@@ -340,7 +340,7 @@ void VulkanVoxelApp::CreatePipelines() {
     worldBindingDescription.stride = sizeof(WorldVertex);
     worldBindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    std::array<VkVertexInputAttributeDescription, 2> worldAttributes{};
+    std::array<VkVertexInputAttributeDescription, 3> worldAttributes{};
     worldAttributes[0].binding = 0;
     worldAttributes[0].location = 0;
     worldAttributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
@@ -349,6 +349,10 @@ void VulkanVoxelApp::CreatePipelines() {
     worldAttributes[1].location = 1;
     worldAttributes[1].format = VK_FORMAT_R32G32_SFLOAT;
     worldAttributes[1].offset = offsetof(WorldVertex, uv);
+    worldAttributes[2].binding = 0;
+    worldAttributes[2].location = 2;
+    worldAttributes[2].format = VK_FORMAT_R32_SFLOAT;
+    worldAttributes[2].offset = offsetof(WorldVertex, ao);
 
     VkPipelineVertexInputStateCreateInfo worldVertexInput{};
     worldVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;

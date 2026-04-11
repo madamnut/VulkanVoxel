@@ -39,6 +39,15 @@ struct RegionChunkIndexEntry {
     std::uint32_t size = 0;
 };
 
+struct FaceMaskCell {
+    int value = 0;
+    std::array<std::uint8_t, 4> ao{3, 3, 3, 3};
+
+    bool operator==(const FaceMaskCell& other) const = default;
+};
+
+constexpr float kAoBrightnessTable[4] = {0.55f, 0.70f, 0.85f, 1.0f};
+
 std::size_t GetMeshBuildSampleIndex(int x, int y, int z) {
     return static_cast<std::size_t>(y * kMeshBuildSampleSize * kMeshBuildSampleSize +
                                     z * kMeshBuildSampleSize + x);
@@ -50,6 +59,22 @@ struct ClipVertex {
     float z = 0.0f;
     float w = 1.0f;
 };
+
+Vec3 SubtractVec3(const Vec3& a, const Vec3& b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+Vec3 CrossVec3(const Vec3& a, const Vec3& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    };
+}
+
+float DotVec3(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
 
 ClipVertex TransformPoint(const Mat4& matrix, const Vec3& point) {
     ClipVertex out{};
@@ -68,21 +93,51 @@ void AppendQuad(
     const Vec3& p2,
     const Vec3& p3,
     float uMax,
-    float vMax
+    float vMax,
+    const std::array<float, 4>& ao = {1.0f, 1.0f, 1.0f, 1.0f},
+    bool flipDiagonal = false,
+    bool reverseWinding = false
 ) {
     const std::uint32_t baseIndex = static_cast<std::uint32_t>(mesh.vertices.size());
 
-    mesh.vertices.push_back({{p0.x, p0.y, p0.z}, {0.0f, 0.0f}});
-    mesh.vertices.push_back({{p1.x, p1.y, p1.z}, {uMax, 0.0f}});
-    mesh.vertices.push_back({{p2.x, p2.y, p2.z}, {uMax, vMax}});
-    mesh.vertices.push_back({{p3.x, p3.y, p3.z}, {0.0f, vMax}});
+    mesh.vertices.push_back({{p0.x, p0.y, p0.z}, {0.0f, 0.0f}, ao[0]});
+    mesh.vertices.push_back({{p1.x, p1.y, p1.z}, {uMax, 0.0f}, ao[1]});
+    mesh.vertices.push_back({{p2.x, p2.y, p2.z}, {uMax, vMax}, ao[2]});
+    mesh.vertices.push_back({{p3.x, p3.y, p3.z}, {0.0f, vMax}, ao[3]});
 
-    mesh.indices.push_back(baseIndex + 0);
-    mesh.indices.push_back(baseIndex + 1);
-    mesh.indices.push_back(baseIndex + 2);
-    mesh.indices.push_back(baseIndex + 0);
-    mesh.indices.push_back(baseIndex + 2);
-    mesh.indices.push_back(baseIndex + 3);
+    if (flipDiagonal) {
+        if (reverseWinding) {
+            mesh.indices.push_back(baseIndex + 0);
+            mesh.indices.push_back(baseIndex + 3);
+            mesh.indices.push_back(baseIndex + 1);
+            mesh.indices.push_back(baseIndex + 1);
+            mesh.indices.push_back(baseIndex + 3);
+            mesh.indices.push_back(baseIndex + 2);
+        } else {
+            mesh.indices.push_back(baseIndex + 0);
+            mesh.indices.push_back(baseIndex + 1);
+            mesh.indices.push_back(baseIndex + 3);
+            mesh.indices.push_back(baseIndex + 1);
+            mesh.indices.push_back(baseIndex + 2);
+            mesh.indices.push_back(baseIndex + 3);
+        }
+    } else {
+        if (reverseWinding) {
+            mesh.indices.push_back(baseIndex + 0);
+            mesh.indices.push_back(baseIndex + 2);
+            mesh.indices.push_back(baseIndex + 1);
+            mesh.indices.push_back(baseIndex + 0);
+            mesh.indices.push_back(baseIndex + 3);
+            mesh.indices.push_back(baseIndex + 2);
+        } else {
+            mesh.indices.push_back(baseIndex + 0);
+            mesh.indices.push_back(baseIndex + 1);
+            mesh.indices.push_back(baseIndex + 2);
+            mesh.indices.push_back(baseIndex + 0);
+            mesh.indices.push_back(baseIndex + 2);
+            mesh.indices.push_back(baseIndex + 3);
+        }
+    }
 }
 
 template <typename Stream, typename T>
@@ -104,6 +159,83 @@ void AppendBinary(std::vector<std::uint8_t>& buffer, const T& value) {
 
 bool ShouldStoreSubChunk(const SubChunkVoxelData& subChunk) {
     return !subChunk.isUniform || subChunk.uniformBlock != 0;
+}
+
+std::uint8_t ComputeVertexAoValue(bool side1, bool side2, bool corner) {
+    if (side1 && side2) {
+        return 0;
+    }
+
+    return static_cast<std::uint8_t>(3 - (static_cast<int>(side1) + static_cast<int>(side2) + static_cast<int>(corner)));
+}
+
+template <typename SampleFn>
+std::array<std::uint8_t, 4> ComputeQuadAoPattern(
+    const SampleFn& sampleBlock,
+    int axis,
+    bool positiveNormal,
+    int planeSlice,
+    int startU,
+    int startV,
+    int width,
+    int height
+) {
+    const int u = (axis + 1) % 3;
+    const int v = (axis + 2) % 3;
+    const int airAxis = positiveNormal ? planeSlice : (planeSlice - 1);
+    const int uMin = startU;
+    const int uMax = startU + width - 1;
+    const int vMin = startV;
+    const int vMax = startV + height - 1;
+
+    const auto sampleAo = [&](int faceU, int faceV, int du, int dv) {
+        int coords[3] = {};
+        coords[axis] = airAxis;
+        coords[u] = faceU;
+        coords[v] = faceV;
+
+        const bool side1 = sampleBlock(
+            coords[0] + (u == 0 ? du : 0),
+            coords[1] + (u == 1 ? du : 0),
+            coords[2] + (u == 2 ? du : 0)) != 0;
+        const bool side2 = sampleBlock(
+            coords[0] + (v == 0 ? dv : 0),
+            coords[1] + (v == 1 ? dv : 0),
+            coords[2] + (v == 2 ? dv : 0)) != 0;
+        const bool corner = sampleBlock(
+            coords[0] + (u == 0 ? du : 0) + (v == 0 ? dv : 0),
+            coords[1] + (u == 1 ? du : 0) + (v == 1 ? dv : 0),
+            coords[2] + (u == 2 ? du : 0) + (v == 2 ? dv : 0)) != 0;
+        return ComputeVertexAoValue(side1, side2, corner);
+    };
+
+    return {
+        sampleAo(uMin, vMin, -1, -1),
+        sampleAo(uMax, vMin, 1, -1),
+        sampleAo(uMax, vMax, 1, 1),
+        sampleAo(uMin, vMax, -1, 1),
+    };
+}
+
+template <typename SampleFn>
+std::array<float, 4> ComputeQuadAoValues(
+    const SampleFn& sampleBlock,
+    int axis,
+    bool positiveNormal,
+    int planeSlice,
+    int startU,
+    int startV,
+    int width,
+    int height
+) {
+    const std::array<std::uint8_t, 4> pattern =
+        ComputeQuadAoPattern(sampleBlock, axis, positiveNormal, planeSlice, startU, startV, width, height);
+    return {
+        kAoBrightnessTable[pattern[0]],
+        kAoBrightnessTable[pattern[1]],
+        kAoBrightnessTable[pattern[2]],
+        kAoBrightnessTable[pattern[3]],
+    };
 }
 
 }  // namespace
@@ -193,8 +325,8 @@ void VoxelWorld::TryCollapseSubChunk(SubChunkVoxelData& subChunk) {
     subChunk.isUniform = true;
 }
 
-std::uint16_t VoxelWorld::SampleGeneratedBlock(int worldY) const {
-    return worldY < terrainConfig_.flatGroundHeight ? static_cast<std::uint16_t>(1) : static_cast<std::uint16_t>(0);
+std::uint16_t VoxelWorld::SampleGeneratedBlock(int worldX, int worldY, int worldZ) const {
+    return WorldGenerator::SampleBlock(worldX, worldY, worldZ, terrainConfig_);
 }
 
 bool VoxelWorld::IsInsideWorld(int worldX, int worldY, int worldZ) {
@@ -360,7 +492,7 @@ PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input
     preparedMesh.id = input.id;
 
     constexpr int dims[3] = {kChunkSizeX, kSubChunkSize, kChunkSizeZ};
-    std::vector<int> mask(static_cast<std::size_t>(kChunkSizeX * kChunkSizeZ));
+    std::vector<FaceMaskCell> mask(static_cast<std::size_t>(kChunkSizeX * kChunkSizeZ));
 
     const auto sampleBlock = [&input](int localX, int localY, int localZ) -> std::uint16_t {
         return input.blocks[GetMeshBuildSampleIndex(localX + 1, localY + 1, localZ + 1)];
@@ -379,7 +511,14 @@ PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input
         }
     }
 
-    const auto emitGreedyQuad = [&](int axis, bool positiveNormal, int slice, int startU, int startV, int width, int height) {
+    const auto emitGreedyQuad = [&](
+                                    int axis,
+                                    bool positiveNormal,
+                                    int slice,
+                                    int startU,
+                                    int startV,
+                                    int width,
+                                    int height) {
         const int u = (axis + 1) % 3;
         const int v = (axis + 2) % 3;
 
@@ -426,11 +565,70 @@ PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input
             dv.z = static_cast<float>(height);
         }
 
-        const Vec3 p0 = base;
-        const Vec3 p1 = positiveNormal ? base + du : base + dv;
-        const Vec3 p2 = base + du + dv;
-        const Vec3 p3 = positiveNormal ? base + dv : base + du;
-        AppendQuad(preparedMesh, p0, p1, p2, p3, static_cast<float>(width), static_cast<float>(height));
+        Vec3 p0{};
+        Vec3 p1{};
+        Vec3 p2{};
+        Vec3 p3{};
+        float quadUMax = static_cast<float>(width);
+        float quadVMax = static_cast<float>(height);
+        const std::array<float, 4> baseAo =
+            ComputeQuadAoValues(sampleBlock, axis, positiveNormal, slice, startU, startV, width, height);
+        std::array<float, 4> vertexAo{};
+
+        if (axis == 0) {
+            quadUMax = static_cast<float>(height);
+            quadVMax = static_cast<float>(width);
+            if (positiveNormal) {
+                p0 = base + dv;
+                p1 = base;
+                p2 = base + du;
+                p3 = base + du + dv;
+                vertexAo = {baseAo[3], baseAo[0], baseAo[1], baseAo[2]};
+            } else {
+                p0 = base;
+                p1 = base + dv;
+                p2 = base + du + dv;
+                p3 = base + du;
+                vertexAo = {baseAo[0], baseAo[3], baseAo[2], baseAo[1]};
+            }
+        } else if (positiveNormal) {
+            p0 = base;
+            p1 = base + du;
+            p2 = base + du + dv;
+            p3 = base + dv;
+            vertexAo = baseAo;
+        } else {
+            p0 = base + du;
+            p1 = base;
+            p2 = base + dv;
+            p3 = base + du + dv;
+            vertexAo = {baseAo[1], baseAo[0], baseAo[3], baseAo[2]};
+        }
+
+        const bool flipDiagonal = (vertexAo[0] + vertexAo[2]) > (vertexAo[1] + vertexAo[3]);
+        Vec3 expectedNormal{};
+        if (axis == 0) {
+            expectedNormal.x = positiveNormal ? 1.0f : -1.0f;
+        } else if (axis == 1) {
+            expectedNormal.y = positiveNormal ? 1.0f : -1.0f;
+        } else {
+            expectedNormal.z = positiveNormal ? 1.0f : -1.0f;
+        }
+        const Vec3 edge01 = SubtractVec3(p1, p0);
+        const Vec3 edge02 = SubtractVec3(p2, p0);
+        const bool reverseWinding = DotVec3(CrossVec3(edge01, edge02), expectedNormal) < 0.0f;
+        AppendQuad(
+            preparedMesh,
+            p0,
+            p1,
+            p2,
+            p3,
+            quadUMax,
+            quadVMax,
+            vertexAo,
+            flipDiagonal,
+            reverseWinding
+        );
     };
 
     for (int axis = 0; axis < 3; ++axis) {
@@ -453,13 +651,15 @@ PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input
                     const std::uint16_t a = sampleBlock(aCoords[0], aCoords[1], aCoords[2]);
                     const std::uint16_t b = sampleBlock(bCoords[0], bCoords[1], bCoords[2]);
 
+                    FaceMaskCell face{};
                     if (a != 0 && b == 0) {
-                        mask[static_cast<std::size_t>(maskIndex)] = static_cast<int>(a);
+                        face.value = static_cast<int>(a);
+                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, true, slice + 1, i, j, 1, 1);
                     } else if (a == 0 && b != 0) {
-                        mask[static_cast<std::size_t>(maskIndex)] = -static_cast<int>(b);
-                    } else {
-                        mask[static_cast<std::size_t>(maskIndex)] = 0;
+                        face.value = -static_cast<int>(b);
+                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, false, slice + 1, i, j, 1, 1);
                     }
+                    mask[static_cast<std::size_t>(maskIndex)] = face;
 
                     ++maskIndex;
                 }
@@ -467,8 +667,8 @@ PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input
 
             for (int j = 0; j < dims[v]; ++j) {
                 for (int i = 0; i < dims[u];) {
-                    const int current = mask[static_cast<std::size_t>(i + j * dims[u])];
-                    if (current == 0) {
+                    const FaceMaskCell current = mask[static_cast<std::size_t>(i + j * dims[u])];
+                    if (current.value == 0) {
                         ++i;
                         continue;
                     }
@@ -493,11 +693,11 @@ PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input
                         }
                     }
 
-                    emitGreedyQuad(axis, current > 0, slice + 1, i, j, width, height);
+                    emitGreedyQuad(axis, current.value > 0, slice + 1, i, j, width, height);
 
                     for (int row = 0; row < height; ++row) {
                         for (int col = 0; col < width; ++col) {
-                            mask[static_cast<std::size_t>(i + col + (j + row) * dims[u])] = 0;
+                            mask[static_cast<std::size_t>(i + col + (j + row) * dims[u])] = FaceMaskCell{};
                         }
                     }
 
@@ -530,7 +730,9 @@ bool VoxelWorld::CommitPreparedSubChunkMesh(PreparedSubChunkMesh&& preparedMesh)
     mesh.indices = std::move(preparedMesh.indices);
     mesh.dirty = queuedDirtySubChunks_.contains(id);
     ++mesh.revision;
-    QueueRenderChunkUpdate(id.chunkX, id.chunkZ);
+    if (!HasPendingMeshWorkForChunk(id.chunkX, id.chunkZ)) {
+        QueueRenderChunkUpdate(id.chunkX, id.chunkZ);
+    }
     return true;
 }
 
@@ -841,6 +1043,16 @@ void VoxelWorld::MarkSubChunkDirty(int chunkX, int chunkZ, int subChunkIndex) {
     SubChunkMeshData& subChunkMesh = columnIt->second.subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
     subChunkMesh.dirty = true;
     EnqueueDirtySubChunk(chunkX, chunkZ, subChunkIndex);
+}
+
+bool VoxelWorld::HasPendingMeshWorkForChunk(int chunkX, int chunkZ) const {
+    for (int subChunkIndex = 0; subChunkIndex < kSubChunkCountY; ++subChunkIndex) {
+        const DirtySubChunkId id{chunkX, chunkZ, subChunkIndex};
+        if (queuedDirtySubChunks_.contains(id) || inFlightDirtySubChunks_.contains(id)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool VoxelWorld::IsChunkDesired(int chunkX, int chunkZ) const {
@@ -1165,7 +1377,6 @@ bool VoxelWorld::LoadChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outCol
     if (!std::filesystem::exists(regionPath)) {
         return false;
     }
-
     std::ifstream stream(regionPath, std::ios::binary);
     if (!stream.is_open()) {
         throw std::runtime_error("Failed to open region file.");
@@ -1579,7 +1790,7 @@ std::uint16_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) {
 
     const auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
     if (columnIt == chunkColumns_.end() || columnIt->second.subChunks.size() != kSubChunkCountY) {
-        return SampleGeneratedBlock(worldY);
+        return SampleGeneratedBlock(worldX, worldY, worldZ);
     }
 
     return GetSubChunkBlock(
@@ -1914,7 +2125,7 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
     }
 
     constexpr int dims[3] = {kChunkSizeX, kSubChunkSize, kChunkSizeZ};
-    std::vector<int> mask(static_cast<std::size_t>(kChunkSizeX * kChunkSizeZ));
+    std::vector<FaceMaskCell> mask(static_cast<std::size_t>(kChunkSizeX * kChunkSizeZ));
 
     const auto sampleBlock = [&](int localX, int localY, int localZ) -> std::uint16_t {
         if (localX >= 0 && localX < kChunkSizeX &&
@@ -1926,7 +2137,14 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
         return GetBlock(minWorldX + localX, minWorldY + localY, minWorldZ + localZ);
     };
 
-    const auto emitGreedyQuad = [&](int axis, bool positiveNormal, int slice, int startU, int startV, int width, int height) {
+    const auto emitGreedyQuad = [&](
+                                    int axis,
+                                    bool positiveNormal,
+                                    int slice,
+                                    int startU,
+                                    int startV,
+                                    int width,
+                                    int height) {
         const int u = (axis + 1) % 3;
         const int v = (axis + 2) % 3;
 
@@ -1973,11 +2191,70 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
             dv.z = static_cast<float>(height);
         }
 
-        const Vec3 p0 = base;
-        const Vec3 p1 = positiveNormal ? base + du : base + dv;
-        const Vec3 p2 = base + du + dv;
-        const Vec3 p3 = positiveNormal ? base + dv : base + du;
-        AppendQuad(mesh, p0, p1, p2, p3, static_cast<float>(width), static_cast<float>(height));
+        Vec3 p0{};
+        Vec3 p1{};
+        Vec3 p2{};
+        Vec3 p3{};
+        float quadUMax = static_cast<float>(width);
+        float quadVMax = static_cast<float>(height);
+        const std::array<float, 4> baseAo =
+            ComputeQuadAoValues(sampleBlock, axis, positiveNormal, slice, startU, startV, width, height);
+        std::array<float, 4> vertexAo{};
+
+        if (axis == 0) {
+            quadUMax = static_cast<float>(height);
+            quadVMax = static_cast<float>(width);
+            if (positiveNormal) {
+                p0 = base + dv;
+                p1 = base;
+                p2 = base + du;
+                p3 = base + du + dv;
+                vertexAo = {baseAo[3], baseAo[0], baseAo[1], baseAo[2]};
+            } else {
+                p0 = base;
+                p1 = base + dv;
+                p2 = base + du + dv;
+                p3 = base + du;
+                vertexAo = {baseAo[0], baseAo[3], baseAo[2], baseAo[1]};
+            }
+        } else if (positiveNormal) {
+            p0 = base;
+            p1 = base + du;
+            p2 = base + du + dv;
+            p3 = base + dv;
+            vertexAo = baseAo;
+        } else {
+            p0 = base + du;
+            p1 = base;
+            p2 = base + dv;
+            p3 = base + du + dv;
+            vertexAo = {baseAo[1], baseAo[0], baseAo[3], baseAo[2]};
+        }
+
+        const bool flipDiagonal = (vertexAo[0] + vertexAo[2]) > (vertexAo[1] + vertexAo[3]);
+        Vec3 expectedNormal{};
+        if (axis == 0) {
+            expectedNormal.x = positiveNormal ? 1.0f : -1.0f;
+        } else if (axis == 1) {
+            expectedNormal.y = positiveNormal ? 1.0f : -1.0f;
+        } else {
+            expectedNormal.z = positiveNormal ? 1.0f : -1.0f;
+        }
+        const Vec3 edge01 = SubtractVec3(p1, p0);
+        const Vec3 edge02 = SubtractVec3(p2, p0);
+        const bool reverseWinding = DotVec3(CrossVec3(edge01, edge02), expectedNormal) < 0.0f;
+        AppendQuad(
+            mesh,
+            p0,
+            p1,
+            p2,
+            p3,
+            quadUMax,
+            quadVMax,
+            vertexAo,
+            flipDiagonal,
+            reverseWinding
+        );
     };
 
     for (int axis = 0; axis < 3; ++axis) {
@@ -2000,13 +2277,15 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
                     const std::uint16_t a = sampleBlock(aCoords[0], aCoords[1], aCoords[2]);
                     const std::uint16_t b = sampleBlock(bCoords[0], bCoords[1], bCoords[2]);
 
+                    FaceMaskCell face{};
                     if (a != 0 && b == 0) {
-                        mask[static_cast<std::size_t>(maskIndex)] = static_cast<int>(a);
+                        face.value = static_cast<int>(a);
+                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, true, slice + 1, i, j, 1, 1);
                     } else if (a == 0 && b != 0) {
-                        mask[static_cast<std::size_t>(maskIndex)] = -static_cast<int>(b);
-                    } else {
-                        mask[static_cast<std::size_t>(maskIndex)] = 0;
+                        face.value = -static_cast<int>(b);
+                        face.ao = ComputeQuadAoPattern(sampleBlock, axis, false, slice + 1, i, j, 1, 1);
                     }
+                    mask[static_cast<std::size_t>(maskIndex)] = face;
 
                     ++maskIndex;
                 }
@@ -2014,8 +2293,8 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
 
             for (int j = 0; j < dims[v]; ++j) {
                 for (int i = 0; i < dims[u];) {
-                    const int current = mask[static_cast<std::size_t>(i + j * dims[u])];
-                    if (current == 0) {
+                    const FaceMaskCell current = mask[static_cast<std::size_t>(i + j * dims[u])];
+                    if (current.value == 0) {
                         ++i;
                         continue;
                     }
@@ -2040,11 +2319,11 @@ void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) 
                         }
                     }
 
-                    emitGreedyQuad(axis, current > 0, slice + 1, i, j, width, height);
+                    emitGreedyQuad(axis, current.value > 0, slice + 1, i, j, width, height);
 
                     for (int row = 0; row < height; ++row) {
                         for (int col = 0; col < width; ++col) {
-                            mask[static_cast<std::size_t>(i + col + (j + row) * dims[u])] = 0;
+                            mask[static_cast<std::size_t>(i + col + (j + row) * dims[u])] = FaceMaskCell{};
                         }
                     }
 

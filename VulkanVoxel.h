@@ -185,16 +185,24 @@ private:
         VkImageUsageFlags usage,
         VkMemoryPropertyFlags properties,
         VkImage& image,
-        VkDeviceMemory& imageMemory
+        VkDeviceMemory& imageMemory,
+        std::uint32_t mipLevels = 1
     ) const;
-    VkImageView CreateImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags) const;
+    VkImageView CreateImageView(
+        VkImage image,
+        VkFormat format,
+        VkImageAspectFlags aspectFlags,
+        std::uint32_t mipLevels = 1
+    ) const;
     void TransitionImageLayout(
         VkImage image,
         VkFormat format,
         VkImageLayout oldLayout,
-        VkImageLayout newLayout
+        VkImageLayout newLayout,
+        std::uint32_t mipLevels = 1
     ) const;
     void CopyBufferToImage(VkBuffer buffer, VkImage image, std::uint32_t width, std::uint32_t height) const;
+    void GenerateMipmaps(VkImage image, VkFormat imageFormat, std::uint32_t width, std::uint32_t height, std::uint32_t mipLevels) const;
     VkCommandBuffer BeginSingleTimeCommands() const;
     void EndSingleTimeCommands(VkCommandBuffer commandBuffer) const;
     VkFormat FindSupportedFormat(
@@ -244,6 +252,7 @@ private:
     VkDeviceMemory textureImageMemory_ = VK_NULL_HANDLE;
     VkImageView textureImageView_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
+    std::uint32_t textureMipLevels_ = 1;
     VkImage playerTextureImage_ = VK_NULL_HANDLE;
     VkDeviceMemory playerTextureImageMemory_ = VK_NULL_HANDLE;
     VkImageView playerTextureImageView_ = VK_NULL_HANDLE;

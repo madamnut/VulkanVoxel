@@ -1,13 +1,29 @@
 #include "WorldGenerator.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 
 namespace WorldGenerator {
 
-void GenerateChunkColumn(int chunkX, int chunkZ, const TerrainConfig& terrainConfig, ChunkColumnData& outColumn) {
-    (void)chunkX;
-    (void)chunkZ;
+int ComputeTerrainHeight(int worldX, int worldZ, const TerrainConfig& terrainConfig) {
+    const float waveHeight =
+        std::sin(static_cast<float>(worldX) * terrainConfig.waveFrequencyX + terrainConfig.wavePhaseX) +
+        std::cos(static_cast<float>(worldZ) * terrainConfig.waveFrequencyZ + terrainConfig.wavePhaseZ);
+    const float heightValue = static_cast<float>(terrainConfig.seaLevel) + waveHeight * terrainConfig.waveAmplitude;
+    return std::clamp(static_cast<int>(std::lround(heightValue)), 0, kWorldSizeY);
+}
 
+std::uint16_t SampleBlock(int worldX, int worldY, int worldZ, const TerrainConfig& terrainConfig) {
+    if (worldY < 0 || worldY >= kWorldSizeY) {
+        return 0;
+    }
+
+    return worldY < ComputeTerrainHeight(worldX, worldZ, terrainConfig) ? static_cast<std::uint16_t>(1)
+                                                                         : static_cast<std::uint16_t>(0);
+}
+
+void GenerateChunkColumn(int chunkX, int chunkZ, const TerrainConfig& terrainConfig, ChunkColumnData& outColumn) {
     outColumn.subChunks.clear();
     outColumn.subChunks.resize(kSubChunkCountY);
     outColumn.subChunkMeshes.clear();
@@ -27,20 +43,33 @@ void GenerateChunkColumn(int chunkX, int chunkZ, const TerrainConfig& terrainCon
         subChunkMesh.revision = 0;
     }
 
-    const int groundHeight = std::clamp(terrainConfig.flatGroundHeight, 0, kWorldSizeY);
+    std::array<int, kChunkSizeX * kChunkSizeZ> columnHeights{};
+    int minHeight = kWorldSizeY;
+    int maxHeight = 0;
+        for (int localZ = 0; localZ < kChunkSizeZ; ++localZ) {
+            for (int localX = 0; localX < kChunkSizeX; ++localX) {
+                const int worldX = chunkX * kChunkSizeX + localX;
+                const int worldZ = chunkZ * kChunkSizeZ + localZ;
+                const int groundHeight = ComputeTerrainHeight(worldX, worldZ, terrainConfig);
+                columnHeights[static_cast<std::size_t>(localZ * kChunkSizeX + localX)] = groundHeight;
+                minHeight = std::min(minHeight, groundHeight);
+                maxHeight = std::max(maxHeight, groundHeight);
+            }
+        }
+
     for (int subChunkIndex = 0; subChunkIndex < kSubChunkCountY; ++subChunkIndex) {
         const int subChunkMinY = subChunkIndex * kSubChunkSize;
-        const int solidLayerCount = std::clamp(groundHeight - subChunkMinY, 0, kSubChunkSize);
         SubChunkVoxelData& subChunk = outColumn.subChunks[static_cast<std::size_t>(subChunkIndex)];
+        const int subChunkMaxY = subChunkMinY + kSubChunkSize;
 
-        if (solidLayerCount <= 0) {
+        if (maxHeight <= subChunkMinY) {
             subChunk.isUniform = true;
             subChunk.uniformBlock = 0;
             subChunk.blocks.clear();
             continue;
         }
 
-        if (solidLayerCount >= kSubChunkSize) {
+        if (minHeight >= subChunkMaxY) {
             subChunk.isUniform = true;
             subChunk.uniformBlock = 1;
             subChunk.blocks.clear();
@@ -50,9 +79,11 @@ void GenerateChunkColumn(int chunkX, int chunkZ, const TerrainConfig& terrainCon
         subChunk.isUniform = false;
         subChunk.uniformBlock = 0;
         subChunk.blocks.assign(static_cast<std::size_t>(kSubChunkVoxelCount), 0);
-        for (int localY = 0; localY < solidLayerCount; ++localY) {
-            for (int localZ = 0; localZ < kSubChunkSize; ++localZ) {
-                for (int localX = 0; localX < kSubChunkSize; ++localX) {
+        for (int localZ = 0; localZ < kChunkSizeZ; ++localZ) {
+            for (int localX = 0; localX < kChunkSizeX; ++localX) {
+                const int groundHeight = columnHeights[static_cast<std::size_t>(localZ * kChunkSizeX + localX)];
+                const int solidLayerCount = std::clamp(groundHeight - subChunkMinY, 0, kSubChunkSize);
+                for (int localY = 0; localY < solidLayerCount; ++localY) {
                     const int blockIndex = localY * kSubChunkSize * kSubChunkSize +
                         localZ * kSubChunkSize + localX;
                     subChunk.blocks[static_cast<std::size_t>(blockIndex)] = 1;

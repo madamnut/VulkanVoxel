@@ -23,6 +23,7 @@ constexpr int kRegionSizeInChunks = 32;
 struct WorldVertex {
     float position[3];
     float uv[2];
+    float ao = 1.0f;
 };
 
 struct WorldBatchId {
@@ -223,7 +224,7 @@ private:
     static std::uint16_t GetSubChunkBlock(const SubChunkVoxelData& subChunk, int localX, int localY, int localZ);
     static void SetSubChunkBlock(SubChunkVoxelData& subChunk, int localX, int localY, int localZ, std::uint16_t blockValue);
     static void TryCollapseSubChunk(SubChunkVoxelData& subChunk);
-    std::uint16_t SampleGeneratedBlock(int worldY) const;
+    std::uint16_t SampleGeneratedBlock(int worldX, int worldY, int worldZ) const;
 
     void EnsureInitialized();
     void InitializeVoxelSubChunks(ChunkColumnData& column) const;
@@ -251,6 +252,7 @@ private:
     void SaveRegionOverrides(int regionX, int regionZ, const std::unordered_map<std::int64_t, const ChunkColumnData*>& overrides) const;
     void LoadRegionFile(int regionX, int regionZ, std::unordered_map<std::int64_t, ChunkColumnData>& outColumns) const;
     void SaveRegionFile(int regionX, int regionZ, const std::unordered_map<std::int64_t, ChunkColumnData>& columns) const;
+    bool HasPendingMeshWorkForChunk(int chunkX, int chunkZ) const;
     static bool IsChunkInsideFrustum(
         int chunkX,
         int chunkZ,
