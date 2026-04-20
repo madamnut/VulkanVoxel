@@ -1,33 +1,13 @@
 {
   "seed": 1337,
-  "sea_level": 169,
-  "flat_ground_height": 256,
+  "wrap_size_xz": 65536,
+  "base_height": 192.0,
   "solid_threshold": 0.0,
-  "wave_amplitude": 12.0,
-  "wave_frequency_x": 0.02,
-  "wave_frequency_z": 0.016,
-  "wave_phase_x": 0.0,
-  "wave_phase_z": 1.5707963,
-
-  "noise_feature_scale": 600.0,
-  "noise_output_min": -1.0,
-  "noise_output_max": 1.0,
-
-  "fbm_gain": 0.6,
-  "fbm_weighted_strength": 1.0,
-  "fbm_octaves": 7,
-  "fbm_lacunarity": 2.5,
-
-  "warp_enabled": true,
-  "warp_amplitude": 60.0,
-  "warp_feature_scale": 600.0,
-  "warp_seed_offset": 0,
-  "warp_x_amplitude_scaling": 1.0,
-  "warp_y_amplitude_scaling": 1.0,
-  "warp_z_amplitude_scaling": 1.0,
-  "warp_w_amplitude_scaling": 1.0,
-
-  "gradient_center_y": 169.0,
-  "gradient_scale": 0.01,
-  "gradient_offset": 0.0
+  "gradient_strength": 1.0,
+  "density_amplitude": 32.0,
+  "feature_scale_xz": 128.0,
+  "feature_scale_y": 96.0,
+  "fbm_octaves": 4,
+  "fbm_gain": 0.5,
+  "fbm_lacunarity": 2.0
 }

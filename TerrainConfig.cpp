@@ -69,16 +69,6 @@ float ReadJsonFloat(const std::string& json, const std::string& key, float defau
     return std::stof(match[1].str());
 }
 
-bool ReadJsonBool(const std::string& json, const std::string& key, bool defaultValue) {
-    const std::regex pattern("\"" + EscapeRegexKey(key) + "\"\\s*:\\s*(true|false)");
-    std::smatch match;
-    if (!std::regex_search(json, match, pattern)) {
-        return defaultValue;
-    }
-
-    return match[1].str() == "true";
-}
-
 }  // namespace
 
 TerrainConfig LoadTerrainConfig(const std::string& path) {
@@ -86,37 +76,17 @@ TerrainConfig LoadTerrainConfig(const std::string& path) {
 
     TerrainConfig config{};
     config.seed = ReadJsonInt(json, "seed", 1337);
-
-    config.seaLevel = ReadJsonInt(json, "sea_level", 169);
-    config.flatGroundHeight = ReadJsonInt(json, "flat_ground_height", 256);
+    config.wrapSizeXZ = ReadJsonInt(json, "wrap_size_xz", 65536);
+    config.baseHeight = ReadJsonFloat(json, "base_height", 192.0f);
     config.solidThreshold = ReadJsonFloat(json, "solid_threshold", 0.0f);
-    config.waveAmplitude = ReadJsonFloat(json, "wave_amplitude", 12.0f);
-    config.waveFrequencyX = ReadJsonFloat(json, "wave_frequency_x", 0.02f);
-    config.waveFrequencyZ = ReadJsonFloat(json, "wave_frequency_z", 0.02f);
-    config.wavePhaseX = ReadJsonFloat(json, "wave_phase_x", 0.0f);
-    config.wavePhaseZ = ReadJsonFloat(json, "wave_phase_z", 0.0f);
+    config.gradientStrength = ReadJsonFloat(json, "gradient_strength", 1.0f);
+    config.densityAmplitude = ReadJsonFloat(json, "density_amplitude", 32.0f);
+    config.featureScaleXZ = ReadJsonFloat(json, "feature_scale_xz", 128.0f);
+    config.featureScaleY = ReadJsonFloat(json, "feature_scale_y", 96.0f);
 
-    config.noiseFeatureScale = ReadJsonFloat(json, "noise_feature_scale", 600.0f);
-    config.noiseOutputMin = ReadJsonFloat(json, "noise_output_min", -1.0f);
-    config.noiseOutputMax = ReadJsonFloat(json, "noise_output_max", 1.0f);
-
-    config.fbmGain = ReadJsonFloat(json, "fbm_gain", 0.6f);
-    config.fbmWeightedStrength = ReadJsonFloat(json, "fbm_weighted_strength", 1.0f);
-    config.fbmOctaves = ReadJsonInt(json, "fbm_octaves", 7);
-    config.fbmLacunarity = ReadJsonFloat(json, "fbm_lacunarity", 2.5f);
-
-    config.warpEnabled = ReadJsonBool(json, "warp_enabled", true);
-    config.warpAmplitude = ReadJsonFloat(json, "warp_amplitude", 60.0f);
-    config.warpFeatureScale = ReadJsonFloat(json, "warp_feature_scale", 600.0f);
-    config.warpSeedOffset = ReadJsonInt(json, "warp_seed_offset", 0);
-    config.warpXAmplitudeScaling = ReadJsonFloat(json, "warp_x_amplitude_scaling", 1.0f);
-    config.warpYAmplitudeScaling = ReadJsonFloat(json, "warp_y_amplitude_scaling", 1.0f);
-    config.warpZAmplitudeScaling = ReadJsonFloat(json, "warp_z_amplitude_scaling", 1.0f);
-    config.warpWAmplitudeScaling = ReadJsonFloat(json, "warp_w_amplitude_scaling", 1.0f);
-
-    config.gradientCenterY = ReadJsonFloat(json, "gradient_center_y", 169.0f);
-    config.gradientScale = ReadJsonFloat(json, "gradient_scale", 0.01f);
-    config.gradientOffset = ReadJsonFloat(json, "gradient_offset", 0.0f);
+    config.fbmGain = ReadJsonFloat(json, "fbm_gain", 0.5f);
+    config.fbmOctaves = ReadJsonInt(json, "fbm_octaves", 4);
+    config.fbmLacunarity = ReadJsonFloat(json, "fbm_lacunarity", 2.0f);
 
     return config;
 }

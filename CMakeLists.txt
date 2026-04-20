@@ -102,6 +102,8 @@ add_custom_target(
 add_executable(VulkanVoxel
     BlockRegistry.h
     MathTypes.h
+    PeriodicSimplex.h
+    PeriodicSimplex.cpp
     TerrainConfig.h
     TerrainConfig.cpp
     WorldGenerator.h
