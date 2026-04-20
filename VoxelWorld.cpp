@@ -888,6 +888,15 @@ std::vector<MeshBuildInput> VoxelWorld::AcquireDirtyMeshRequests(std::size_t max
         dirtySubChunkQueue_.pop_front();
         queuedDirtySubChunks_.erase(id);
 
+        const PendingChunkId chunkId{id.chunkX, id.chunkZ};
+        const auto requeueIfStillRelevant = [&]() {
+            if (desiredChunks_.contains(chunkId) ||
+                inFlightChunkLoads_.contains(chunkId) ||
+                chunkColumns_.contains(MakeChunkKey(id.chunkX, id.chunkZ))) {
+                EnqueueDirtySubChunk(id.chunkX, id.chunkZ, id.subChunkIndex);
+            }
+        };
+
         const int dx = id.chunkX - centerChunkX;
         const int dz = id.chunkZ - centerChunkZ;
         if (dx * dx + dz * dz > keepRadius * keepRadius) {
@@ -896,15 +905,18 @@ std::vector<MeshBuildInput> VoxelWorld::AcquireDirtyMeshRequests(std::size_t max
         }
 
         if (inFlightDirtySubChunks_.contains(id)) {
+            requeueIfStillRelevant();
             continue;
         }
 
         const auto columnIt = chunkColumns_.find(MakeChunkKey(id.chunkX, id.chunkZ));
         if (columnIt == chunkColumns_.end()) {
+            requeueIfStillRelevant();
             continue;
         }
         if (columnIt->second.subChunkMeshes.size() != kSubChunkCountY ||
             columnIt->second.subChunks.size() != kSubChunkCountY) {
+            requeueIfStillRelevant();
             continue;
         }
         if (!columnIt->second.subChunkMeshes[static_cast<std::size_t>(id.subChunkIndex)].dirty) {
@@ -990,15 +1002,27 @@ WorldRenderUpdate VoxelWorld::DrainRenderUpdates() {
     }
     pendingRenderChunkRemovals_.clear();
 
+    std::vector<PendingChunkId> retryUpdates;
     update.uploads.reserve(pendingRenderChunkUpdates_.size());
     for (const PendingChunkId& chunkId : pendingRenderChunkUpdates_) {
         ChunkMeshBatchData batch{};
         if (CopyChunkMeshBatch(chunkId.chunkX, chunkId.chunkZ, batch)) {
             update.uploads.push_back(std::move(batch));
+            continue;
+        }
+
+        if (desiredChunks_.contains(chunkId) &&
+            (activeRenderChunks_.contains(chunkId) ||
+             HasPendingMeshWorkForChunk(chunkId.chunkX, chunkId.chunkZ) ||
+             inFlightChunkLoads_.contains(chunkId))) {
+            retryUpdates.push_back(chunkId);
         }
     }
     pendingRenderChunkUpdates_.clear();
-    renderStatsDirty_ = false;
+    for (const PendingChunkId& chunkId : retryUpdates) {
+        pendingRenderChunkUpdates_.insert(chunkId);
+    }
+    renderStatsDirty_ = !pendingRenderChunkUpdates_.empty();
 
     return update;
 }

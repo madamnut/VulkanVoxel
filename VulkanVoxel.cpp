@@ -23,7 +23,7 @@ constexpr int kWindowWidth = 1280;
 constexpr int kWindowHeight = 720;
 constexpr int kMaxFramesInFlight = 2;
 constexpr std::size_t kMaxOverlayVertexCount = 4194304;
-constexpr float kMoveSpeed = 60.0f;
+constexpr float kMoveSpeed = 120.0f;
 constexpr float kWalkSpeed = 6.0f;
 constexpr float kJumpSpeed = 8.5f;
 constexpr float kGravity = 24.0f;
@@ -43,6 +43,8 @@ constexpr const char* kWindowTitle = "VulkanVoxel";
 constexpr float kOverlayGlyphScale = 1.0f;
 constexpr float kOverlayMargin = 16.0f;
 constexpr float kOverlayLineGap = 8.0f;
+constexpr float kOverlayReferenceWidth = 1920.0f;
+constexpr float kOverlayReferenceHeight = 1080.0f;
 constexpr float kInteractionRange = 10.0f;
 constexpr float kSelectionExpand = 0.002f;
 constexpr float kPlayerEyeHeight = 1.5625f;
@@ -85,6 +87,16 @@ float GetOverlayTextWidth(const std::string& text, const std::array<FontGlyphBit
         width += static_cast<float>(glyphs[code].advance) * scale;
     }
     return width;
+}
+
+float GetOverlayUiScale(const VkExtent2D& extent) {
+    if (extent.width == 0 || extent.height == 0) {
+        return 1.0f;
+    }
+
+    const float widthScale = static_cast<float>(extent.width) / kOverlayReferenceWidth;
+    const float heightScale = static_cast<float>(extent.height) / kOverlayReferenceHeight;
+    return std::clamp(std::min(widthScale, heightScale), 0.75f, 3.0f);
 }
 
 void AppendOverlayQuad(
@@ -1010,7 +1022,7 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
     cameraYaw_ += static_cast<float>(deltaX) * kMouseSensitivity;
     cameraPitch_ -= static_cast<float>(deltaY) * kMouseSensitivity;
     cameraYaw_ = WrapAngle180(cameraYaw_);
-    cameraPitch_ = std::clamp(cameraPitch_, -90.0f, 90.0f);
+    cameraPitch_ = std::clamp(cameraPitch_, -89.0f, 89.0f);
 
     const bool isSpacePressed = glfwGetKey(window_, GLFW_KEY_SPACE) == GLFW_PRESS;
     const bool isSpaceJustPressed = isSpacePressed && !previousSpacePressed_;
@@ -1596,6 +1608,10 @@ void VulkanVoxelApp::LoadStaticDebugInfo() {
 void VulkanVoxelApp::RebuildOverlayVertices() {
     overlayVertices_.clear();
     celestialVertexCount_ = 0;
+    const float overlayUiScale = GetOverlayUiScale(swapChainExtent_);
+    const float overlayGlyphScale = kOverlayGlyphScale * overlayUiScale;
+    const float overlayMargin = kOverlayMargin * overlayUiScale;
+    const float overlayLineGap = kOverlayLineGap * overlayUiScale;
 
     if (crosshairLoaded_) {
         const float width = crosshairWidth_;
@@ -1694,41 +1710,41 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
     rightLines.push_back("VERTEX COUNT: " + std::to_string(worldVertexCount_));
     rightLines.push_back("TRIANGLE COUNT: " + std::to_string(triangleCount));
 
-    float leftY = kOverlayMargin;
+    float leftY = overlayMargin;
     for (const std::string& rawLine : leftLines) {
         const std::string line = SanitizeOverlayText(rawLine, overlayFontGlyphs_);
         AppendOutlinedText(
             overlayVertices_,
             overlayFontGlyphs_,
             line,
-            kOverlayMargin,
+            overlayMargin,
             leftY,
-            kOverlayGlyphScale,
+            overlayGlyphScale,
             swapChainExtent_
         );
-        leftY += static_cast<float>(overlayFontLineHeight_) * kOverlayGlyphScale + kOverlayLineGap;
+        leftY += static_cast<float>(overlayFontLineHeight_) * overlayGlyphScale + overlayLineGap;
     }
 
-    float rightY = kOverlayMargin;
+    float rightY = overlayMargin;
     for (const std::string& rawLine : rightLines) {
         const std::string line = SanitizeOverlayText(rawLine, overlayFontGlyphs_);
         const float startX = static_cast<float>(swapChainExtent_.width) -
-                             kOverlayMargin -
-                             GetOverlayTextWidth(line, overlayFontGlyphs_, kOverlayGlyphScale);
+                             overlayMargin -
+                             GetOverlayTextWidth(line, overlayFontGlyphs_, overlayGlyphScale);
         AppendOutlinedText(
             overlayVertices_,
             overlayFontGlyphs_,
             line,
             startX,
             rightY,
-            kOverlayGlyphScale,
+            overlayGlyphScale,
             swapChainExtent_
         );
-        rightY += static_cast<float>(overlayFontLineHeight_) * kOverlayGlyphScale + kOverlayLineGap;
+        rightY += static_cast<float>(overlayFontLineHeight_) * overlayGlyphScale + overlayLineGap;
     }
 
-    const float lineAdvance = static_cast<float>(overlayFontLineHeight_) * kOverlayGlyphScale + kOverlayLineGap;
-    float lowerLeftY = static_cast<float>(swapChainExtent_.height) - kOverlayMargin -
+    const float lineAdvance = static_cast<float>(overlayFontLineHeight_) * overlayGlyphScale + overlayLineGap;
+    float lowerLeftY = static_cast<float>(swapChainExtent_.height) - overlayMargin -
                        lineAdvance * static_cast<float>(lowerLeftLines.size());
     for (const std::string& rawLine : lowerLeftLines) {
         const std::string line = SanitizeOverlayText(rawLine, overlayFontGlyphs_);
@@ -1736,9 +1752,9 @@ void VulkanVoxelApp::RebuildOverlayVertices() {
             overlayVertices_,
             overlayFontGlyphs_,
             line,
-            kOverlayMargin,
+            overlayMargin,
             lowerLeftY,
-            kOverlayGlyphScale,
+            overlayGlyphScale,
             swapChainExtent_
         );
         lowerLeftY += lineAdvance;

@@ -1650,9 +1650,19 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
                     }
 
                     PreparedSubChunkMesh preparedMesh = world_.PrepareSubChunkMesh(meshRequests.front());
+                    bool hasPendingRenderUpdates = false;
                     {
                         std::unique_lock lock(worldMutex_);
                         world_.CommitPreparedSubChunkMesh(std::move(preparedMesh));
+                        hasPendingRenderUpdates = world_.HasPendingRenderUpdates();
+                    }
+
+                    if (hasPendingRenderUpdates) {
+                        {
+                            std::lock_guard lock(worldMeshWorkerMutex_);
+                            worldMeshTargetAvailable_ = true;
+                        }
+                        worldMeshWorkerCv_.notify_all();
                     }
                 }
             } catch (const std::exception& e) {
