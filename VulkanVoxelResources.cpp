@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,8 @@ constexpr std::size_t kMeshBuildBudgetPerPass = 12;
 constexpr std::size_t kWorldRenderRemovalBudgetPerConsume = 16;
 constexpr std::size_t kWorldRenderUploadBudgetPerConsume = 8;
 constexpr auto kWorldMeshWorkerYieldDelay = std::chrono::milliseconds(1);
+constexpr std::uint32_t kMaxPlayerMeshVertexCount = 1'000'000;
+constexpr std::uint32_t kMaxPlayerMeshIndexCount = 3'000'000;
 
 struct LoadedImage {
     std::uint32_t width = 0;
@@ -542,7 +545,9 @@ void VulkanVoxelApp::CreateTextureSampler() {
 }
 
 void VulkanVoxelApp::LoadPlayerMesh() {
-    std::ifstream file(CHARACTER_MESH_PATH, std::ios::binary);
+    namespace fs = std::filesystem;
+    const fs::path meshPath = CHARACTER_MESH_PATH;
+    std::ifstream file(meshPath, std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("Failed to open extracted player mesh.");
     }
@@ -553,23 +558,39 @@ void VulkanVoxelApp::LoadPlayerMesh() {
     file.read(magic, sizeof(magic));
     file.read(reinterpret_cast<char*>(&vertexCount), sizeof(vertexCount));
     file.read(reinterpret_cast<char*>(&indexCount), sizeof(indexCount));
+    if (!file) {
+        throw std::runtime_error("Failed to read extracted player mesh header.");
+    }
 
     if (std::memcmp(magic, "PMSH", 4) != 0) {
         throw std::runtime_error("Invalid extracted player mesh format.");
     }
+    if (vertexCount > kMaxPlayerMeshVertexCount || indexCount > kMaxPlayerMeshIndexCount) {
+        throw std::runtime_error("Extracted player mesh has unreasonable vertex/index counts.");
+    }
+
+    const std::uintmax_t fileSize = fs::file_size(meshPath);
+    const std::uintmax_t headerSize = sizeof(magic) + sizeof(vertexCount) + sizeof(indexCount);
+    const std::uintmax_t expectedSize =
+        headerSize +
+        static_cast<std::uintmax_t>(sizeof(SerializedPlayerVertex)) * static_cast<std::uintmax_t>(vertexCount) +
+        static_cast<std::uintmax_t>(sizeof(std::uint32_t)) * static_cast<std::uintmax_t>(indexCount);
+    if (fileSize < expectedSize) {
+        throw std::runtime_error("Extracted player mesh file is truncated.");
+    }
 
     std::vector<SerializedPlayerVertex> serializedVertices(vertexCount);
-    playerBaseVertices_.resize(vertexCount);
-    playerRenderVertices_.resize(vertexCount);
-    playerIndices_.resize(indexCount);
+    std::vector<WorldVertex> loadedBaseVertices(vertexCount);
+    std::vector<WorldVertex> loadedRenderVertices(vertexCount);
+    std::vector<std::uint32_t> loadedIndices(indexCount);
 
     file.read(
         reinterpret_cast<char*>(serializedVertices.data()),
         static_cast<std::streamsize>(sizeof(SerializedPlayerVertex) * serializedVertices.size())
     );
     file.read(
-        reinterpret_cast<char*>(playerIndices_.data()),
-        static_cast<std::streamsize>(sizeof(std::uint32_t) * playerIndices_.size())
+        reinterpret_cast<char*>(loadedIndices.data()),
+        static_cast<std::streamsize>(sizeof(std::uint32_t) * loadedIndices.size())
     );
 
     if (!file) {
@@ -578,7 +599,7 @@ void VulkanVoxelApp::LoadPlayerMesh() {
 
     for (std::size_t i = 0; i < serializedVertices.size(); ++i) {
         const SerializedPlayerVertex& src = serializedVertices[i];
-        WorldVertex& dst = playerBaseVertices_[i];
+        WorldVertex& dst = loadedBaseVertices[i];
         dst.position[0] = src.position[0];
         dst.position[1] = src.position[1];
         dst.position[2] = src.position[2];
@@ -586,6 +607,10 @@ void VulkanVoxelApp::LoadPlayerMesh() {
         dst.uv[1] = src.uv[1];
         dst.ao = 1.0f;
     }
+
+    playerBaseVertices_ = std::move(loadedBaseVertices);
+    playerRenderVertices_ = std::move(loadedRenderVertices);
+    playerIndices_ = std::move(loadedIndices);
 
     playerIndexCount_ = indexCount;
     playerLoaded_ = !playerBaseVertices_.empty() && !playerIndices_.empty();
@@ -1612,10 +1637,29 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
         return;
     }
 
-    worldMeshWorkerRunning_ = true;
+    for (std::thread& workerThread : chunkLoadWorkerThreads_) {
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+    }
     chunkLoadWorkerThreads_.clear();
-    chunkLoadWorkerThreads_.reserve(kChunkLoadWorkerCount);
+
+    for (std::thread& workerThread : meshWorkerThreads_) {
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+    }
     meshWorkerThreads_.clear();
+
+    if (worldMeshWorkerThread_.joinable()) {
+        worldMeshWorkerThread_.join();
+    }
+    if (worldSaveWorkerThread_.joinable()) {
+        worldSaveWorkerThread_.join();
+    }
+
+    worldMeshWorkerRunning_ = true;
+    chunkLoadWorkerThreads_.reserve(kChunkLoadWorkerCount);
     meshWorkerThreads_.reserve(kMeshWorkerCount);
 
     for (std::size_t workerIndex = 0; workerIndex < kChunkLoadWorkerCount; ++workerIndex) {
@@ -1742,10 +1786,7 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
 
             try {
                 world_.ExecuteSaveTask(saveTask);
-                {
-                    std::unique_lock lock(worldMutex_);
-                    world_.CompletePendingSaveTask(saveTask);
-                }
+                world_.CompletePendingSaveTask(saveTask);
             } catch (const std::exception& e) {
                 {
                     std::lock_guard lock(worldMeshWorkerMutex_);
@@ -1791,23 +1832,74 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
                 }
             }
             {
+                const auto worldMeshSaveQueueStartTime = std::chrono::steady_clock::now();
+                saveTasks = world_.DrainPendingSaveTasks(std::numeric_limits<std::size_t>::max());
+                const auto worldMeshSaveQueueEndTime = std::chrono::steady_clock::now();
+                AccumulateRuntimeProfileSample(
+                    std::chrono::duration<double, std::milli>(worldMeshSaveQueueEndTime - worldMeshSaveQueueStartTime).count(),
+                    worldMeshSaveQueueProfileTotalMs_,
+                    worldMeshSaveQueueProfileMaxMs_,
+                    worldMeshSaveQueueProfileSamples_
+                );
+            }
+
+            double worldMeshLockHeldMs = 0.0;
+            {
+                const auto worldMeshLockStartTime = std::chrono::steady_clock::now();
                 std::unique_lock lock(worldMutex_);
                 world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
                 chunkRequests = world_.AcquireChunkLoadRequests(kChunkGenerationBudgetPerPass);
                 for (PreparedChunkColumn& preparedChunk : preparedChunks) {
                     world_.CommitPreparedChunkColumn(std::move(preparedChunk));
                 }
-                saveTasks = world_.DrainPendingSaveTasks(std::numeric_limits<std::size_t>::max());
+                worldMeshLockHeldMs +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshLockStartTime).count();
+            }
+
+            double worldMeshFinalizeMs = 0.0;
+            double worldMeshRenderDrainMs = 0.0;
+            {
+                const auto worldMeshLockStartTime = std::chrono::steady_clock::now();
+                std::unique_lock lock(worldMutex_);
+                const auto worldMeshFinalizeStartTime = std::chrono::steady_clock::now();
                 remainingStreamingWork = world_.FinalizeStreamingWindow(
                     request.centerChunkX,
                     request.centerChunkZ,
                     worldSettings_.chunkRadius,
                     kChunkGenerationBudgetPerPass
                 );
+                worldMeshFinalizeMs =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshFinalizeStartTime).count();
+
                 if (world_.HasPendingRenderUpdates()) {
+                    const auto worldMeshRenderDrainStartTime = std::chrono::steady_clock::now();
                     renderUpdate = world_.DrainRenderUpdates();
+                    worldMeshRenderDrainMs =
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshRenderDrainStartTime).count();
                 }
+                worldMeshLockHeldMs +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshLockStartTime).count();
             }
+            AccumulateRuntimeProfileSample(
+                worldMeshFinalizeMs,
+                worldMeshFinalizeProfileTotalMs_,
+                worldMeshFinalizeProfileMaxMs_,
+                worldMeshFinalizeProfileSamples_
+            );
+            if (renderUpdate.has_value()) {
+                AccumulateRuntimeProfileSample(
+                    worldMeshRenderDrainMs,
+                    worldMeshRenderDrainProfileTotalMs_,
+                    worldMeshRenderDrainProfileMaxMs_,
+                    worldMeshRenderDrainProfileSamples_
+                );
+            }
+            AccumulateRuntimeProfileSample(
+                worldMeshLockHeldMs,
+                worldMeshLockProfileTotalMs_,
+                worldMeshLockProfileMaxMs_,
+                worldMeshLockProfileSamples_
+            );
 
             bool hasNewTarget = false;
             {
@@ -1838,7 +1930,11 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
                 worldMeshWorkerCv_.notify_all();
             }
 
-            if (hasNewTarget || hasPendingPreparedChunks || remainingStreamingWork > 0 || renderUpdate.has_value() || !saveTasks.empty()) {
+            if (hasNewTarget ||
+                hasPendingPreparedChunks ||
+                remainingStreamingWork > 0 ||
+                renderUpdate.has_value() ||
+                !saveTasks.empty()) {
                 std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
                 continue;
             }
@@ -2400,40 +2496,7 @@ bool VulkanVoxelApp::HasStencilComponent(VkFormat format) const {
 }
 
 std::optional<std::uint64_t> VulkanVoxelApp::QueryVideoMemoryUsageBytes() const {
-    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
-        return std::nullopt;
-    }
-
-    const std::wstring targetName = ToWide(gpuName_);
-
-    for (UINT adapterIndex = 0;; ++adapterIndex) {
-        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-        if (factory->EnumAdapters1(adapterIndex, &adapter) == DXGI_ERROR_NOT_FOUND) {
-            break;
-        }
-
-        DXGI_ADAPTER_DESC1 adapterDesc{};
-        if (FAILED(adapter->GetDesc1(&adapterDesc))) {
-            continue;
-        }
-
-        if (targetName != adapterDesc.Description) {
-            continue;
-        }
-
-        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
-        if (FAILED(adapter.As(&adapter3))) {
-            return std::nullopt;
-        }
-
-        DXGI_QUERY_VIDEO_MEMORY_INFO memoryInfo{};
-        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memoryInfo))) {
-            return std::nullopt;
-        }
-
-        return static_cast<std::uint64_t>(memoryInfo.CurrentUsage);
-    }
-
+    // DXGI memory query has been unstable on some systems, and this metric is
+    // only used for the debug overlay. Fall back to N/A instead of risking a crash.
     return std::nullopt;
 }

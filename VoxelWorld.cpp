@@ -45,11 +45,23 @@ struct RuntimeProfileAccumulator {
     std::atomic<std::uint32_t> samples{0};
 };
 
+struct RuntimeCountAccumulator {
+    std::atomic<std::uint64_t> totalValue{0};
+    std::atomic<std::uint64_t> maxValue{0};
+    std::atomic<std::uint32_t> samples{0};
+};
+
 RuntimeProfileAccumulator gChunkLoadProfile{};
 RuntimeProfileAccumulator gDiskLoadProfile{};
 RuntimeProfileAccumulator gGenerateProfile{};
 RuntimeProfileAccumulator gMeshBuildProfile{};
 RuntimeProfileAccumulator gSaveProfile{};
+RuntimeProfileAccumulator gUnloadProfile{};
+RuntimeProfileAccumulator gSaveFileProfile{};
+RuntimeProfileAccumulator gGetBlockProfile{};
+RuntimeProfileAccumulator gGeneratedBlockProfile{};
+RuntimeCountAccumulator gUnloadCountProfile{};
+RuntimeCountAccumulator gSaveCountProfile{};
 
 void RecordRuntimeProfileSample(RuntimeProfileAccumulator& accumulator, std::uint64_t elapsedNs) {
     accumulator.totalNs.fetch_add(elapsedNs, std::memory_order_relaxed);
@@ -74,6 +86,32 @@ RuntimeProfileStage ConsumeRuntimeProfileStage(RuntimeProfileAccumulator& accumu
     if (samples > 0) {
         stage.averageMs = static_cast<double>(totalNs) / static_cast<double>(samples) / 1'000'000.0;
         stage.maxMs = static_cast<double>(maxNs) / 1'000'000.0;
+    }
+    return stage;
+}
+
+void RecordRuntimeCountSample(RuntimeCountAccumulator& accumulator, std::uint64_t value) {
+    accumulator.totalValue.fetch_add(value, std::memory_order_relaxed);
+    accumulator.samples.fetch_add(1u, std::memory_order_relaxed);
+    std::uint64_t observedMax = accumulator.maxValue.load(std::memory_order_relaxed);
+    while (observedMax < value &&
+           !accumulator.maxValue.compare_exchange_weak(
+               observedMax,
+               value,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+}
+
+RuntimeProfileStage ConsumeRuntimeCountStage(RuntimeCountAccumulator& accumulator) {
+    RuntimeProfileStage stage{};
+    const std::uint64_t totalValue = accumulator.totalValue.exchange(0u, std::memory_order_relaxed);
+    const std::uint64_t maxValue = accumulator.maxValue.exchange(0u, std::memory_order_relaxed);
+    const std::uint32_t samples = accumulator.samples.exchange(0u, std::memory_order_relaxed);
+    stage.samples = samples;
+    if (samples > 0) {
+        stage.averageMs = static_cast<double>(totalValue) / static_cast<double>(samples);
+        stage.maxMs = static_cast<double>(maxValue);
     }
     return stage;
 }
@@ -661,6 +699,12 @@ VoxelWorldRuntimeProfileSnapshot ConsumeVoxelWorldRuntimeProfileSnapshot() {
     snapshot.generate = ConsumeRuntimeProfileStage(gGenerateProfile);
     snapshot.meshBuild = ConsumeRuntimeProfileStage(gMeshBuildProfile);
     snapshot.save = ConsumeRuntimeProfileStage(gSaveProfile);
+    snapshot.unload = ConsumeRuntimeProfileStage(gUnloadProfile);
+    snapshot.unloadCount = ConsumeRuntimeCountStage(gUnloadCountProfile);
+    snapshot.saveFile = ConsumeRuntimeProfileStage(gSaveFileProfile);
+    snapshot.saveCount = ConsumeRuntimeCountStage(gSaveCountProfile);
+    snapshot.getBlock = ConsumeRuntimeProfileStage(gGetBlockProfile);
+    snapshot.generatedBlock = ConsumeRuntimeProfileStage(gGeneratedBlockProfile);
     return snapshot;
 }
 
@@ -749,7 +793,16 @@ void VoxelWorld::TryCollapseSubChunk(SubChunkVoxelData& subChunk) {
 }
 
 std::uint16_t VoxelWorld::SampleGeneratedBlock(int worldX, int worldY, int worldZ) const {
-    return WorldGenerator::SampleBlock(worldX, worldY, worldZ, terrainConfig_);
+    const auto profileStartTime = Clock::now();
+    const std::uint16_t block = WorldGenerator::SampleBlock(worldX, worldY, worldZ, terrainConfig_);
+    const auto profileEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gGeneratedBlockProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(profileEndTime - profileStartTime).count()
+        )
+    );
+    return block;
 }
 
 bool VoxelWorld::IsInsideWorld(int worldX, int worldY, int worldZ) {
@@ -1500,6 +1553,7 @@ void VoxelWorld::QueueRenderUpdatesForChunk(int chunkX, int chunkZ, const ChunkC
 }
 
 void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
+    const auto unloadStartTime = Clock::now();
     struct PendingUnload {
         int chunkX = 0;
         int chunkZ = 0;
@@ -1544,6 +1598,7 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
         group.chunks.push_back(unload);
     }
 
+    std::size_t unloadedChunkCount = 0;
     for (auto& [regionKey, group] : unloadRegions) {
         (void)regionKey;
         RegionSaveTask saveTask{};
@@ -1587,6 +1642,7 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
             QueueRenderChunkRemoval(unload.chunkX, unload.chunkZ);
             RemoveQueuedDirtySubChunksForChunk(unload.chunkX, unload.chunkZ);
             chunkColumns_.erase(columnIt);
+            ++unloadedChunkCount;
             if (ChunkTaskState* state = FindChunkTaskState(unload.chunkX, unload.chunkZ)) {
                 state->resident = false;
                 state->retireRequested = false;
@@ -1598,6 +1654,17 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
             MaybeCleanupChunkTaskState(unload.chunkX, unload.chunkZ);
             renderStatsDirty_ = true;
         }
+    }
+
+    const auto unloadEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gUnloadProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(unloadEndTime - unloadStartTime).count()
+        )
+    );
+    if (unloadedChunkCount > 0) {
+        RecordRuntimeCountSample(gUnloadCountProfile, static_cast<std::uint64_t>(unloadedChunkCount));
     }
 
     saveDirty_ = false;
@@ -1926,6 +1993,9 @@ void VoxelWorld::ExecuteSaveTask(const RegionSaveTask& task) const {
             std::chrono::duration_cast<std::chrono::nanoseconds>(saveEndTime - saveStartTime).count()
         )
     );
+    if (!task.chunks.empty()) {
+        RecordRuntimeCountSample(gSaveCountProfile, static_cast<std::uint64_t>(task.chunks.size()));
+    }
 }
 
 bool VoxelWorld::HasPendingSaveTasks() const {
@@ -2014,6 +2084,7 @@ void VoxelWorld::SaveRegionOverrides(
     int regionZ,
     const std::unordered_map<std::int64_t, const ChunkColumnData*>& overrides
 ) const {
+    const auto saveFileStartTime = Clock::now();
     std::lock_guard regionFileLock(regionFileIoMutex_);
 
     struct SerializedRegionChunk {
@@ -2097,9 +2168,17 @@ void VoxelWorld::SaveRegionOverrides(
                 }
 
                 serializedChunks.push_back(std::move(serializedChunk));
-            }
         }
     }
+
+    const auto saveFileEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gSaveFileProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(saveFileEndTime - saveFileStartTime).count()
+        )
+    );
+}
 
     std::sort(serializedChunks.begin(), serializedChunks.end(), [](const SerializedRegionChunk& lhs, const SerializedRegionChunk& rhs) {
         if (lhs.chunkZ != rhs.chunkZ) {
@@ -2288,6 +2367,7 @@ void VoxelWorld::SaveRegionFile(int regionX, int regionZ, const std::unordered_m
 }
 
 std::uint16_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) {
+    const auto profileStartTime = Clock::now();
     if (worldY < 0 || worldY >= kWorldSizeY) {
         return 0;
     }
@@ -2302,16 +2382,26 @@ std::uint16_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) {
     const int localY = worldY - subChunkIndex * kSubChunkSize;
 
     const auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
+    std::uint16_t blockValue = 0;
     if (columnIt == chunkColumns_.end() || columnIt->second.subChunks.size() != kSubChunkCountY) {
-        return SampleGeneratedBlock(worldX, worldY, worldZ);
-    }
-
-    return GetSubChunkBlock(
+        blockValue = SampleGeneratedBlock(worldX, worldY, worldZ);
+    } else {
+        blockValue = GetSubChunkBlock(
         columnIt->second.subChunks[static_cast<std::size_t>(subChunkIndex)],
         localX,
         localY,
         localZ
+        );
+    }
+
+    const auto profileEndTime = Clock::now();
+    RecordRuntimeProfileSample(
+        gGetBlockProfile,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(profileEndTime - profileStartTime).count()
+        )
     );
+    return blockValue;
 }
 
 bool VoxelWorld::SetBlock(int worldX, int worldY, int worldZ, std::uint16_t blockValue) {

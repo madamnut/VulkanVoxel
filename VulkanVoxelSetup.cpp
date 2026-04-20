@@ -167,22 +167,6 @@ void VulkanVoxelApp::CreateSwapChain() {
     swapChainImageFormat_ = surfaceFormat.format;
     swapChainExtent_ = extent;
     presentMode_ = presentMode;
-
-    switch (presentMode_) {
-    case VK_PRESENT_MODE_MAILBOX_KHR:
-        presentModeString_ = "MAILBOX";
-        break;
-    case VK_PRESENT_MODE_IMMEDIATE_KHR:
-        presentModeString_ = "IMMEDIATE";
-        break;
-    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
-        presentModeString_ = "FIFO RELAXED";
-        break;
-    case VK_PRESENT_MODE_FIFO_KHR:
-    default:
-        presentModeString_ = "FIFO";
-        break;
-    }
 }
 
 void VulkanVoxelApp::CreateImageViews() {

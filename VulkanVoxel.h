@@ -8,6 +8,7 @@
 #include "WorldSettings.h"
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -424,6 +425,20 @@ private:
     RuntimeProfileStage submitProfile_{};
     RuntimeProfileStage presentProfile_{};
     RuntimeProfileStage frameProfile_{};
+    RuntimeProfileStage worldMeshLockProfile_{};
+    RuntimeProfileStage worldMeshSaveQueueProfile_{};
+    RuntimeProfileStage worldMeshFinalizeProfile_{};
+    RuntimeProfileStage worldMeshRenderDrainProfile_{};
+    RuntimeProfileStage unloadProfile_{};
+    RuntimeProfileStage unloadCountProfile_{};
+    RuntimeProfileStage saveFileProfile_{};
+    RuntimeProfileStage saveCountProfile_{};
+    RuntimeProfileStage raycastWaitProfile_{};
+    RuntimeProfileStage raycastProfile_{};
+    RuntimeProfileStage collisionWaitProfile_{};
+    RuntimeProfileStage collisionProfile_{};
+    RuntimeProfileStage getBlockProfile_{};
+    RuntimeProfileStage generatedBlockProfile_{};
     double chunkLoadProfileCumulativeMs_ = 0.0;
     std::uint64_t chunkLoadProfileCumulativeSamples_ = 0;
     double diskLoadProfileCumulativeMs_ = 0.0;
@@ -460,6 +475,34 @@ private:
     std::uint64_t presentProfileCumulativeSamples_ = 0;
     double frameProfileCumulativeMs_ = 0.0;
     std::uint64_t frameProfileCumulativeSamples_ = 0;
+    double worldMeshLockProfileCumulativeMs_ = 0.0;
+    std::uint64_t worldMeshLockProfileCumulativeSamples_ = 0;
+    double worldMeshSaveQueueProfileCumulativeMs_ = 0.0;
+    std::uint64_t worldMeshSaveQueueProfileCumulativeSamples_ = 0;
+    double worldMeshFinalizeProfileCumulativeMs_ = 0.0;
+    std::uint64_t worldMeshFinalizeProfileCumulativeSamples_ = 0;
+    double worldMeshRenderDrainProfileCumulativeMs_ = 0.0;
+    std::uint64_t worldMeshRenderDrainProfileCumulativeSamples_ = 0;
+    double unloadProfileCumulativeMs_ = 0.0;
+    std::uint64_t unloadProfileCumulativeSamples_ = 0;
+    double unloadCountProfileCumulativeValue_ = 0.0;
+    std::uint64_t unloadCountProfileCumulativeSamples_ = 0;
+    double saveFileProfileCumulativeMs_ = 0.0;
+    std::uint64_t saveFileProfileCumulativeSamples_ = 0;
+    double saveCountProfileCumulativeValue_ = 0.0;
+    std::uint64_t saveCountProfileCumulativeSamples_ = 0;
+    double raycastWaitProfileCumulativeMs_ = 0.0;
+    std::uint64_t raycastWaitProfileCumulativeSamples_ = 0;
+    double raycastProfileCumulativeMs_ = 0.0;
+    std::uint64_t raycastProfileCumulativeSamples_ = 0;
+    double collisionWaitProfileCumulativeMs_ = 0.0;
+    std::uint64_t collisionWaitProfileCumulativeSamples_ = 0;
+    double collisionProfileCumulativeMs_ = 0.0;
+    std::uint64_t collisionProfileCumulativeSamples_ = 0;
+    double getBlockProfileCumulativeMs_ = 0.0;
+    std::uint64_t getBlockProfileCumulativeSamples_ = 0;
+    double generatedBlockProfileCumulativeMs_ = 0.0;
+    std::uint64_t generatedBlockProfileCumulativeSamples_ = 0;
     double uploadProfileTotalMs_ = 0.0;
     double uploadProfileMaxMs_ = 0.0;
     std::uint32_t uploadProfileSamples_ = 0;
@@ -499,6 +542,51 @@ private:
     double frameProfileTotalMs_ = 0.0;
     double frameProfileMaxMs_ = 0.0;
     std::uint32_t frameProfileSamples_ = 0;
+    double worldMeshLockProfileTotalMs_ = 0.0;
+    double worldMeshLockProfileMaxMs_ = 0.0;
+    std::uint32_t worldMeshLockProfileSamples_ = 0;
+    double worldMeshSaveQueueProfileTotalMs_ = 0.0;
+    double worldMeshSaveQueueProfileMaxMs_ = 0.0;
+    std::uint32_t worldMeshSaveQueueProfileSamples_ = 0;
+    double worldMeshFinalizeProfileTotalMs_ = 0.0;
+    double worldMeshFinalizeProfileMaxMs_ = 0.0;
+    std::uint32_t worldMeshFinalizeProfileSamples_ = 0;
+    double worldMeshRenderDrainProfileTotalMs_ = 0.0;
+    double worldMeshRenderDrainProfileMaxMs_ = 0.0;
+    std::uint32_t worldMeshRenderDrainProfileSamples_ = 0;
+    double unloadProfileTotalMs_ = 0.0;
+    double unloadProfileMaxMs_ = 0.0;
+    std::uint32_t unloadProfileSamples_ = 0;
+    double unloadCountProfileTotalValue_ = 0.0;
+    double unloadCountProfileMaxValue_ = 0.0;
+    std::uint32_t unloadCountProfileSamples_ = 0;
+    double saveFileProfileTotalMs_ = 0.0;
+    double saveFileProfileMaxMs_ = 0.0;
+    std::uint32_t saveFileProfileSamples_ = 0;
+    double saveCountProfileTotalValue_ = 0.0;
+    double saveCountProfileMaxValue_ = 0.0;
+    std::uint32_t saveCountProfileSamples_ = 0;
+    double raycastWaitProfileTotalMs_ = 0.0;
+    double raycastWaitProfileMaxMs_ = 0.0;
+    std::uint32_t raycastWaitProfileSamples_ = 0;
+    double raycastProfileTotalMs_ = 0.0;
+    double raycastProfileMaxMs_ = 0.0;
+    std::uint32_t raycastProfileSamples_ = 0;
+    double collisionWaitProfileTotalMs_ = 0.0;
+    double collisionWaitProfileMaxMs_ = 0.0;
+    std::uint32_t collisionWaitProfileSamples_ = 0;
+    double collisionProfileTotalMs_ = 0.0;
+    double collisionProfileMaxMs_ = 0.0;
+    std::uint32_t collisionProfileSamples_ = 0;
+    double getBlockProfileTotalMs_ = 0.0;
+    double getBlockProfileMaxMs_ = 0.0;
+    std::uint32_t getBlockProfileSamples_ = 0;
+    double generatedBlockProfileTotalMs_ = 0.0;
+    double generatedBlockProfileMaxMs_ = 0.0;
+    std::uint32_t generatedBlockProfileSamples_ = 0;
+    double runtimeProfileElapsedSeconds_ = 0.0;
+    std::atomic<bool> runtimeProfileCollectionEnabled_{false};
+    std::mutex runtimeProfileMutex_;
     std::size_t loadedChunkCount_ = 0;
     int lastMeshChunkX_ = -1;
     int lastMeshChunkZ_ = -1;
@@ -513,7 +601,6 @@ private:
     std::string apiVersionString_;
     std::string driverVersionString_;
     std::string rendererName_ = "VULKAN";
-    std::string presentModeString_ = "FIFO";
     std::array<FontGlyphBitmap, 128> overlayFontGlyphs_{};
     int overlayFontLineHeight_ = 0;
     float crosshairU0_ = 0.0f;
@@ -544,6 +631,7 @@ private:
     Vec3 playerModelBoundsMax_{};
     bool playerLoaded_ = false;
     std::optional<BlockRaycastHit> selectedBlockHit_;
+    double selectedBlockTraceAccumulatorSeconds_ = 1.0 / 60.0;
     bool screenshotRequested_ = false;
     bool screenshotCapturePending_ = false;
     VkBuffer screenshotStagingBuffer_ = VK_NULL_HANDLE;

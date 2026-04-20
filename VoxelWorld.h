@@ -225,6 +225,12 @@ struct VoxelWorldRuntimeProfileSnapshot {
     RuntimeProfileStage generate{};
     RuntimeProfileStage meshBuild{};
     RuntimeProfileStage save{};
+    RuntimeProfileStage unload{};
+    RuntimeProfileStage unloadCount{};
+    RuntimeProfileStage saveFile{};
+    RuntimeProfileStage saveCount{};
+    RuntimeProfileStage getBlock{};
+    RuntimeProfileStage generatedBlock{};
 };
 
 VoxelWorldRuntimeProfileSnapshot ConsumeVoxelWorldRuntimeProfileSnapshot();
