@@ -14,6 +14,7 @@ layout(location = 1) in uint inPacked1;
 
 layout(location = 0) out vec2 fragUv;
 layout(location = 1) out float fragAo;
+layout(location = 2) flat out uint fragTextureLayer;
 
 float DecodeAo(uint value) {
     const float brightnessTable[4] = float[4](0.55, 0.70, 0.85, 1.0);
@@ -53,6 +54,7 @@ void main() {
     uint height = ((inPacked0 >> 24u) & 0xFu) + 1u;
     bool flipDiagonal = ((inPacked0 >> 28u) & 0x1u) != 0u;
     bool reverseWinding = ((inPacked0 >> 29u) & 0x1u) != 0u;
+    uint materialId = (inPacked1 >> 8u) & 0xFFFFu;
 
     int uAxis = int((axis + 1u) % 3u);
     int vAxis = int((axis + 2u) % 3u);
@@ -104,23 +106,24 @@ void main() {
 
     if (cornerIndex == 0) {
         worldPosition = p0;
-        uv = vec2(0.0, 0.0);
+        uv = vec2(0.0, uvMax.y);
         ao = DecodeAo(inPacked1);
     } else if (cornerIndex == 1) {
         worldPosition = p1;
-        uv = vec2(uvMax.x, 0.0);
+        uv = vec2(uvMax.x, uvMax.y);
         ao = DecodeAo(inPacked1 >> 2u);
     } else if (cornerIndex == 2) {
         worldPosition = p2;
-        uv = uvMax;
+        uv = vec2(uvMax.x, 0.0);
         ao = DecodeAo(inPacked1 >> 4u);
     } else {
         worldPosition = p3;
-        uv = vec2(0.0, uvMax.y);
+        uv = vec2(0.0, 0.0);
         ao = DecodeAo(inPacked1 >> 6u);
     }
 
     gl_Position = ubo.viewProj * vec4(worldPosition, 1.0);
     fragUv = uv;
     fragAo = ao;
+    fragTextureLayer = materialId;
 }

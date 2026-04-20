@@ -542,6 +542,8 @@ BlockRaycastHit VulkanVoxelApp::TraceSelectedBlock() {
     return hit;
 }
 
+const char* gFatalStage = "startup";
+
 void VulkanVoxelApp::InitWindow() {
     if (glfwInit() != GLFW_TRUE) {
         throw std::runtime_error("Failed to initialize GLFW.");
@@ -559,46 +561,82 @@ void VulkanVoxelApp::InitWindow() {
 }
 
 void VulkanVoxelApp::InitVulkan() {
+    gFatalStage = "LoadWorldSettings";
     worldSettings_ = LoadWorldSettings(std::string(ASSET_DIR) + "/assets/config/world.json");
     {
+        gFatalStage = "UpdateStreamingTargets";
         const int centerChunkX = static_cast<int>(std::floor(cameraPosition_.x / static_cast<float>(kChunkSizeX)));
         const int centerChunkZ = static_cast<int>(std::floor(cameraPosition_.z / static_cast<float>(kChunkSizeZ)));
         std::unique_lock lock(worldMutex_);
         world_.UpdateStreamingTargets(centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
     }
+    gFatalStage = "CreateInstance";
     CreateInstance();
+    gFatalStage = "CreateSurface";
     CreateSurface();
+    gFatalStage = "PickPhysicalDevice";
     PickPhysicalDevice();
+    gFatalStage = "CreateLogicalDevice";
     CreateLogicalDevice();
+    gFatalStage = "CreateSwapChain";
     CreateSwapChain();
+    gFatalStage = "LoadStaticDebugInfo";
     LoadStaticDebugInfo();
+    gFatalStage = "RefreshSystemUsageStats";
     RefreshSystemUsageStats();
+    gFatalStage = "CreateImageViews";
     CreateImageViews();
+    gFatalStage = "CreateCommandPool";
     CreateCommandPool();
+    gFatalStage = "CreateDescriptorSetLayout";
     CreateDescriptorSetLayout();
+    gFatalStage = "CreateRenderPass";
     CreateRenderPass();
+    gFatalStage = "CreateDepthResources";
     CreateDepthResources();
+    gFatalStage = "CreateTextureImage";
     CreateTextureImage();
+    gFatalStage = "CreateTextureImageView";
     CreateTextureImageView();
+    gFatalStage = "CreateTextureSampler";
     CreateTextureSampler();
+    gFatalStage = "LoadPlayerMesh";
     LoadPlayerMesh();
+    gFatalStage = "CreatePlayerTextureImage";
     CreatePlayerTextureImage();
+    gFatalStage = "CreatePlayerTextureImageView";
     CreatePlayerTextureImageView();
+    gFatalStage = "CreatePlayerTextureSampler";
     CreatePlayerTextureSampler();
+    gFatalStage = "LoadOverlayFont";
     LoadOverlayFont();
+    gFatalStage = "StartWorldMeshWorker";
     StartWorldMeshWorker();
+    gFatalStage = "RequestWorldMeshBuild";
     RequestWorldMeshBuild();
+    gFatalStage = "CreatePlayerBuffers";
     CreatePlayerBuffers();
+    gFatalStage = "CreateOverlayBuffer";
     CreateOverlayBuffer();
+    gFatalStage = "CreateSelectionBuffer";
     CreateSelectionBuffer();
+    gFatalStage = "CreateEntityColliderBuffer";
     CreateEntityColliderBuffer();
+    gFatalStage = "CreateUniformBuffers";
     CreateUniformBuffers();
+    gFatalStage = "CreateDescriptorPool";
     CreateDescriptorPool();
+    gFatalStage = "CreateDescriptorSets";
     CreateDescriptorSets();
+    gFatalStage = "CreatePipelines";
     CreatePipelines();
+    gFatalStage = "CreateFramebuffers";
     CreateFramebuffers();
+    gFatalStage = "CreateCommandBuffers";
     CreateCommandBuffers();
+    gFatalStage = "CreateSyncObjects";
     CreateSyncObjects();
+    gFatalStage = "InitVulkanDone";
 }
 
 void VulkanVoxelApp::MainLoop() {
@@ -1980,9 +2018,19 @@ int main() {
     try {
         return app.Run();
     } catch (const std::exception& e) {
-        OutputDebugStringA(e.what());
+        OutputDebugStringA("Fatal stage: ");
+        OutputDebugStringA(gFatalStage);
         OutputDebugStringA("\n");
-        std::cerr << e.what() << '\n';
+        std::cerr << "Fatal stage: " << gFatalStage << '\n';
+        try {
+            const char* message = e.what();
+            if (message != nullptr) {
+                OutputDebugStringA(message);
+                OutputDebugStringA("\n");
+                std::cerr << message << '\n';
+            }
+        } catch (...) {
+        }
         return 1;
     }
 }

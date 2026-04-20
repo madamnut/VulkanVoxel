@@ -300,9 +300,11 @@ void VulkanVoxelApp::CreateRenderPass() {
 }
 
 void VulkanVoxelApp::CreatePipelines() {
+    gFatalStage = "CreatePipelines.ReadShaders";
     const std::vector<char> skyVertShaderCode = ReadFile(SHADER_DIR "/sky.vert.spv");
     const std::vector<char> skyFragShaderCode = ReadFile(SHADER_DIR "/sky.frag.spv");
     const std::vector<char> terrainVertShaderCode = ReadFile(SHADER_DIR "/terrain.vert.spv");
+    const std::vector<char> terrainFragShaderCode = ReadFile(SHADER_DIR "/terrain.frag.spv");
     const std::vector<char> worldVertShaderCode = ReadFile(SHADER_DIR "/world.vert.spv");
     const std::vector<char> worldFragShaderCode = ReadFile(SHADER_DIR "/world.frag.spv");
     const std::vector<char> overlayVertShaderCode = ReadFile(SHADER_DIR "/overlay.vert.spv");
@@ -310,9 +312,11 @@ void VulkanVoxelApp::CreatePipelines() {
     const std::vector<char> selectionVertShaderCode = ReadFile(SHADER_DIR "/selection.vert.spv");
     const std::vector<char> selectionFragShaderCode = ReadFile(SHADER_DIR "/selection.frag.spv");
 
+    gFatalStage = "CreatePipelines.CreateShaderModules";
     const VkShaderModule skyVertShaderModule = CreateShaderModule(skyVertShaderCode);
     const VkShaderModule skyFragShaderModule = CreateShaderModule(skyFragShaderCode);
     const VkShaderModule terrainVertShaderModule = CreateShaderModule(terrainVertShaderCode);
+    const VkShaderModule terrainFragShaderModule = CreateShaderModule(terrainFragShaderCode);
     const VkShaderModule worldVertShaderModule = CreateShaderModule(worldVertShaderCode);
     const VkShaderModule worldFragShaderModule = CreateShaderModule(worldFragShaderCode);
     const VkShaderModule overlayVertShaderModule = CreateShaderModule(overlayVertShaderCode);
@@ -343,9 +347,15 @@ void VulkanVoxelApp::CreatePipelines() {
     terrainVertStage.module = terrainVertShaderModule;
     terrainVertStage.pName = "main";
 
+    VkPipelineShaderStageCreateInfo terrainFragStage{};
+    terrainFragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    terrainFragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    terrainFragStage.module = terrainFragShaderModule;
+    terrainFragStage.pName = "main";
+
     const std::array<VkPipelineShaderStageCreateInfo, 2> terrainStages = {
         terrainVertStage,
-        worldFragStage,
+        terrainFragStage,
     };
 
     VkVertexInputBindingDescription worldBindingDescription{};
@@ -496,6 +506,7 @@ void VulkanVoxelApp::CreatePipelines() {
     skyLayoutInfo.setLayoutCount = 1;
     skyLayoutInfo.pSetLayouts = &descriptorSetLayout_;
 
+    gFatalStage = "CreatePipelines.Sky";
     if (vkCreatePipelineLayout(device_, &skyLayoutInfo, nullptr, &skyPipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create sky pipeline layout.");
     }
@@ -530,6 +541,7 @@ void VulkanVoxelApp::CreatePipelines() {
     worldLayoutInfo.setLayoutCount = 1;
     worldLayoutInfo.pSetLayouts = &descriptorSetLayout_;
 
+    gFatalStage = "CreatePipelines.WorldLayout";
     if (vkCreatePipelineLayout(device_, &worldLayoutInfo, nullptr, &worldPipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create world pipeline layout.");
     }
@@ -543,6 +555,7 @@ void VulkanVoxelApp::CreatePipelines() {
     terrainLayoutInfo.pushConstantRangeCount = 1;
     terrainLayoutInfo.pPushConstantRanges = &terrainPushConstantRange;
 
+    gFatalStage = "CreatePipelines.TerrainLayout";
     if (vkCreatePipelineLayout(device_, &terrainLayoutInfo, nullptr, &terrainPipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create terrain pipeline layout.");
     }
@@ -562,6 +575,7 @@ void VulkanVoxelApp::CreatePipelines() {
     terrainPipelineInfo.renderPass = renderPass_;
     terrainPipelineInfo.subpass = 0;
 
+    gFatalStage = "CreatePipelines.TerrainPipeline";
     if (vkCreateGraphicsPipelines(
             device_,
             VK_NULL_HANDLE,
@@ -587,6 +601,7 @@ void VulkanVoxelApp::CreatePipelines() {
     worldPipelineInfo.renderPass = renderPass_;
     worldPipelineInfo.subpass = 0;
 
+    gFatalStage = "CreatePipelines.WorldPipeline";
     if (vkCreateGraphicsPipelines(
             device_,
             VK_NULL_HANDLE,
@@ -655,6 +670,7 @@ void VulkanVoxelApp::CreatePipelines() {
     overlayLayoutInfo.setLayoutCount = 1;
     overlayLayoutInfo.pSetLayouts = &descriptorSetLayout_;
 
+    gFatalStage = "CreatePipelines.Overlay";
     if (vkCreatePipelineLayout(device_, &overlayLayoutInfo, nullptr, &overlayPipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create overlay pipeline layout.");
     }
@@ -733,6 +749,7 @@ void VulkanVoxelApp::CreatePipelines() {
     selectionLayoutInfo.setLayoutCount = 1;
     selectionLayoutInfo.pSetLayouts = &descriptorSetLayout_;
 
+    gFatalStage = "CreatePipelines.Selection";
     if (vkCreatePipelineLayout(device_, &selectionLayoutInfo, nullptr, &selectionPipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create selection pipeline layout.");
     }
@@ -769,8 +786,10 @@ void VulkanVoxelApp::CreatePipelines() {
     vkDestroyShaderModule(device_, overlayFragShaderModule, nullptr);
     vkDestroyShaderModule(device_, overlayVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, worldFragShaderModule, nullptr);
+    vkDestroyShaderModule(device_, terrainFragShaderModule, nullptr);
     vkDestroyShaderModule(device_, terrainVertShaderModule, nullptr);
     vkDestroyShaderModule(device_, worldVertShaderModule, nullptr);
+    gFatalStage = "CreatePipelines.Done";
 }
 
 void VulkanVoxelApp::CreateFramebuffers() {

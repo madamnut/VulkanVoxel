@@ -86,6 +86,8 @@ enum class MovementMode {
     Walk,
 };
 
+extern const char* gFatalStage;
+
 class VulkanVoxelApp {
 public:
     int Run();
@@ -211,22 +213,32 @@ private:
         VkMemoryPropertyFlags properties,
         VkImage& image,
         VkDeviceMemory& imageMemory,
-        std::uint32_t mipLevels = 1
+        std::uint32_t mipLevels = 1,
+        std::uint32_t arrayLayers = 1
     ) const;
     VkImageView CreateImageView(
         VkImage image,
         VkFormat format,
         VkImageAspectFlags aspectFlags,
-        std::uint32_t mipLevels = 1
+        std::uint32_t mipLevels = 1,
+        VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D,
+        std::uint32_t layerCount = 1
     ) const;
     void TransitionImageLayout(
         VkImage image,
         VkFormat format,
         VkImageLayout oldLayout,
         VkImageLayout newLayout,
-        std::uint32_t mipLevels = 1
+        std::uint32_t mipLevels = 1,
+        std::uint32_t layerCount = 1
     ) const;
-    void CopyBufferToImage(VkBuffer buffer, VkImage image, std::uint32_t width, std::uint32_t height) const;
+    void CopyBufferToImage(
+        VkBuffer buffer,
+        VkImage image,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t layerCount = 1
+    ) const;
     void GenerateMipmaps(VkImage image, VkFormat imageFormat, std::uint32_t width, std::uint32_t height, std::uint32_t mipLevels) const;
     VkCommandBuffer BeginSingleTimeCommands() const;
     void EndSingleTimeCommands(VkCommandBuffer commandBuffer) const;

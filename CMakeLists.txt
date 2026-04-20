@@ -53,6 +53,7 @@ set(SHADER_SOURCES
     shaders/sky.vert
     shaders/sky.frag
     shaders/terrain.vert
+    shaders/terrain.frag
     shaders/world.vert
     shaders/world.frag
     shaders/overlay.vert
@@ -99,6 +100,7 @@ add_custom_target(
 )
 
 add_executable(VulkanVoxel
+    BlockRegistry.h
     MathTypes.h
     TerrainConfig.h
     TerrainConfig.cpp

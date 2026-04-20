@@ -1,3 +1,4 @@
+#include "BlockRegistry.h"
 #include "VulkanVoxel.h"
 
 #define NOMINMAX
@@ -410,23 +411,36 @@ void VulkanVoxelApp::CreateDepthResources() {
 }
 
 void VulkanVoxelApp::CreateTextureImage() {
-    const std::filesystem::path primaryPath = std::filesystem::path(ASSET_DIR) / "assets" / "textures" / "Block.png";
-    const std::filesystem::path fallbackPath = std::filesystem::path(ASSET_DIR) / "Block.png";
+    const std::filesystem::path textureDirectory = std::filesystem::path(ASSET_DIR) / "assets" / "textures";
+    std::vector<LoadedImage> layerImages;
+    layerImages.reserve(kBlockTextureLayerFiles.size());
 
-    std::filesystem::path texturePath = primaryPath;
-    if (!std::filesystem::exists(texturePath) && std::filesystem::exists(fallbackPath)) {
-        texturePath = fallbackPath;
-    }
-    if (!std::filesystem::exists(texturePath)) {
-        throw std::runtime_error("Texture file not found. Expected assets/textures/Block.png");
+    std::uint32_t textureWidth = 0;
+    std::uint32_t textureHeight = 0;
+    for (const std::string_view textureName : kBlockTextureLayerFiles) {
+        const std::filesystem::path texturePath = textureDirectory / std::filesystem::path(std::string(textureName));
+        if (!std::filesystem::exists(texturePath)) {
+            throw std::runtime_error("Missing block texture: " + texturePath.string());
+        }
+
+        LoadedImage image = LoadImageRgba(texturePath.string());
+        if (image.width == 0 || image.height == 0 || image.pixels.empty()) {
+            throw std::runtime_error("Failed to load block texture: " + texturePath.string());
+        }
+
+        if (layerImages.empty()) {
+            textureWidth = image.width;
+            textureHeight = image.height;
+        } else if (image.width != textureWidth || image.height != textureHeight) {
+            throw std::runtime_error("All block textures must share the same dimensions.");
+        }
+
+        layerImages.push_back(std::move(image));
     }
 
-    const std::string path = texturePath.string();
-    const LoadedImage image = LoadImageRgba(path);
-    const VkDeviceSize imageSize = static_cast<VkDeviceSize>(image.pixels.size());
-    textureMipLevels_ = static_cast<std::uint32_t>(
-        std::floor(std::log2(static_cast<float>(std::max(image.width, image.height))))
-    ) + 1;
+    const VkDeviceSize layerSize = static_cast<VkDeviceSize>(textureWidth) * static_cast<VkDeviceSize>(textureHeight) * 4u;
+    const VkDeviceSize imageSize = layerSize * static_cast<VkDeviceSize>(layerImages.size());
+    textureMipLevels_ = 1;
 
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
@@ -443,19 +457,27 @@ void VulkanVoxelApp::CreateTextureImage() {
         throw std::runtime_error("Failed to map texture staging buffer.");
     }
 
-    std::memcpy(mappedData, image.pixels.data(), image.pixels.size());
+    auto* mappedBytes = static_cast<std::uint8_t*>(mappedData);
+    for (std::size_t layerIndex = 0; layerIndex < layerImages.size(); ++layerIndex) {
+        std::memcpy(
+            mappedBytes + static_cast<std::size_t>(layerSize) * layerIndex,
+            layerImages[layerIndex].pixels.data(),
+            layerImages[layerIndex].pixels.size()
+        );
+    }
     vkUnmapMemory(device_, stagingBufferMemory);
 
     CreateImage(
-        image.width,
-        image.height,
+        textureWidth,
+        textureHeight,
         VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         textureImage_,
         textureImageMemory_,
-        textureMipLevels_
+        textureMipLevels_,
+        static_cast<std::uint32_t>(layerImages.size())
     );
 
     TransitionImageLayout(
@@ -463,24 +485,45 @@ void VulkanVoxelApp::CreateTextureImage() {
         VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        textureMipLevels_
+        textureMipLevels_,
+        static_cast<std::uint32_t>(layerImages.size())
     );
-    CopyBufferToImage(stagingBuffer, textureImage_, image.width, image.height);
-    GenerateMipmaps(textureImage_, VK_FORMAT_R8G8B8A8_UNORM, image.width, image.height, textureMipLevels_);
+    CopyBufferToImage(
+        stagingBuffer,
+        textureImage_,
+        textureWidth,
+        textureHeight,
+        static_cast<std::uint32_t>(layerImages.size())
+    );
+    TransitionImageLayout(
+        textureImage_,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        textureMipLevels_,
+        static_cast<std::uint32_t>(layerImages.size())
+    );
 
     vkDestroyBuffer(device_, stagingBuffer, nullptr);
     vkFreeMemory(device_, stagingBufferMemory, nullptr);
 }
 
 void VulkanVoxelApp::CreateTextureImageView() {
-    textureImageView_ = CreateImageView(textureImage_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, textureMipLevels_);
+    textureImageView_ = CreateImageView(
+        textureImage_,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        textureMipLevels_,
+        VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+        static_cast<std::uint32_t>(kBlockTextureLayerFiles.size())
+    );
 }
 
 void VulkanVoxelApp::CreateTextureSampler() {
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_NEAREST;
-    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -489,9 +532,9 @@ void VulkanVoxelApp::CreateTextureSampler() {
     samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
     samplerInfo.compareEnable = VK_FALSE;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = static_cast<float>(textureMipLevels_);
+    samplerInfo.maxLod = 0.0f;
 
     if (vkCreateSampler(device_, &samplerInfo, nullptr, &textureSampler_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create texture sampler.");
@@ -2253,7 +2296,8 @@ void VulkanVoxelApp::CreateImage(
     VkMemoryPropertyFlags properties,
     VkImage& image,
     VkDeviceMemory& imageMemory,
-    std::uint32_t mipLevels
+    std::uint32_t mipLevels,
+    std::uint32_t arrayLayers
 ) const {
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -2262,7 +2306,7 @@ void VulkanVoxelApp::CreateImage(
     imageInfo.extent.height = height;
     imageInfo.extent.depth = 1;
     imageInfo.mipLevels = mipLevels;
-    imageInfo.arrayLayers = 1;
+    imageInfo.arrayLayers = arrayLayers;
     imageInfo.format = format;
     imageInfo.tiling = tiling;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2293,18 +2337,20 @@ VkImageView VulkanVoxelApp::CreateImageView(
     VkImage image,
     VkFormat format,
     VkImageAspectFlags aspectFlags,
-    std::uint32_t mipLevels
+    std::uint32_t mipLevels,
+    VkImageViewType viewType,
+    std::uint32_t layerCount
 ) const {
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = viewType;
     viewInfo.format = format;
     viewInfo.subresourceRange.aspectMask = aspectFlags;
     viewInfo.subresourceRange.baseMipLevel = 0;
     viewInfo.subresourceRange.levelCount = mipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
-    viewInfo.subresourceRange.layerCount = 1;
+    viewInfo.subresourceRange.layerCount = layerCount;
 
     VkImageView imageView = VK_NULL_HANDLE;
     if (vkCreateImageView(device_, &viewInfo, nullptr, &imageView) != VK_SUCCESS) {

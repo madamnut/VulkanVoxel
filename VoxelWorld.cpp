@@ -1,3 +1,4 @@
+#include "BlockRegistry.h"
 #include "VoxelWorld.h"
 #include "WorldGenerator.h"
 
@@ -525,13 +526,19 @@ void BuildSubChunkQuadRecords(
                     FaceMaskCell face{};
                     if ((positiveMask & (1u << i)) != 0) {
                         face = MakeFaceMaskCell(
-                            rowValuesA[static_cast<std::size_t>(i)],
+                            GetBlockTextureLayer(
+                                rowValuesA[static_cast<std::size_t>(i)],
+                                GetBlockFaceForAxis(axis, true)
+                            ),
                             true,
                             PackAoPattern(ComputeQuadAoPattern(sampleBlock, axis, true, slice + 1, i, j, 1, 1))
                         );
                     } else if ((negativeMask & (1u << i)) != 0) {
                         face = MakeFaceMaskCell(
-                            rowValuesB[static_cast<std::size_t>(i)],
+                            GetBlockTextureLayer(
+                                rowValuesB[static_cast<std::size_t>(i)],
+                                GetBlockFaceForAxis(axis, false)
+                            ),
                             false,
                             PackAoPattern(ComputeQuadAoPattern(sampleBlock, axis, false, slice + 1, i, j, 1, 1))
                         );

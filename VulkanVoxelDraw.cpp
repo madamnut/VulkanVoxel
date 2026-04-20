@@ -715,7 +715,8 @@ void VulkanVoxelApp::TransitionImageLayout(
     VkFormat format,
     VkImageLayout oldLayout,
     VkImageLayout newLayout,
-    std::uint32_t mipLevels
+    std::uint32_t mipLevels,
+    std::uint32_t layerCount
 ) const {
     const VkCommandBuffer commandBuffer = BeginSingleTimeCommands();
 
@@ -729,7 +730,7 @@ void VulkanVoxelApp::TransitionImageLayout(
     barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = mipLevels;
     barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.layerCount = layerCount;
 
     if (newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
         barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -786,24 +787,30 @@ void VulkanVoxelApp::CopyBufferToImage(
     VkBuffer buffer,
     VkImage image,
     std::uint32_t width,
-    std::uint32_t height
+    std::uint32_t height,
+    std::uint32_t layerCount
 ) const {
     const VkCommandBuffer commandBuffer = BeginSingleTimeCommands();
 
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {width, height, 1};
+    std::vector<VkBufferImageCopy> regions(layerCount);
+    const VkDeviceSize layerSize = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4u;
+    for (std::uint32_t layerIndex = 0; layerIndex < layerCount; ++layerIndex) {
+        VkBufferImageCopy& region = regions[static_cast<std::size_t>(layerIndex)];
+        region.bufferOffset = layerSize * static_cast<VkDeviceSize>(layerIndex);
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = layerIndex;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {width, height, 1};
+    }
 
     vkCmdCopyBufferToImage(
         commandBuffer,
         buffer,
         image,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1,
-        &region
+        static_cast<std::uint32_t>(regions.size()),
+        regions.data()
     );
 
     EndSingleTimeCommands(commandBuffer);
