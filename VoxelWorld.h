@@ -135,6 +135,19 @@ struct PendingChunkIdHash {
     }
 };
 
+struct ChunkTaskState {
+    bool desired = false;
+    bool resident = false;
+    bool loadQueued = false;
+    bool loadInFlight = false;
+    bool retireRequested = false;
+    bool renderActive = false;
+    bool renderUpdateQueued = false;
+    bool renderRemovalQueued = false;
+    std::uint32_t dirtyQueuedMask = 0;
+    std::uint32_t dirtyInFlightMask = 0;
+};
+
 struct ChunkMeshBatchData {
     PendingChunkId id{};
     std::vector<WorldQuadRecord> quads;
@@ -268,6 +281,7 @@ private:
     static int GetRegionLocalCoord(int chunkCoord);
     static std::int64_t MakeRegionKey(int regionX, int regionZ);
     static int GetSubChunkIndex(int worldY);
+    static std::uint32_t GetSubChunkBit(int subChunkIndex);
     static int GetSubChunkBlockIndex(int localX, int localY, int localZ);
     static std::uint16_t GetSubChunkBlock(const SubChunkVoxelData& subChunk, int localX, int localY, int localZ);
     static void SetSubChunkBlock(SubChunkVoxelData& subChunk, int localX, int localY, int localZ, std::uint16_t blockValue);
@@ -277,6 +291,10 @@ private:
     void EnsureInitialized();
     void InitializeVoxelSubChunks(ChunkColumnData& column) const;
     void InitializeSubChunkMeshes(ChunkColumnData& column, bool dirty) const;
+    ChunkTaskState& GetOrCreateChunkTaskState(int chunkX, int chunkZ);
+    ChunkTaskState* FindChunkTaskState(int chunkX, int chunkZ);
+    const ChunkTaskState* FindChunkTaskState(int chunkX, int chunkZ) const;
+    void MaybeCleanupChunkTaskState(int chunkX, int chunkZ);
     std::unordered_set<PendingChunkId, PendingChunkIdHash> CollectDesiredChunks(int centerChunkX, int centerChunkZ, int keepRadius) const;
     void RebuildPendingChunkQueue(int centerChunkX, int centerChunkZ);
     void RefreshStreamingQueue(int centerChunkX, int centerChunkZ, int keepRadius);
@@ -284,11 +302,9 @@ private:
     void EnqueueAllDirtySubChunks(int chunkX, int chunkZ, ChunkColumnData& column);
     void RemoveQueuedDirtySubChunksForChunk(int chunkX, int chunkZ);
     void MarkSubChunkDirty(int chunkX, int chunkZ, int subChunkIndex);
-    bool IsChunkDesired(int chunkX, int chunkZ) const;
     void QueueRenderChunkUpdate(int chunkX, int chunkZ);
     void QueueRenderChunkRemoval(int chunkX, int chunkZ);
     void QueueRenderUpdatesForChunk(int chunkX, int chunkZ, const ChunkColumnData& column);
-    std::size_t RebuildDirtyMeshesInWindow(int centerChunkX, int centerChunkZ, int keepRadius);
     void UnloadRetiredChunks(std::size_t unloadBudget = static_cast<std::size_t>(-1));
     void GenerateChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const;
     void LoadOrCreateSave();
@@ -328,17 +344,12 @@ private:
     int streamingKeepRadius_ = 0;
     TerrainConfig terrainConfig_{}; 
     std::unordered_map<std::int64_t, ChunkColumnData> chunkColumns_;
+    std::unordered_map<std::int64_t, ChunkTaskState> chunkTaskStates_;
     std::unordered_set<PendingChunkId, PendingChunkIdHash> desiredChunks_;
-    std::unordered_set<PendingChunkId, PendingChunkIdHash> retiringChunks_;
-    std::unordered_set<PendingChunkId, PendingChunkIdHash> inFlightChunkLoads_;
     std::deque<PendingChunkId> pendingChunkLoadQueue_;
-    std::unordered_set<PendingChunkId, PendingChunkIdHash> queuedChunkLoads_;
     std::deque<DirtySubChunkId> dirtySubChunkQueue_;
-    std::unordered_set<DirtySubChunkId, DirtySubChunkIdHash> queuedDirtySubChunks_;
-    std::unordered_set<DirtySubChunkId, DirtySubChunkIdHash> inFlightDirtySubChunks_;
-    std::unordered_set<PendingChunkId, PendingChunkIdHash> activeRenderChunks_;
-    std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingRenderChunkUpdates_;
-    std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingRenderChunkRemovals_;
+    std::deque<PendingChunkId> pendingRenderChunkUpdates_;
+    std::deque<PendingChunkId> pendingRenderChunkRemovals_;
     bool renderStatsDirty_ = true;
     struct PendingSavedChunkState {
         std::uint64_t generation = 0;
