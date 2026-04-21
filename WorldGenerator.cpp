@@ -9,6 +9,9 @@ namespace WorldGenerator {
 
 namespace {
 
+constexpr int kGrassSurfaceOrdinal = 0;
+constexpr int kDirtLayerSolidCount = 4;
+
 constexpr int kDensitySampleStepX = 4;
 constexpr int kDensitySampleStepY = 4;
 constexpr int kDensitySampleStepZ = 4;
@@ -181,6 +184,32 @@ float SampleInterpolatedTerrainDensity(
     return Lerp(c0, c1, tz);
 }
 
+std::uint16_t GetGeneratedSolidBlockForOrdinal(int solidOrdinalFromTop) {
+    if (solidOrdinalFromTop <= kGrassSurfaceOrdinal) {
+        return kBlockGrass;
+    }
+    if (solidOrdinalFromTop <= kGrassSurfaceOrdinal + kDirtLayerSolidCount) {
+        return kBlockDirt;
+    }
+    return kBlockRock;
+}
+
+int ComputeTerrainHeight(
+    int worldX,
+    int worldZ,
+    const TerrainConfig& terrainConfig,
+    const PeriodicSimplex::FbmSettings& noiseSettings
+) {
+    for (int worldY = kWorldSizeY - 1; worldY >= 0; --worldY) {
+        if (SampleInterpolatedTerrainDensity(worldX, worldY, worldZ, terrainConfig, noiseSettings) >
+            terrainConfig.solidThreshold) {
+            return worldY + 1;
+        }
+    }
+
+    return 0;
+}
+
 void TryCollapseGeneratedSubChunk(SubChunkVoxelData& subChunk) {
     if (subChunk.isUniform || subChunk.blocks.empty()) {
         return;
@@ -203,14 +232,7 @@ void TryCollapseGeneratedSubChunk(SubChunkVoxelData& subChunk) {
 
 int ComputeTerrainHeight(int worldX, int worldZ, const TerrainConfig& terrainConfig) {
     const PeriodicSimplex::FbmSettings noiseSettings = MakeNoiseSettings(terrainConfig);
-    for (int worldY = kWorldSizeY - 1; worldY >= 0; --worldY) {
-        if (SampleInterpolatedTerrainDensity(worldX, worldY, worldZ, terrainConfig, noiseSettings) >
-            terrainConfig.solidThreshold) {
-            return worldY + 1;
-        }
-    }
-
-    return 0;
+    return ComputeTerrainHeight(worldX, worldZ, terrainConfig, noiseSettings);
 }
 
 std::uint16_t SampleBlock(int worldX, int worldY, int worldZ, const TerrainConfig& terrainConfig) {
@@ -218,9 +240,29 @@ std::uint16_t SampleBlock(int worldX, int worldY, int worldZ, const TerrainConfi
         return kBlockAir;
     }
 
+    const PeriodicSimplex::FbmSettings noiseSettings = MakeNoiseSettings(terrainConfig);
     const float density =
-        SampleInterpolatedTerrainDensity(worldX, worldY, worldZ, terrainConfig, MakeNoiseSettings(terrainConfig));
-    return density > terrainConfig.solidThreshold ? kBlockRock : kBlockAir;
+        SampleInterpolatedTerrainDensity(worldX, worldY, worldZ, terrainConfig, noiseSettings);
+    if (density <= terrainConfig.solidThreshold) {
+        return kBlockAir;
+    }
+
+    int solidOrdinalFromTop = 0;
+    for (int sampleY = kWorldSizeY - 1; sampleY >= worldY; --sampleY) {
+        const float sampleDensity =
+            SampleInterpolatedTerrainDensity(worldX, sampleY, worldZ, terrainConfig, noiseSettings);
+        if (sampleDensity <= terrainConfig.solidThreshold) {
+            continue;
+        }
+
+        if (sampleY == worldY) {
+            return GetGeneratedSolidBlockForOrdinal(solidOrdinalFromTop);
+        }
+
+        ++solidOrdinalFromTop;
+    }
+
+    return kBlockAir;
 }
 
 void GenerateChunkColumn(int chunkX, int chunkZ, const TerrainConfig& terrainConfig, ChunkColumnData& outColumn) {
@@ -246,45 +288,35 @@ void GenerateChunkColumn(int chunkX, int chunkZ, const TerrainConfig& terrainCon
     const ChunkDensityGrid densityGrid = BuildChunkDensityGrid(chunkX, chunkZ, terrainConfig, noiseSettings);
 
     for (int subChunkIndex = 0; subChunkIndex < kSubChunkCountY; ++subChunkIndex) {
-        const int subChunkMinY = subChunkIndex * kSubChunkSize;
         SubChunkVoxelData& subChunk = outColumn.subChunks[static_cast<std::size_t>(subChunkIndex)];
         subChunk.isUniform = false;
         subChunk.uniformBlock = kBlockAir;
         subChunk.blocks.assign(static_cast<std::size_t>(kSubChunkVoxelCount), kBlockAir);
+    }
 
-        bool isUniform = true;
-        std::uint16_t firstBlock = kBlockAir;
-        bool firstBlockInitialized = false;
-
-        for (int localZ = 0; localZ < kChunkSizeZ; ++localZ) {
-            for (int localX = 0; localX < kChunkSizeX; ++localX) {
-                for (int localY = 0; localY < kSubChunkSize; ++localY) {
-                    const int worldY = subChunkMinY + localY;
-                    const int blockIndex = localY * kSubChunkSize * kSubChunkSize +
-                        localZ * kSubChunkSize + localX;
-                    const float density =
-                        SampleInterpolatedTerrainDensityFromChunkGrid(densityGrid, localX, worldY, localZ);
-                    const std::uint16_t blockValue =
-                        density > terrainConfig.solidThreshold ? kBlockRock : kBlockAir;
-                    subChunk.blocks[static_cast<std::size_t>(blockIndex)] = blockValue;
-
-                    if (!firstBlockInitialized) {
-                        firstBlock = blockValue;
-                        firstBlockInitialized = true;
-                    } else if (blockValue != firstBlock) {
-                        isUniform = false;
-                    }
+    for (int localZ = 0; localZ < kChunkSizeZ; ++localZ) {
+        for (int localX = 0; localX < kChunkSizeX; ++localX) {
+            int solidOrdinalFromTop = 0;
+            for (int worldY = kWorldSizeY - 1; worldY >= 0; --worldY) {
+                const float density =
+                    SampleInterpolatedTerrainDensityFromChunkGrid(densityGrid, localX, worldY, localZ);
+                std::uint16_t blockValue = kBlockAir;
+                if (density > terrainConfig.solidThreshold) {
+                    blockValue = GetGeneratedSolidBlockForOrdinal(solidOrdinalFromTop);
+                    ++solidOrdinalFromTop;
                 }
+
+                const int subChunkIndex = worldY / kSubChunkSize;
+                const int localY = worldY - subChunkIndex * kSubChunkSize;
+                const int blockIndex = localY * kSubChunkSize * kSubChunkSize +
+                    localZ * kSubChunkSize + localX;
+                outColumn.subChunks[static_cast<std::size_t>(subChunkIndex)]
+                    .blocks[static_cast<std::size_t>(blockIndex)] = blockValue;
             }
         }
+    }
 
-        if (isUniform) {
-            subChunk.isUniform = true;
-            subChunk.uniformBlock = firstBlock;
-            subChunk.blocks.clear();
-            continue;
-        }
-
+    for (SubChunkVoxelData& subChunk : outColumn.subChunks) {
         TryCollapseGeneratedSubChunk(subChunk);
     }
 }

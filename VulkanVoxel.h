@@ -627,9 +627,9 @@ private:
     float moonWidth_ = 0.0f;
     float moonHeight_ = 0.0f;
     bool moonLoaded_ = false;
-    std::vector<WorldVertex> playerBaseVertices_;
-    std::vector<WorldVertex> playerRenderVertices_;
-    std::vector<std::uint32_t> playerIndices_;
+    std::vector<WorldVertex>* playerBaseVertices_ = nullptr;
+    std::vector<WorldVertex>* playerRenderVertices_ = nullptr;
+    std::vector<std::uint32_t>* playerIndices_ = nullptr;
     Vec3 playerModelBoundsMin_{};
     Vec3 playerModelBoundsMax_{};
     bool playerLoaded_ = false;

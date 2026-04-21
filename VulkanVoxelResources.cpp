@@ -636,24 +636,25 @@ void VulkanVoxelApp::LoadPlayerMesh() {
         dst.ao = 1.0f;
     }
 
-    playerBaseVertices_ = std::move(loadedBaseVertices);
-    playerRenderVertices_ = std::move(loadedRenderVertices);
-    playerIndices_ = std::move(loadedIndices);
+    playerBaseVertices_ = new std::vector<WorldVertex>(std::move(loadedBaseVertices));
+    playerRenderVertices_ = new std::vector<WorldVertex>(std::move(loadedRenderVertices));
+    playerIndices_ = new std::vector<std::uint32_t>(std::move(loadedIndices));
 
     playerIndexCount_ = indexCount;
-    playerLoaded_ = !playerBaseVertices_.empty() && !playerIndices_.empty();
+    playerLoaded_ = playerBaseVertices_ && playerIndices_ &&
+        !playerBaseVertices_->empty() && !playerIndices_->empty();
     if (!playerLoaded_) {
         return;
     }
 
     playerModelBoundsMin_ = {
-        playerBaseVertices_[0].position[0],
-        playerBaseVertices_[0].position[1],
-        playerBaseVertices_[0].position[2],
+        (*playerBaseVertices_)[0].position[0],
+        (*playerBaseVertices_)[0].position[1],
+        (*playerBaseVertices_)[0].position[2],
     };
     playerModelBoundsMax_ = playerModelBoundsMin_;
 
-    for (const WorldVertex& vertex : playerBaseVertices_) {
+    for (const WorldVertex& vertex : *playerBaseVertices_) {
         playerModelBoundsMin_.x = std::min(playerModelBoundsMin_.x, vertex.position[0]);
         playerModelBoundsMin_.y = std::min(playerModelBoundsMin_.y, vertex.position[1]);
         playerModelBoundsMin_.z = std::min(playerModelBoundsMin_.z, vertex.position[2]);
@@ -1411,9 +1412,9 @@ void VulkanVoxelApp::CreatePlayerBuffers() {
     }
 
     const VkDeviceSize vertexBufferSize =
-        sizeof(WorldVertex) * static_cast<VkDeviceSize>(playerBaseVertices_.size());
+        sizeof(WorldVertex) * static_cast<VkDeviceSize>(playerBaseVertices_->size());
     const VkDeviceSize indexBufferSize =
-        sizeof(std::uint32_t) * static_cast<VkDeviceSize>(playerIndices_.size());
+        sizeof(std::uint32_t) * static_cast<VkDeviceSize>(playerIndices_->size());
 
     if (playerVertexBuffers_.empty()) {
         playerVertexBuffers_.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
@@ -1444,17 +1445,18 @@ void VulkanVoxelApp::CreatePlayerBuffers() {
         if (vkMapMemory(device_, playerIndexBufferMemory_, 0, indexBufferSize, 0, &mappedData) != VK_SUCCESS) {
             throw std::runtime_error("Failed to map player index buffer.");
         }
-        std::memcpy(mappedData, playerIndices_.data(), static_cast<std::size_t>(indexBufferSize));
+        std::memcpy(mappedData, playerIndices_->data(), static_cast<std::size_t>(indexBufferSize));
         vkUnmapMemory(device_, playerIndexBufferMemory_);
     }
 
-    playerIndexCount_ = static_cast<std::uint32_t>(playerIndices_.size());
+    playerIndexCount_ = static_cast<std::uint32_t>(playerIndices_->size());
     UpdatePlayerRenderMesh();
 }
 
 void VulkanVoxelApp::UpdatePlayerRenderMesh() {
     if (!playerLoaded_ || currentFrame_ >= playerVertexBuffers_.size() ||
-        playerVertexBuffers_[currentFrame_] == VK_NULL_HANDLE) {
+        playerVertexBuffers_[currentFrame_] == VK_NULL_HANDLE ||
+        !playerBaseVertices_ || !playerRenderVertices_) {
         playerVertexCount_ = 0;
         return;
     }
@@ -1473,10 +1475,10 @@ void VulkanVoxelApp::UpdatePlayerRenderMesh() {
     const float sinYaw = std::sin(yawRadians);
     const Vec3 playerFeet = GetInterpolatedPlayerFeetPosition();
 
-    playerRenderVertices_.resize(playerBaseVertices_.size());
-    for (std::size_t i = 0; i < playerBaseVertices_.size(); ++i) {
-        const WorldVertex& src = playerBaseVertices_[i];
-        WorldVertex& dst = playerRenderVertices_[i];
+    playerRenderVertices_->resize(playerBaseVertices_->size());
+    for (std::size_t i = 0; i < playerBaseVertices_->size(); ++i) {
+        const WorldVertex& src = (*playerBaseVertices_)[i];
+        WorldVertex& dst = (*playerRenderVertices_)[i];
 
         const float localX = (src.position[0] - centerX) * scale;
         const float localY = (src.position[1] - playerModelBoundsMin_.y) * scale;
@@ -1494,7 +1496,7 @@ void VulkanVoxelApp::UpdatePlayerRenderMesh() {
     }
 
     const VkDeviceSize vertexBufferSize =
-        sizeof(WorldVertex) * static_cast<VkDeviceSize>(playerRenderVertices_.size());
+        sizeof(WorldVertex) * static_cast<VkDeviceSize>(playerRenderVertices_->size());
     void* mappedData = nullptr;
     if (vkMapMemory(
             device_,
@@ -1505,10 +1507,10 @@ void VulkanVoxelApp::UpdatePlayerRenderMesh() {
             &mappedData) != VK_SUCCESS) {
         throw std::runtime_error("Failed to map player vertex buffer.");
     }
-    std::memcpy(mappedData, playerRenderVertices_.data(), static_cast<std::size_t>(vertexBufferSize));
+    std::memcpy(mappedData, playerRenderVertices_->data(), static_cast<std::size_t>(vertexBufferSize));
     vkUnmapMemory(device_, playerVertexBuffersMemory_[currentFrame_]);
 
-    playerVertexCount_ = static_cast<std::uint32_t>(playerRenderVertices_.size());
+    playerVertexCount_ = static_cast<std::uint32_t>(playerRenderVertices_->size());
 }
 
 void VulkanVoxelApp::UploadWorldRenderUpdate(const WorldRenderUpdate& update) {
@@ -1623,6 +1625,7 @@ void VulkanVoxelApp::BuildWorldMesh() {
     {
         std::shared_lock lock(worldChunkMapMutex_);
         meshRequestHandleSelection = world_.ResolveDirtyMeshRequestHandles(meshRequestCandidates);
+        world_.PrefetchChunkColumnsForMeshRequests(meshRequestHandleSelection);
     }
     {
         std::shared_lock lock(worldChunkMutex_);
@@ -1823,6 +1826,7 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
                     {
                         std::shared_lock lock(worldChunkMapMutex_);
                         meshRequestHandleSelection = world_.ResolveDirtyMeshRequestHandles(meshRequestCandidates);
+                        world_.PrefetchChunkColumnsForMeshRequests(meshRequestHandleSelection);
                     }
                     {
                         std::shared_lock lock(worldChunkMutex_);

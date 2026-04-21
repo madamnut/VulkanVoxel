@@ -16,14 +16,7 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-set(FASTNOISE2_TOOLS OFF CACHE BOOL "" FORCE)
-set(FASTNOISE2_TESTS OFF CACHE BOOL "" FORCE)
-set(FASTNOISE2_UTILITY OFF CACHE BOOL "" FORCE)
-set(FASTSIMD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(FASTSIMD_TESTS OFF CACHE BOOL "" FORCE)
-
 add_subdirectory(glfw-3.4)
-add_subdirectory(third_party/FastNoise2)
 
 find_package(Vulkan REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -133,7 +126,6 @@ target_compile_definitions(VulkanVoxel
 target_link_libraries(VulkanVoxel
     PRIVATE
         glfw
-        FastNoise
         Vulkan::Vulkan
         dxgi
         advapi32

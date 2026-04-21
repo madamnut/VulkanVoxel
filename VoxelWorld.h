@@ -290,6 +290,7 @@ public:
     bool CommitPreparedChunkColumn(PreparedChunkColumn&& prepared);
     std::vector<DirtySubChunkId> AcquireDirtyMeshRequestCandidates(std::size_t maxCount, int centerChunkX, int centerChunkZ, int keepRadius);
     DirtyMeshRequestHandleSelection ResolveDirtyMeshRequestHandles(const std::vector<DirtySubChunkId>& candidates) const;
+    void PrefetchChunkColumnsForMeshRequests(const DirtyMeshRequestHandleSelection& handleSelection);
     DirtyMeshRequestSelection ResolveDirtyMeshRequests(const DirtyMeshRequestHandleSelection& handleSelection) const;
     void FinalizeDirtyMeshRequests(const DirtyMeshRequestSelection& selection);
     std::vector<MeshBuildInput> AcquireDirtyMeshRequests(std::size_t maxCount, int centerChunkX, int centerChunkZ, int keepRadius);
@@ -354,6 +355,10 @@ private:
     void InitializeSubChunkMeshes(ChunkColumnData& column, bool dirty) const;
     std::shared_ptr<ChunkColumnData> FindChunkColumnHandle(int chunkX, int chunkZ);
     std::shared_ptr<const ChunkColumnData> FindChunkColumnHandle(int chunkX, int chunkZ) const;
+    bool TryTakePrefetchedChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const;
+    bool TryGetPrefetchedChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const;
+    void CachePrefetchedChunkColumn(int chunkX, int chunkZ, ChunkColumnData&& column) const;
+    void PrunePrefetchedChunkColumns(int centerChunkX, int centerChunkZ, int keepRadius);
     ChunkTaskState& GetOrCreateChunkTaskState(int chunkX, int chunkZ);
     ChunkTaskState* FindChunkTaskState(int chunkX, int chunkZ);
     const ChunkTaskState* FindChunkTaskState(int chunkX, int chunkZ) const;
@@ -421,6 +426,8 @@ private:
         ChunkColumnData column;
     };
     mutable std::recursive_mutex regionFileIoMutex_;
+    mutable std::mutex prefetchedChunkMutex_;
+    mutable std::unordered_map<std::int64_t, ChunkColumnData> prefetchedChunkColumns_;
     mutable std::mutex pendingSaveMutex_;
     std::deque<RegionSaveTask> pendingSaveTasks_;
     std::unordered_map<std::int64_t, PendingSavedChunkState> pendingSavedChunkColumns_;

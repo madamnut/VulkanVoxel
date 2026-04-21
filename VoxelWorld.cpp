@@ -866,6 +866,18 @@ PreparedChunkColumn VoxelWorld::PrepareChunkColumn(int chunkX, int chunkZ) const
     PreparedChunkColumn prepared{};
     prepared.id = {chunkX, chunkZ};
 
+    if (TryTakePrefetchedChunkColumn(chunkX, chunkZ, prepared.column)) {
+        prepared.generated = prepared.column.modified;
+        const auto profileEndTime = Clock::now();
+        RecordRuntimeProfileSample(
+            gChunkLoadProfile,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(profileEndTime - profileStartTime).count()
+            )
+        );
+        return prepared;
+    }
+
     const auto diskLoadStartTime = Clock::now();
     const bool loadedFromDisk = LoadChunkColumn(chunkX, chunkZ, prepared.column);
     const auto diskLoadEndTime = Clock::now();
@@ -1008,6 +1020,48 @@ DirtyMeshRequestHandleSelection VoxelWorld::ResolveDirtyMeshRequestHandles(const
     }
 
     return selection;
+}
+
+void VoxelWorld::PrefetchChunkColumnsForMeshRequests(const DirtyMeshRequestHandleSelection& handleSelection) {
+    EnsureInitialized();
+
+    std::vector<PendingChunkId> missingChunks;
+    missingChunks.reserve(handleSelection.readyHandles.size() * 9);
+
+    {
+        std::lock_guard lock(prefetchedChunkMutex_);
+        for (const DirtyMeshRequestHandle& handle : handleSelection.readyHandles) {
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int chunkX = handle.id.chunkX + dx;
+                    const int chunkZ = handle.id.chunkZ + dz;
+                    const std::int64_t chunkKey = MakeChunkKey(chunkX, chunkZ);
+                    if (chunkColumns_.contains(chunkKey) || prefetchedChunkColumns_.contains(chunkKey)) {
+                        continue;
+                    }
+                    missingChunks.push_back({chunkX, chunkZ});
+                }
+            }
+        }
+    }
+
+    std::sort(missingChunks.begin(), missingChunks.end(), [](const PendingChunkId& lhs, const PendingChunkId& rhs) {
+        if (lhs.chunkZ != rhs.chunkZ) {
+            return lhs.chunkZ < rhs.chunkZ;
+        }
+        return lhs.chunkX < rhs.chunkX;
+    });
+    missingChunks.erase(std::unique(missingChunks.begin(), missingChunks.end()), missingChunks.end());
+
+    for (const PendingChunkId& chunkId : missingChunks) {
+        ChunkColumnData column{};
+        const bool loadedFromDisk = LoadChunkColumn(chunkId.chunkX, chunkId.chunkZ, column);
+        if (!loadedFromDisk) {
+            GenerateChunkColumn(chunkId.chunkX, chunkId.chunkZ, column);
+            column.modified = true;
+        }
+        CachePrefetchedChunkColumn(chunkId.chunkX, chunkId.chunkZ, std::move(column));
+    }
 }
 
 DirtyMeshRequestSelection VoxelWorld::ResolveDirtyMeshRequests(const DirtyMeshRequestHandleSelection& handleSelection) const {
@@ -1392,6 +1446,48 @@ std::shared_ptr<const ChunkColumnData> VoxelWorld::FindChunkColumnHandle(int chu
     return it == chunkColumns_.end() ? nullptr : it->second;
 }
 
+bool VoxelWorld::TryTakePrefetchedChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const {
+    std::lock_guard lock(prefetchedChunkMutex_);
+    const auto it = prefetchedChunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
+    if (it == prefetchedChunkColumns_.end()) {
+        return false;
+    }
+    outColumn = std::move(it->second);
+    prefetchedChunkColumns_.erase(it);
+    return true;
+}
+
+bool VoxelWorld::TryGetPrefetchedChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const {
+    std::lock_guard lock(prefetchedChunkMutex_);
+    const auto it = prefetchedChunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
+    if (it == prefetchedChunkColumns_.end()) {
+        return false;
+    }
+    outColumn = it->second;
+    return true;
+}
+
+void VoxelWorld::CachePrefetchedChunkColumn(int chunkX, int chunkZ, ChunkColumnData&& column) const {
+    std::lock_guard lock(prefetchedChunkMutex_);
+    prefetchedChunkColumns_.try_emplace(MakeChunkKey(chunkX, chunkZ), std::move(column));
+}
+
+void VoxelWorld::PrunePrefetchedChunkColumns(int centerChunkX, int centerChunkZ, int keepRadius) {
+    std::lock_guard lock(prefetchedChunkMutex_);
+    for (auto it = prefetchedChunkColumns_.begin(); it != prefetchedChunkColumns_.end();) {
+        const std::uint64_t unsignedKey = static_cast<std::uint64_t>(it->first);
+        const int chunkX = static_cast<std::int32_t>(static_cast<std::uint32_t>(unsignedKey >> 32));
+        const int chunkZ = static_cast<std::int32_t>(static_cast<std::uint32_t>(unsignedKey));
+        const int dx = chunkX - centerChunkX;
+        const int dz = chunkZ - centerChunkZ;
+        if (dx * dx + dz * dz > keepRadius * keepRadius) {
+            it = prefetchedChunkColumns_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 ChunkTaskState& VoxelWorld::GetOrCreateChunkTaskState(int chunkX, int chunkZ) {
     return chunkTaskStates_[MakeChunkKey(chunkX, chunkZ)];
 }
@@ -1523,6 +1619,7 @@ void VoxelWorld::RefreshStreamingQueue(int centerChunkX, int centerChunkZ, int k
     streamingCenterChunkX_ = centerChunkX;
     streamingCenterChunkZ_ = centerChunkZ;
     streamingKeepRadius_ = keepRadius;
+    PrunePrefetchedChunkColumns(centerChunkX, centerChunkZ, keepRadius + 1);
 
     const std::unordered_set<PendingChunkId, PendingChunkIdHash> previousDesiredChunks = desiredChunks_;
     const std::unordered_set<PendingChunkId, PendingChunkIdHash> newDesiredChunks =
@@ -2633,7 +2730,18 @@ std::uint16_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) const {
     const std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
     std::uint16_t blockValue = 0;
     if (!columnHandle || columnHandle->subChunks.size() != kSubChunkCountY) {
-        blockValue = SampleGeneratedBlock(worldX, worldY, worldZ);
+        ChunkColumnData prefetchedColumn{};
+        if (TryGetPrefetchedChunkColumn(chunkX, chunkZ, prefetchedColumn) &&
+            prefetchedColumn.subChunks.size() == kSubChunkCountY) {
+            blockValue = GetSubChunkBlock(
+                prefetchedColumn.subChunks[static_cast<std::size_t>(subChunkIndex)],
+                localX,
+                localY,
+                localZ
+            );
+        } else {
+            blockValue = SampleGeneratedBlock(worldX, worldY, worldZ);
+        }
     } else {
         blockValue = GetSubChunkBlock(
             columnHandle->subChunks[static_cast<std::size_t>(subChunkIndex)],
