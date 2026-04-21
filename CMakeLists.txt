@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 if(POLICY CMP0141)
     cmake_policy(SET CMP0141 NEW)
     set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
-        "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+        "$<$<CONFIG:Debug>:EditAndContinue>$<$<CONFIG:RelWithDebInfo,Release>:ProgramDatabase>")
 endif()
 
 project(VulkanVoxel LANGUAGES CXX)
@@ -144,6 +144,7 @@ target_link_libraries(VulkanVoxel
 
 if(MSVC)
     target_compile_options(VulkanVoxel PRIVATE /W4 /permissive-)
+    target_link_options(VulkanVoxel PRIVATE $<$<CONFIG:Release>:/DEBUG:FULL>)
 else()
     target_compile_options(VulkanVoxel PRIVATE -Wall -Wextra -Wpedantic)
 endif()

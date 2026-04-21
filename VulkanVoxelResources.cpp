@@ -86,10 +86,28 @@ void ErasePendingChunkId(
 void EnqueuePendingChunkId(
     std::vector<PendingChunkId>& chunks,
     std::unordered_set<PendingChunkId, PendingChunkIdHash>& chunkSet,
-    const PendingChunkId& target
+    const PendingChunkId& target,
+    bool prioritize = false
 ) {
     if (chunkSet.insert(target).second) {
-        chunks.push_back(target);
+        if (prioritize) {
+            chunks.insert(chunks.begin(), target);
+        } else {
+            chunks.push_back(target);
+        }
+        return;
+    }
+
+    if (prioritize) {
+        chunks.erase(
+            std::remove_if(
+                chunks.begin(),
+                chunks.end(),
+                [&target](const PendingChunkId& candidate) { return PendingChunkIdEquals(candidate, target); }
+            ),
+            chunks.end()
+        );
+        chunks.insert(chunks.begin(), target);
     }
 }
 
@@ -115,16 +133,26 @@ void ErasePendingChunkUpload(
 void EnqueuePendingChunkUpload(
     std::vector<ChunkMeshBatchData>& uploads,
     std::unordered_set<PendingChunkId, PendingChunkIdHash>& uploadSet,
-    ChunkMeshBatchData&& upload
+    ChunkMeshBatchData&& upload,
+    bool prioritize = false
 ) {
     if (uploadSet.insert(upload.id).second) {
-        uploads.push_back(std::move(upload));
+        if (prioritize) {
+            uploads.insert(uploads.begin(), std::move(upload));
+        } else {
+            uploads.push_back(std::move(upload));
+        }
         return;
     }
 
-    for (ChunkMeshBatchData& existing : uploads) {
-        if (PendingChunkIdEquals(existing.id, upload.id)) {
-            existing = std::move(upload);
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+        if (PendingChunkIdEquals(uploads[index].id, upload.id)) {
+            uploads[index] = std::move(upload);
+            if (prioritize && index != 0) {
+                ChunkMeshBatchData prioritized = std::move(uploads[index]);
+                uploads.erase(uploads.begin() + static_cast<std::ptrdiff_t>(index));
+                uploads.insert(uploads.begin(), std::move(prioritized));
+            }
             return;
         }
     }
@@ -772,6 +800,7 @@ void VulkanVoxelApp::LoadOverlayFont() {
     for (FontGlyphBitmap& glyph : overlayFontGlyphs_) {
         glyph = {};
     }
+    std::array<std::vector<std::uint8_t>, 128> overlayFontGlyphAlpha{};
 
     for (unsigned int code = 32; code < 127; ++code) {
         const wchar_t ch = static_cast<wchar_t>(code);
@@ -836,7 +865,8 @@ void VulkanVoxelApp::LoadOverlayFont() {
             glyph.height = maxY - minY + 1;
             glyph.offsetX = minX - padding;
             glyph.offsetY = minY - padding;
-            glyph.alpha.resize(static_cast<std::size_t>(glyph.width * glyph.height));
+            std::vector<std::uint8_t>& glyphAlpha = overlayFontGlyphAlpha[code];
+            glyphAlpha.resize(static_cast<std::size_t>(glyph.width * glyph.height));
 
             for (int y = 0; y < glyph.height; ++y) {
                 for (int x = 0; x < glyph.width; ++x) {
@@ -848,7 +878,7 @@ void VulkanVoxelApp::LoadOverlayFont() {
                         pixels[sourceIndex + 1],
                         pixels[sourceIndex + 2]
                     });
-                    glyph.alpha[static_cast<std::size_t>(y * glyph.width + x)] = alpha;
+                    glyphAlpha[static_cast<std::size_t>(y * glyph.width + x)] = alpha;
                 }
             }
         }
@@ -895,6 +925,7 @@ void VulkanVoxelApp::LoadOverlayFont() {
         if (!glyph.valid || glyph.width <= 0 || glyph.height <= 0) {
             continue;
         }
+        std::vector<std::uint8_t>& glyphAlpha = overlayFontGlyphAlpha[code];
 
         if (cursorX + glyph.width + atlasPadding > atlasWidth) {
             cursorX = atlasPadding;
@@ -909,7 +940,7 @@ void VulkanVoxelApp::LoadOverlayFont() {
         for (int y = 0; y < glyph.height; ++y) {
             const std::size_t srcOffset = static_cast<std::size_t>(y * glyph.width);
             for (int x = 0; x < glyph.width; ++x) {
-                const std::uint8_t alpha = glyph.alpha[srcOffset + static_cast<std::size_t>(x)];
+                const std::uint8_t alpha = glyphAlpha[srcOffset + static_cast<std::size_t>(x)];
                 const std::size_t dstIndex = static_cast<std::size_t>(((cursorY + y) * atlasWidth + cursorX + x) * 4);
                 atlasPixels[dstIndex + 0] = alpha;
                 atlasPixels[dstIndex + 1] = alpha;
@@ -922,8 +953,8 @@ void VulkanVoxelApp::LoadOverlayFont() {
         glyph.v0 = static_cast<float>(cursorY) / static_cast<float>(atlasHeight);
         glyph.u1 = static_cast<float>(cursorX + glyph.width) / static_cast<float>(atlasWidth);
         glyph.v1 = static_cast<float>(cursorY + glyph.height) / static_cast<float>(atlasHeight);
-        glyph.alpha.clear();
-        glyph.alpha.shrink_to_fit();
+        glyphAlpha.clear();
+        glyphAlpha.shrink_to_fit();
 
         cursorX += glyph.width + atlasPadding;
         rowHeight = std::max(rowHeight, glyph.height);
@@ -1570,13 +1601,36 @@ void VulkanVoxelApp::BuildWorldMesh() {
     const int centerChunkZ = static_cast<int>(std::floor(cameraPosition_.z / static_cast<float>(kChunkSizeZ)));
 
     std::vector<PendingChunkId> chunkRequests;
-    std::vector<MeshBuildInput> meshRequests;
+    std::vector<PendingChunkId> unloadCandidates;
+    std::vector<PendingChunkId> unloadedChunks;
+    std::vector<DirtySubChunkId> meshRequestCandidates;
+    DirtyMeshRequestHandleSelection meshRequestHandleSelection;
+    DirtyMeshRequestSelection meshRequestSelection;
+    PendingRenderDrainSelection renderDrainSelection;
+    PendingRenderDrainHandleSelection renderDrainHandleSelection;
+    ResolvedRenderDrainSelection resolvedRenderDrainSelection;
     WorldRenderUpdate renderUpdate{};
     {
-        std::unique_lock lock(worldMutex_);
+        std::unique_lock lock(worldStreamingMutex_);
         world_.UpdateStreamingTargets(centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+    }
+    {
+        std::unique_lock lock(worldStreamingMutex_);
         chunkRequests = world_.AcquireChunkLoadRequests(kChunkGenerationBudgetPerPass);
-        meshRequests = world_.AcquireDirtyMeshRequests(kMeshBuildBudgetPerPass, centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+        meshRequestCandidates =
+            world_.AcquireDirtyMeshRequestCandidates(kMeshBuildBudgetPerPass, centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+    }
+    {
+        std::shared_lock lock(worldChunkMapMutex_);
+        meshRequestHandleSelection = world_.ResolveDirtyMeshRequestHandles(meshRequestCandidates);
+    }
+    {
+        std::shared_lock lock(worldChunkMutex_);
+        meshRequestSelection = world_.ResolveDirtyMeshRequests(meshRequestHandleSelection);
+    }
+    {
+        std::unique_lock lock(worldStreamingMutex_);
+        world_.FinalizeDirtyMeshRequests(meshRequestSelection);
     }
 
     std::vector<PreparedChunkColumn> preparedChunks;
@@ -1586,27 +1640,56 @@ void VulkanVoxelApp::BuildWorldMesh() {
     }
 
     std::vector<PreparedSubChunkMesh> preparedMeshes;
-    preparedMeshes.reserve(meshRequests.size());
-    for (const MeshBuildInput& meshRequest : meshRequests) {
+    preparedMeshes.reserve(meshRequestSelection.requests.size());
+    for (const MeshBuildInput& meshRequest : meshRequestSelection.requests) {
         preparedMeshes.push_back(world_.PrepareSubChunkMesh(meshRequest));
     }
 
     {
-        std::unique_lock lock(worldMutex_);
+        std::unique_lock lock(worldStreamingMutex_);
         world_.UpdateStreamingTargets(centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
+        unloadCandidates = world_.AcquireRetiredChunkUnloadCandidates(kChunkGenerationBudgetPerPass);
+    }
+    {
+        std::unique_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+        std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+        std::lock(mapLock, chunkLock);
+        unloadedChunks = world_.ExecuteChunkUnloads(unloadCandidates);
+    }
+    {
+        std::unique_lock lock(worldStreamingMutex_);
+        world_.FinalizeUnloadedChunkStates(unloadedChunks);
+    }
+    {
+        std::unique_lock streamingLock(worldStreamingMutex_, std::defer_lock);
+        std::unique_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+        std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+        std::lock(streamingLock, mapLock, chunkLock);
         for (PreparedChunkColumn& preparedChunk : preparedChunks) {
             world_.CommitPreparedChunkColumn(std::move(preparedChunk));
         }
         for (PreparedSubChunkMesh& preparedMesh : preparedMeshes) {
             world_.CommitPreparedSubChunkMesh(std::move(preparedMesh));
         }
-        world_.FinalizeStreamingWindow(
-            centerChunkX,
-            centerChunkZ,
-            worldSettings_.chunkRadius,
-            kChunkGenerationBudgetPerPass
+    }
+    {
+        std::unique_lock lock(worldStreamingMutex_);
+        renderDrainSelection = world_.AcquirePendingRenderDrainSelection();
+    }
+    {
+        std::shared_lock lock(worldChunkMapMutex_);
+        renderDrainHandleSelection = world_.ResolvePendingRenderDrainHandles(renderDrainSelection);
+    }
+    {
+        std::shared_lock lock(worldChunkMutex_);
+        resolvedRenderDrainSelection = world_.ResolvePendingRenderDrainSelection(renderDrainHandleSelection);
+    }
+    {
+        std::unique_lock lock(worldStreamingMutex_);
+        renderUpdate = world_.FinalizePendingRenderDrainSelection(
+            renderDrainSelection,
+            std::move(resolvedRenderDrainSelection)
         );
-        renderUpdate = world_.DrainRenderUpdates();
     }
 
     UploadWorldRenderUpdate(renderUpdate);
@@ -1724,22 +1807,44 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
                         request = pendingWorldMeshRequest_;
                     }
 
-                    std::vector<MeshBuildInput> meshRequests;
+                    std::vector<DirtySubChunkId> meshRequestCandidates;
+                    DirtyMeshRequestHandleSelection meshRequestHandleSelection;
+                    DirtyMeshRequestSelection meshRequestSelection;
                     {
-                        std::unique_lock lock(worldMutex_);
+                        std::unique_lock lock(worldStreamingMutex_);
                         world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
-                        meshRequests = world_.AcquireDirtyMeshRequests(1, request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
+                        meshRequestCandidates = world_.AcquireDirtyMeshRequestCandidates(
+                            1,
+                            request.centerChunkX,
+                            request.centerChunkZ,
+                            worldSettings_.chunkRadius
+                        );
+                    }
+                    {
+                        std::shared_lock lock(worldChunkMapMutex_);
+                        meshRequestHandleSelection = world_.ResolveDirtyMeshRequestHandles(meshRequestCandidates);
+                    }
+                    {
+                        std::shared_lock lock(worldChunkMutex_);
+                        meshRequestSelection = world_.ResolveDirtyMeshRequests(meshRequestHandleSelection);
+                    }
+                    {
+                        std::unique_lock lock(worldStreamingMutex_);
+                        world_.FinalizeDirtyMeshRequests(meshRequestSelection);
                     }
 
-                    if (meshRequests.empty()) {
+                    if (meshRequestSelection.requests.empty()) {
                         std::this_thread::sleep_for(kWorldMeshWorkerYieldDelay);
                         continue;
                     }
 
-                    PreparedSubChunkMesh preparedMesh = world_.PrepareSubChunkMesh(meshRequests.front());
+                    PreparedSubChunkMesh preparedMesh = world_.PrepareSubChunkMesh(meshRequestSelection.requests.front());
                     bool hasPendingRenderUpdates = false;
                     {
-                        std::unique_lock lock(worldMutex_);
+                        std::unique_lock streamingLock(worldStreamingMutex_, std::defer_lock);
+                        std::shared_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+                        std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+                        std::lock(streamingLock, mapLock, chunkLock);
                         world_.CommitPreparedSubChunkMesh(std::move(preparedMesh));
                         hasPendingRenderUpdates = world_.HasPendingRenderUpdates();
                     }
@@ -1819,6 +1924,11 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
             std::size_t remainingStreamingWork = 0;
             std::optional<WorldRenderUpdate> renderUpdate;
             std::vector<PendingChunkId> chunkRequests;
+            std::vector<PendingChunkId> unloadCandidates;
+            std::vector<PendingChunkId> unloadedChunks;
+            PendingRenderDrainSelection renderDrainSelection;
+            PendingRenderDrainHandleSelection renderDrainHandleSelection;
+            ResolvedRenderDrainSelection resolvedRenderDrainSelection;
             std::vector<PreparedChunkColumn> preparedChunks;
             std::vector<RegionSaveTask> saveTasks;
             bool hasPendingPreparedChunks = false;
@@ -1845,12 +1955,20 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
 
             double worldMeshLockHeldMs = 0.0;
             {
-                const auto worldMeshLockStartTime = std::chrono::steady_clock::now();
-                std::unique_lock lock(worldMutex_);
+                std::unique_lock lock(worldStreamingMutex_);
                 world_.UpdateStreamingTargets(request.centerChunkX, request.centerChunkZ, worldSettings_.chunkRadius);
                 chunkRequests = world_.AcquireChunkLoadRequests(kChunkGenerationBudgetPerPass);
-                for (PreparedChunkColumn& preparedChunk : preparedChunks) {
-                    world_.CommitPreparedChunkColumn(std::move(preparedChunk));
+            }
+            {
+                const auto worldMeshLockStartTime = std::chrono::steady_clock::now();
+                {
+                    std::unique_lock streamingLock(worldStreamingMutex_, std::defer_lock);
+                    std::unique_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+                    std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+                    std::lock(streamingLock, mapLock, chunkLock);
+                    for (PreparedChunkColumn& preparedChunk : preparedChunks) {
+                        world_.CommitPreparedChunkColumn(std::move(preparedChunk));
+                    }
                 }
                 worldMeshLockHeldMs +=
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshLockStartTime).count();
@@ -1859,26 +1977,58 @@ void VulkanVoxelApp::StartWorldMeshWorker() {
             double worldMeshFinalizeMs = 0.0;
             double worldMeshRenderDrainMs = 0.0;
             {
-                const auto worldMeshLockStartTime = std::chrono::steady_clock::now();
-                std::unique_lock lock(worldMutex_);
                 const auto worldMeshFinalizeStartTime = std::chrono::steady_clock::now();
-                remainingStreamingWork = world_.FinalizeStreamingWindow(
-                    request.centerChunkX,
-                    request.centerChunkZ,
-                    worldSettings_.chunkRadius,
-                    kChunkGenerationBudgetPerPass
-                );
+                {
+                    std::unique_lock lock(worldStreamingMutex_);
+                    unloadCandidates = world_.AcquireRetiredChunkUnloadCandidates(kChunkGenerationBudgetPerPass);
+                }
+                {
+                    std::unique_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+                    std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+                    std::lock(mapLock, chunkLock);
+                    unloadedChunks = world_.ExecuteChunkUnloads(unloadCandidates);
+                }
+                {
+                    std::unique_lock lock(worldStreamingMutex_);
+                    world_.FinalizeUnloadedChunkStates(unloadedChunks);
+                    remainingStreamingWork = world_.CountRemainingStreamingWork();
+                }
                 worldMeshFinalizeMs =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshFinalizeStartTime).count();
-
-                if (world_.HasPendingRenderUpdates()) {
-                    const auto worldMeshRenderDrainStartTime = std::chrono::steady_clock::now();
-                    renderUpdate = world_.DrainRenderUpdates();
-                    worldMeshRenderDrainMs =
-                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshRenderDrainStartTime).count();
+            }
+            {
+                const auto worldMeshLockStartTime = std::chrono::steady_clock::now();
+                {
+                    std::unique_lock lock(worldStreamingMutex_);
+                    if (world_.HasPendingRenderUpdates()) {
+                        const auto worldMeshRenderDrainStartTime = std::chrono::steady_clock::now();
+                        renderDrainSelection = world_.AcquirePendingRenderDrainSelection();
+                        worldMeshRenderDrainMs =
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshRenderDrainStartTime).count();
+                    }
                 }
                 worldMeshLockHeldMs +=
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshLockStartTime).count();
+            }
+            if (!renderDrainSelection.removals.empty() || !renderDrainSelection.updates.empty()) {
+                {
+                    std::shared_lock lock(worldChunkMapMutex_);
+                    renderDrainHandleSelection = world_.ResolvePendingRenderDrainHandles(renderDrainSelection);
+                }
+                {
+                    std::shared_lock lock(worldChunkMutex_);
+                    resolvedRenderDrainSelection = world_.ResolvePendingRenderDrainSelection(renderDrainHandleSelection);
+                }
+                {
+                    const auto worldMeshLockStartTime = std::chrono::steady_clock::now();
+                    std::unique_lock lock(worldStreamingMutex_);
+                    renderUpdate = world_.FinalizePendingRenderDrainSelection(
+                        renderDrainSelection,
+                        std::move(resolvedRenderDrainSelection)
+                    );
+                    worldMeshLockHeldMs +=
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - worldMeshLockStartTime).count();
+                }
             }
             AccumulateRuntimeProfileSample(
                 worldMeshFinalizeMs,
@@ -2007,12 +2157,22 @@ void VulkanVoxelApp::ConsumeCompletedWorldMesh() {
 
         for (const PendingChunkId& removal : renderUpdate->removals) {
             ErasePendingChunkUpload(pendingWorldRenderUploads_, pendingWorldRenderUploadSet_, removal);
-            EnqueuePendingChunkId(pendingWorldRenderRemovals_, pendingWorldRenderRemovalSet_, removal);
+            EnqueuePendingChunkId(
+                pendingWorldRenderRemovals_,
+                pendingWorldRenderRemovalSet_,
+                removal,
+                immediateWorldRenderChunkSet_.contains(removal)
+            );
         }
 
         for (ChunkMeshBatchData& upload : renderUpdate->uploads) {
             ErasePendingChunkId(pendingWorldRenderRemovals_, pendingWorldRenderRemovalSet_, upload.id);
-            EnqueuePendingChunkUpload(pendingWorldRenderUploads_, pendingWorldRenderUploadSet_, std::move(upload));
+            EnqueuePendingChunkUpload(
+                pendingWorldRenderUploads_,
+                pendingWorldRenderUploadSet_,
+                std::move(upload),
+                immediateWorldRenderChunkSet_.contains(upload.id)
+            );
         }
 
         uploadedWorldMeshSerial_ = serial;
@@ -2031,6 +2191,7 @@ void VulkanVoxelApp::ConsumeCompletedWorldMesh() {
         const PendingChunkId batchId = pendingWorldRenderRemovals_[i];
         budgetedUpdate.removals.push_back(batchId);
         pendingWorldRenderRemovalSet_.erase(batchId);
+        immediateWorldRenderChunkSet_.erase(batchId);
     }
     pendingWorldRenderRemovals_.erase(
         pendingWorldRenderRemovals_.begin(),
@@ -2040,6 +2201,7 @@ void VulkanVoxelApp::ConsumeCompletedWorldMesh() {
     const std::size_t uploadCount =
         std::min<std::size_t>(pendingWorldRenderUploads_.size(), kWorldRenderUploadBudgetPerConsume);
     for (std::size_t i = 0; i < uploadCount; ++i) {
+        immediateWorldRenderChunkSet_.erase(pendingWorldRenderUploads_[i].id);
         pendingWorldRenderUploadSet_.erase(pendingWorldRenderUploads_[i].id);
         budgetedUpdate.uploads.push_back(std::move(pendingWorldRenderUploads_[i]));
     }

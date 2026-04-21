@@ -147,6 +147,7 @@ private:
     void UpdateEntityColliderBuffer();
     void BuildWorldMesh();
     void RequestWorldMeshBuild();
+    void PrioritizeImmediateRenderChunksForBlockEdit(int worldX, int worldZ);
     void StartWorldMeshWorker();
     void StopWorldMeshWorker();
     void ConsumeCompletedWorldMesh();
@@ -362,7 +363,9 @@ private:
 
     VoxelWorld world_;
     WorldSettings worldSettings_{};
-    mutable std::shared_mutex worldMutex_;
+    mutable std::shared_mutex worldStreamingMutex_;
+    mutable std::shared_mutex worldChunkMapMutex_;
+    mutable std::shared_mutex worldChunkMutex_;
     Vec3 cameraPosition_{1.0f, 400.0f, 1.0f};
     Vec3 previousPhysicsCameraPosition_{1.0f, 400.0f, 1.0f};
     float cameraYaw_ = -90.0f;
@@ -669,5 +672,6 @@ private:
     std::vector<PendingChunkId> pendingWorldRenderRemovals_;
     std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingWorldRenderUploadSet_;
     std::unordered_set<PendingChunkId, PendingChunkIdHash> pendingWorldRenderRemovalSet_;
+    std::unordered_set<PendingChunkId, PendingChunkIdHash> immediateWorldRenderChunkSet_;
     std::size_t pendingWorldRenderLoadedChunkCount_ = 0;
 };

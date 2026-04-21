@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <deque>
 #include <istream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -84,7 +85,6 @@ struct FontGlyphBitmap {
     float v0 = 0.0f;
     float u1 = 0.0f;
     float v1 = 0.0f;
-    std::vector<std::uint8_t> alpha;
 };
 
 struct BlockRaycastHit {
@@ -184,6 +184,45 @@ struct MeshBuildInput {
     std::vector<std::uint16_t> blocks;
 };
 
+struct DirtyMeshRequestSelection {
+    std::vector<MeshBuildInput> requests;
+    std::vector<DirtySubChunkId> readyIds;
+    std::vector<DirtySubChunkId> retryIds;
+};
+
+struct DirtyMeshRequestHandle {
+    DirtySubChunkId id{};
+    std::shared_ptr<const ChunkColumnData> column;
+};
+
+struct DirtyMeshRequestHandleSelection {
+    std::vector<DirtyMeshRequestHandle> readyHandles;
+    std::vector<DirtySubChunkId> retryIds;
+};
+
+struct PendingRenderDrainSelection {
+    std::vector<PendingChunkId> removals;
+    std::vector<PendingChunkId> updates;
+};
+
+struct PendingRenderDrainHandle {
+    PendingChunkId id{};
+    std::shared_ptr<const ChunkColumnData> column;
+};
+
+struct PendingRenderDrainHandleSelection {
+    std::size_t loadedChunkCount = 0;
+    std::vector<PendingChunkId> removals;
+    std::vector<PendingChunkId> missingUpdates;
+    std::vector<PendingRenderDrainHandle> updates;
+};
+
+struct ResolvedRenderDrainSelection {
+    std::size_t loadedChunkCount = 0;
+    std::vector<ChunkMeshBatchData> uploads;
+    std::vector<PendingChunkId> failedUpdates;
+};
+
 struct PreparedSubChunkMesh {
     DirtySubChunkId id{};
     std::vector<WorldQuadRecord> quads;
@@ -249,7 +288,22 @@ public:
     std::vector<PendingChunkId> AcquireChunkLoadRequests(std::size_t maxCount);
     PreparedChunkColumn PrepareChunkColumn(int chunkX, int chunkZ) const;
     bool CommitPreparedChunkColumn(PreparedChunkColumn&& prepared);
+    std::vector<DirtySubChunkId> AcquireDirtyMeshRequestCandidates(std::size_t maxCount, int centerChunkX, int centerChunkZ, int keepRadius);
+    DirtyMeshRequestHandleSelection ResolveDirtyMeshRequestHandles(const std::vector<DirtySubChunkId>& candidates) const;
+    DirtyMeshRequestSelection ResolveDirtyMeshRequests(const DirtyMeshRequestHandleSelection& handleSelection) const;
+    void FinalizeDirtyMeshRequests(const DirtyMeshRequestSelection& selection);
     std::vector<MeshBuildInput> AcquireDirtyMeshRequests(std::size_t maxCount, int centerChunkX, int centerChunkZ, int keepRadius);
+    std::size_t CountRemainingStreamingWork() const;
+    std::vector<PendingChunkId> AcquireRetiredChunkUnloadCandidates(std::size_t unloadBudget = static_cast<std::size_t>(-1));
+    std::vector<PendingChunkId> ExecuteChunkUnloads(const std::vector<PendingChunkId>& unloadCandidates);
+    void FinalizeUnloadedChunkStates(const std::vector<PendingChunkId>& unloadedChunks);
+    PendingRenderDrainSelection AcquirePendingRenderDrainSelection();
+    PendingRenderDrainHandleSelection ResolvePendingRenderDrainHandles(const PendingRenderDrainSelection& selection) const;
+    ResolvedRenderDrainSelection ResolvePendingRenderDrainSelection(const PendingRenderDrainHandleSelection& selection) const;
+    WorldRenderUpdate FinalizePendingRenderDrainSelection(
+        const PendingRenderDrainSelection& selection,
+        ResolvedRenderDrainSelection&& resolvedSelection
+    );
     PreparedSubChunkMesh PrepareSubChunkMesh(const MeshBuildInput& input) const;
     bool CommitPreparedSubChunkMesh(PreparedSubChunkMesh&& preparedMesh);
     WorldRenderUpdate DrainRenderUpdates();
@@ -259,6 +313,7 @@ public:
     void EnsureChunkColumn(int chunkX, int chunkZ);
     void EnsureRange(int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ);
     std::uint16_t GetBlock(int worldX, int worldY, int worldZ);
+    std::uint16_t GetBlock(int worldX, int worldY, int worldZ) const;
     bool SetBlock(int worldX, int worldY, int worldZ, std::uint16_t blockValue);
     void Save();
     bool CopyChunkMeshBatch(int chunkX, int chunkZ, ChunkMeshBatchData& outBatch) const;
@@ -297,6 +352,8 @@ private:
     void EnsureInitialized();
     void InitializeVoxelSubChunks(ChunkColumnData& column) const;
     void InitializeSubChunkMeshes(ChunkColumnData& column, bool dirty) const;
+    std::shared_ptr<ChunkColumnData> FindChunkColumnHandle(int chunkX, int chunkZ);
+    std::shared_ptr<const ChunkColumnData> FindChunkColumnHandle(int chunkX, int chunkZ) const;
     ChunkTaskState& GetOrCreateChunkTaskState(int chunkX, int chunkZ);
     ChunkTaskState* FindChunkTaskState(int chunkX, int chunkZ);
     const ChunkTaskState* FindChunkTaskState(int chunkX, int chunkZ) const;
@@ -304,10 +361,10 @@ private:
     std::unordered_set<PendingChunkId, PendingChunkIdHash> CollectDesiredChunks(int centerChunkX, int centerChunkZ, int keepRadius) const;
     void RebuildPendingChunkQueue(int centerChunkX, int centerChunkZ);
     void RefreshStreamingQueue(int centerChunkX, int centerChunkZ, int keepRadius);
-    void EnqueueDirtySubChunk(int chunkX, int chunkZ, int subChunkIndex);
+    void EnqueueDirtySubChunk(int chunkX, int chunkZ, int subChunkIndex, bool prioritize = false);
     void EnqueueAllDirtySubChunks(int chunkX, int chunkZ, ChunkColumnData& column);
     void RemoveQueuedDirtySubChunksForChunk(int chunkX, int chunkZ);
-    void MarkSubChunkDirty(int chunkX, int chunkZ, int subChunkIndex);
+    void MarkSubChunkDirty(int chunkX, int chunkZ, int subChunkIndex, bool prioritize = false);
     void QueueRenderChunkUpdate(int chunkX, int chunkZ);
     void QueueRenderChunkRemoval(int chunkX, int chunkZ);
     void QueueRenderUpdatesForChunk(int chunkX, int chunkZ, const ChunkColumnData& column);
@@ -339,6 +396,8 @@ private:
     static std::string GetSaveRootPath();
     static std::string GetLevelFilePath();
     static std::string GetRegionDirectoryPath();
+    static std::uint32_t CollectDirtySubChunkMask(ChunkColumnData& column);
+    static bool HasRenderableMesh(const ChunkColumnData& column);
     static std::string GetRegionFilePath(int regionX, int regionZ);
 
     bool initialized_ = false;
@@ -349,7 +408,7 @@ private:
     int streamingCenterChunkZ_ = 0;
     int streamingKeepRadius_ = 0;
     TerrainConfig terrainConfig_{}; 
-    std::unordered_map<std::int64_t, ChunkColumnData> chunkColumns_;
+    std::unordered_map<std::int64_t, std::shared_ptr<ChunkColumnData>> chunkColumns_;
     std::unordered_map<std::int64_t, ChunkTaskState> chunkTaskStates_;
     std::unordered_set<PendingChunkId, PendingChunkIdHash> desiredChunks_;
     std::deque<PendingChunkId> pendingChunkLoadQueue_;

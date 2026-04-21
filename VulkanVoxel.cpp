@@ -23,7 +23,7 @@ constexpr int kWindowWidth = 1280;
 constexpr int kWindowHeight = 720;
 constexpr int kMaxFramesInFlight = 2;
 constexpr std::size_t kMaxOverlayVertexCount = 4194304;
-constexpr double kSelectedBlockTraceIntervalSeconds = 1.0 / 60.0;
+constexpr double kSelectedBlockTraceIntervalSeconds = 1.0 / 20.0;
 constexpr float kMoveSpeed = 120.0f;
 constexpr float kWalkSpeed = 6.0f;
 constexpr float kJumpSpeed = 8.5f;
@@ -53,6 +53,20 @@ constexpr float kThirdPersonDistance = 4.5f;
 
 int GetChunkCoordinate(float worldCoordinate, int chunkSize) {
     return static_cast<int>(std::floor(worldCoordinate / static_cast<float>(chunkSize)));
+}
+
+int FloorDivInt(int value, int divisor) {
+    int quotient = value / divisor;
+    const int remainder = value % divisor;
+    if (remainder != 0 && ((remainder < 0) != (divisor < 0))) {
+        --quotient;
+    }
+    return quotient;
+}
+
+int PositiveModInt(int value, int divisor) {
+    const int remainder = value % divisor;
+    return remainder < 0 ? remainder + divisor : remainder;
 }
 
 bool HasOverlayGlyph(const std::array<FontGlyphBitmap, 128>& glyphs, char c) {
@@ -512,7 +526,8 @@ BlockRaycastHit VulkanVoxelApp::TraceSelectedBlock() {
     int previousZ = z;
 
     const auto waitStartTime = std::chrono::steady_clock::now();
-    std::shared_lock lock(worldMutex_);
+    std::shared_lock mapLock(worldChunkMapMutex_);
+    std::shared_lock chunkLock(worldChunkMutex_);
     const double waitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStartTime).count();
     AccumulateRuntimeProfileSample(
         waitMs,
@@ -591,7 +606,7 @@ void VulkanVoxelApp::InitVulkan() {
         gFatalStage = "UpdateStreamingTargets";
         const int centerChunkX = static_cast<int>(std::floor(cameraPosition_.x / static_cast<float>(kChunkSizeX)));
         const int centerChunkZ = static_cast<int>(std::floor(cameraPosition_.z / static_cast<float>(kChunkSizeZ)));
-        std::unique_lock lock(worldMutex_);
+        std::unique_lock lock(worldStreamingMutex_);
         world_.UpdateStreamingTargets(centerChunkX, centerChunkZ, worldSettings_.chunkRadius);
     }
     gFatalStage = "CreateInstance";
@@ -693,7 +708,10 @@ void VulkanVoxelApp::Cleanup() {
     }
 
     try {
-        std::unique_lock lock(worldMutex_);
+        std::unique_lock streamingLock(worldStreamingMutex_, std::defer_lock);
+        std::unique_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+        std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+        std::lock(streamingLock, mapLock, chunkLock);
         world_.Save();
     } catch (const std::exception& e) {
         OutputDebugStringA(e.what());
@@ -1185,7 +1203,10 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
     if (isLeftMousePressed && !previousLeftMousePressed_ && selectedBlockHit_.has_value()) {
         bool changed = false;
         {
-            std::unique_lock lock(worldMutex_);
+            std::unique_lock streamingLock(worldStreamingMutex_, std::defer_lock);
+            std::unique_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+            std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+            std::lock(streamingLock, mapLock, chunkLock);
             changed = world_.SetBlock(
                 selectedBlockHit_->blockX,
                 selectedBlockHit_->blockY,
@@ -1194,6 +1215,10 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
             );
         }
         if (changed) {
+            PrioritizeImmediateRenderChunksForBlockEdit(
+                selectedBlockHit_->blockX,
+                selectedBlockHit_->blockZ
+            );
             RequestWorldMeshBuild();
         }
     }
@@ -1202,13 +1227,17 @@ void VulkanVoxelApp::ProcessInput(float deltaTime) {
         const BlockRaycastHit& hit = *selectedBlockHit_;
         bool changed = false;
         {
-            std::unique_lock lock(worldMutex_);
+            std::unique_lock streamingLock(worldStreamingMutex_, std::defer_lock);
+            std::unique_lock mapLock(worldChunkMapMutex_, std::defer_lock);
+            std::unique_lock chunkLock(worldChunkMutex_, std::defer_lock);
+            std::lock(streamingLock, mapLock, chunkLock);
             if (VoxelWorld::IsInsideWorld(hit.placeX, hit.placeY, hit.placeZ) &&
                 world_.GetBlock(hit.placeX, hit.placeY, hit.placeZ) == 0) {
                 changed = world_.SetBlock(hit.placeX, hit.placeY, hit.placeZ, 1);
             }
         }
         if (changed) {
+            PrioritizeImmediateRenderChunksForBlockEdit(hit.placeX, hit.placeZ);
             RequestWorldMeshBuild();
         }
     }
@@ -1259,7 +1288,8 @@ void VulkanVoxelApp::StepFixedPhysics() {
 
     {
         const auto collisionWaitStartTime = std::chrono::steady_clock::now();
-        std::shared_lock lock(worldMutex_);
+        std::shared_lock mapLock(worldChunkMapMutex_);
+        std::shared_lock chunkLock(worldChunkMutex_);
         const auto collisionWorkStartTime = std::chrono::steady_clock::now();
         AccumulateRuntimeProfileSample(
             std::chrono::duration<double, std::milli>(collisionWorkStartTime - collisionWaitStartTime).count(),
@@ -1372,7 +1402,8 @@ Vec3 VulkanVoxelApp::GetRenderCameraPosition() {
     const int stepCount = std::max(1, static_cast<int>(std::ceil(cameraDistance / 0.1f)));
     Vec3 lastFreePosition = baseCameraPosition;
 
-    std::shared_lock lock(worldMutex_);
+    std::shared_lock mapLock(worldChunkMapMutex_);
+    std::shared_lock chunkLock(worldChunkMutex_);
     for (int step = 1; step <= stepCount; ++step) {
         const float t = static_cast<float>(step) / static_cast<float>(stepCount);
         const Vec3 sample = baseCameraPosition + cameraDelta * t;
@@ -1412,6 +1443,31 @@ void VulkanVoxelApp::UpdateWorldMeshIfNeeded() {
     lastMeshChunkX_ = chunkX;
     lastMeshChunkZ_ = chunkZ;
     RequestWorldMeshBuild();
+}
+
+void VulkanVoxelApp::PrioritizeImmediateRenderChunksForBlockEdit(int worldX, int worldZ) {
+    const int chunkX = FloorDivInt(worldX, kChunkSizeX);
+    const int chunkZ = FloorDivInt(worldZ, kChunkSizeZ);
+    const int localX = PositiveModInt(worldX, kChunkSizeX);
+    const int localZ = PositiveModInt(worldZ, kChunkSizeZ);
+
+    auto enqueueChunk = [this](int targetChunkX, int targetChunkZ) {
+        immediateWorldRenderChunkSet_.insert(PendingChunkId{targetChunkX, targetChunkZ});
+    };
+
+    enqueueChunk(chunkX, chunkZ);
+    if (localX == 0) {
+        enqueueChunk(chunkX - 1, chunkZ);
+    }
+    if (localX == kChunkSizeX - 1) {
+        enqueueChunk(chunkX + 1, chunkZ);
+    }
+    if (localZ == 0) {
+        enqueueChunk(chunkX, chunkZ - 1);
+    }
+    if (localZ == kChunkSizeZ - 1) {
+        enqueueChunk(chunkX, chunkZ + 1);
+    }
 }
 
 void VulkanVoxelApp::UpdateOverlayText(float deltaTime) {

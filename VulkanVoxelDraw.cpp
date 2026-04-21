@@ -120,7 +120,14 @@ void VulkanVoxelApp::DrawFrame() {
     imagesInFlight_[imageIndex] = inFlightFences_[currentFrame_];
 
     if (screenshotRequested_) {
-        PrepareScreenshotCapture();
+        try {
+            PrepareScreenshotCapture();
+        } catch (const std::exception& e) {
+            OutputDebugStringA(e.what());
+            OutputDebugStringA("\n");
+            screenshotRequested_ = false;
+            screenshotCapturePending_ = false;
+        }
     }
 
     vkResetFences(device_, 1, &inFlightFences_[currentFrame_]);

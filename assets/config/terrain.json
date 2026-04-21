@@ -3,7 +3,7 @@
   "wrap_size_xz": 65536,
   "base_height": 192.0,
   "solid_threshold": 0.0,
-  "gradient_strength": 1.0,
+  "gradient_strength": 0.5,
   "density_amplitude": 32.0,
   "feature_scale_xz": 128.0,
   "feature_scale_y": 96.0,

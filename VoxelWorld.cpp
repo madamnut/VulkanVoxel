@@ -915,14 +915,17 @@ bool VoxelWorld::CommitPreparedChunkColumn(PreparedChunkColumn&& prepared) {
         saveDirty_ = true;
     }
 
-    auto [it, inserted] = chunkColumns_.emplace(chunkKey, std::move(prepared.column));
+    auto [it, inserted] = chunkColumns_.emplace(
+        chunkKey,
+        std::make_shared<ChunkColumnData>(std::move(prepared.column))
+    );
     (void)inserted;
     state.resident = true;
     state.retireRequested = !state.desired;
 
     renderStatsDirty_ = true;
     if (state.desired) {
-        EnqueueAllDirtySubChunks(prepared.id.chunkX, prepared.id.chunkZ, it->second);
+        EnqueueAllDirtySubChunks(prepared.id.chunkX, prepared.id.chunkZ, *it->second);
         if (!HasPendingMeshWorkForChunk(prepared.id.chunkX, prepared.id.chunkZ)) {
             QueueRenderChunkUpdate(prepared.id.chunkX, prepared.id.chunkZ);
         }
@@ -930,14 +933,19 @@ bool VoxelWorld::CommitPreparedChunkColumn(PreparedChunkColumn&& prepared) {
     return true;
 }
 
-std::vector<MeshBuildInput> VoxelWorld::AcquireDirtyMeshRequests(std::size_t maxCount, int centerChunkX, int centerChunkZ, int keepRadius) {
+std::vector<DirtySubChunkId> VoxelWorld::AcquireDirtyMeshRequestCandidates(
+    std::size_t maxCount,
+    int centerChunkX,
+    int centerChunkZ,
+    int keepRadius
+) {
     EnsureInitialized();
 
-    std::vector<MeshBuildInput> requests;
-    requests.reserve(maxCount);
+    std::vector<DirtySubChunkId> candidates;
+    candidates.reserve(maxCount);
 
     const std::size_t initialQueueCount = dirtySubChunkQueue_.size();
-    for (std::size_t iteration = 0; iteration < initialQueueCount && requests.size() < maxCount; ++iteration) {
+    for (std::size_t iteration = 0; iteration < initialQueueCount && candidates.size() < maxCount; ++iteration) {
         if (dirtySubChunkQueue_.empty()) {
             break;
         }
@@ -966,17 +974,57 @@ std::vector<MeshBuildInput> VoxelWorld::AcquireDirtyMeshRequests(std::size_t max
             continue;
         }
 
-        const auto columnIt = chunkColumns_.find(MakeChunkKey(id.chunkX, id.chunkZ));
-        if (columnIt == chunkColumns_.end()) {
-            requeueIfStillRelevant();
+        candidates.push_back(id);
+    }
+
+    return candidates;
+}
+
+DirtyMeshRequestHandleSelection VoxelWorld::ResolveDirtyMeshRequestHandles(const std::vector<DirtySubChunkId>& candidates) const {
+    DirtyMeshRequestHandleSelection selection{};
+    selection.readyHandles.reserve(candidates.size());
+    selection.retryIds.reserve(candidates.size());
+
+    for (const DirtySubChunkId& id : candidates) {
+        if (id.subChunkIndex < 0 || id.subChunkIndex >= kSubChunkCountY) {
             continue;
         }
-        if (columnIt->second.subChunkMeshes.size() != kSubChunkCountY ||
-            columnIt->second.subChunks.size() != kSubChunkCountY) {
-            requeueIfStillRelevant();
+
+        std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(id.chunkX, id.chunkZ);
+        if (!columnHandle) {
+            selection.retryIds.push_back(id);
             continue;
         }
-        if (!columnIt->second.subChunkMeshes[static_cast<std::size_t>(id.subChunkIndex)].dirty) {
+        if (columnHandle->subChunkMeshes.size() != kSubChunkCountY ||
+            columnHandle->subChunks.size() != kSubChunkCountY) {
+            selection.retryIds.push_back(id);
+            continue;
+        }
+        if (!columnHandle->subChunkMeshes[static_cast<std::size_t>(id.subChunkIndex)].dirty) {
+            continue;
+        }
+
+        selection.readyHandles.push_back({id, std::move(columnHandle)});
+    }
+
+    return selection;
+}
+
+DirtyMeshRequestSelection VoxelWorld::ResolveDirtyMeshRequests(const DirtyMeshRequestHandleSelection& handleSelection) const {
+    DirtyMeshRequestSelection selection{};
+    selection.requests.reserve(handleSelection.readyHandles.size());
+    selection.readyIds.reserve(handleSelection.readyHandles.size());
+    selection.retryIds = handleSelection.retryIds;
+
+    for (const DirtyMeshRequestHandle& handle : handleSelection.readyHandles) {
+        const DirtySubChunkId& id = handle.id;
+        const ChunkColumnData& column = *handle.column;
+        if (column.subChunkMeshes.size() != kSubChunkCountY ||
+            column.subChunks.size() != kSubChunkCountY) {
+            selection.retryIds.push_back(id);
+            continue;
+        }
+        if (!column.subChunkMeshes[static_cast<std::size_t>(id.subChunkIndex)].dirty) {
             continue;
         }
 
@@ -996,11 +1044,44 @@ std::vector<MeshBuildInput> VoxelWorld::AcquireDirtyMeshRequests(std::size_t max
             }
         }
 
-        state.dirtyInFlightMask |= dirtyBit;
-        requests.push_back(std::move(input));
+        selection.readyIds.push_back(id);
+        selection.requests.push_back(std::move(input));
     }
 
-    return requests;
+    return selection;
+}
+
+void VoxelWorld::FinalizeDirtyMeshRequests(const DirtyMeshRequestSelection& selection) {
+    EnsureInitialized();
+
+    for (const DirtySubChunkId& id : selection.readyIds) {
+        if (ChunkTaskState* state = FindChunkTaskState(id.chunkX, id.chunkZ)) {
+            state->dirtyInFlightMask |= GetSubChunkBit(id.subChunkIndex);
+        }
+    }
+
+    for (const DirtySubChunkId& id : selection.retryIds) {
+        ChunkTaskState* state = FindChunkTaskState(id.chunkX, id.chunkZ);
+        if (state == nullptr) {
+            continue;
+        }
+
+        if (state->desired || state->loadInFlight || (state->resident && !state->retireRequested)) {
+            EnqueueDirtySubChunk(id.chunkX, id.chunkZ, id.subChunkIndex);
+        }
+    }
+}
+
+std::vector<MeshBuildInput> VoxelWorld::AcquireDirtyMeshRequests(std::size_t maxCount, int centerChunkX, int centerChunkZ, int keepRadius) {
+    EnsureInitialized();
+
+    const std::vector<DirtySubChunkId> candidates =
+        AcquireDirtyMeshRequestCandidates(maxCount, centerChunkX, centerChunkZ, keepRadius);
+    DirtyMeshRequestHandleSelection handleSelection = ResolveDirtyMeshRequestHandles(candidates);
+    DirtyMeshRequestSelection selection = ResolveDirtyMeshRequests(handleSelection);
+    FinalizeDirtyMeshRequests(selection);
+
+    return std::move(selection.requests);
 }
 
 PreparedSubChunkMesh VoxelWorld::PrepareSubChunkMesh(const MeshBuildInput& input) const {
@@ -1030,39 +1111,95 @@ bool VoxelWorld::CommitPreparedSubChunkMesh(PreparedSubChunkMesh&& preparedMesh)
         state->dirtyInFlightMask &= ~dirtyBit;
     }
 
-    const auto columnIt = chunkColumns_.find(MakeChunkKey(id.chunkX, id.chunkZ));
-    if (columnIt == chunkColumns_.end()) {
+    std::shared_ptr<ChunkColumnData> columnHandle = FindChunkColumnHandle(id.chunkX, id.chunkZ);
+    if (!columnHandle) {
         MaybeCleanupChunkTaskState(id.chunkX, id.chunkZ);
         return false;
     }
     if (id.subChunkIndex < 0 || id.subChunkIndex >= kSubChunkCountY) {
         return false;
     }
-    if (columnIt->second.subChunkMeshes.size() != kSubChunkCountY) {
+    if (columnHandle->subChunkMeshes.size() != kSubChunkCountY) {
         return false;
     }
 
-    SubChunkMeshData& mesh = columnIt->second.subChunkMeshes[static_cast<std::size_t>(id.subChunkIndex)];
+    SubChunkMeshData& mesh = columnHandle->subChunkMeshes[static_cast<std::size_t>(id.subChunkIndex)];
     mesh.quads = std::move(preparedMesh.quads);
     mesh.dirty = state != nullptr && (state->dirtyQueuedMask & dirtyBit) != 0;
     ++mesh.revision;
-    if (!HasPendingMeshWorkForChunk(id.chunkX, id.chunkZ)) {
-        QueueRenderChunkUpdate(id.chunkX, id.chunkZ);
-    }
+    QueueRenderChunkUpdate(id.chunkX, id.chunkZ);
     MaybeCleanupChunkTaskState(id.chunkX, id.chunkZ);
     return true;
 }
 
-WorldRenderUpdate VoxelWorld::DrainRenderUpdates() {
+PendingRenderDrainSelection VoxelWorld::AcquirePendingRenderDrainSelection() {
+    EnsureInitialized();
+
+    PendingRenderDrainSelection selection{};
+    selection.removals.reserve(pendingRenderChunkRemovals_.size());
+    while (!pendingRenderChunkRemovals_.empty()) {
+        selection.removals.push_back(pendingRenderChunkRemovals_.front());
+        pendingRenderChunkRemovals_.pop_front();
+    }
+
+    selection.updates.reserve(pendingRenderChunkUpdates_.size());
+    while (!pendingRenderChunkUpdates_.empty()) {
+        selection.updates.push_back(pendingRenderChunkUpdates_.front());
+        pendingRenderChunkUpdates_.pop_front();
+    }
+
+    return selection;
+}
+
+PendingRenderDrainHandleSelection VoxelWorld::ResolvePendingRenderDrainHandles(const PendingRenderDrainSelection& selection) const {
+    PendingRenderDrainHandleSelection resolved{};
+    resolved.loadedChunkCount = chunkColumns_.size();
+    resolved.removals = selection.removals;
+    resolved.updates.reserve(selection.updates.size());
+    resolved.missingUpdates.reserve(selection.updates.size());
+
+    for (const PendingChunkId& chunkId : selection.updates) {
+        std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkId.chunkX, chunkId.chunkZ);
+        if (!columnHandle) {
+            resolved.missingUpdates.push_back(chunkId);
+            continue;
+        }
+        resolved.updates.push_back({chunkId, std::move(columnHandle)});
+    }
+
+    return resolved;
+}
+
+ResolvedRenderDrainSelection VoxelWorld::ResolvePendingRenderDrainSelection(const PendingRenderDrainHandleSelection& selection) const {
+    ResolvedRenderDrainSelection resolved{};
+    resolved.loadedChunkCount = selection.loadedChunkCount;
+    resolved.uploads.reserve(selection.updates.size());
+    resolved.failedUpdates = selection.missingUpdates;
+
+    for (const PendingRenderDrainHandle& handle : selection.updates) {
+        const PendingChunkId& chunkId = handle.id;
+        ChunkMeshBatchData batch{};
+        if (CopyChunkMeshBatch(chunkId.chunkX, chunkId.chunkZ, batch)) {
+            resolved.uploads.push_back(std::move(batch));
+        } else {
+            resolved.failedUpdates.push_back(chunkId);
+        }
+    }
+
+    return resolved;
+}
+
+WorldRenderUpdate VoxelWorld::FinalizePendingRenderDrainSelection(
+    const PendingRenderDrainSelection& selection,
+    ResolvedRenderDrainSelection&& resolvedSelection
+) {
     EnsureInitialized();
 
     WorldRenderUpdate update{};
-    update.loadedChunkCount = chunkColumns_.size();
+    update.loadedChunkCount = resolvedSelection.loadedChunkCount;
 
-    update.removals.reserve(pendingRenderChunkRemovals_.size());
-    while (!pendingRenderChunkRemovals_.empty()) {
-        const PendingChunkId chunkId = pendingRenderChunkRemovals_.front();
-        pendingRenderChunkRemovals_.pop_front();
+    update.removals.reserve(selection.removals.size());
+    for (const PendingChunkId& chunkId : selection.removals) {
         ChunkTaskState* state = FindChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
         if (state == nullptr || !state->renderRemovalQueued) {
             MaybeCleanupChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
@@ -1073,10 +1210,10 @@ WorldRenderUpdate VoxelWorld::DrainRenderUpdates() {
         update.removals.push_back(chunkId);
         MaybeCleanupChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
     }
-    update.uploads.reserve(pendingRenderChunkUpdates_.size());
-    while (!pendingRenderChunkUpdates_.empty()) {
-        const PendingChunkId chunkId = pendingRenderChunkUpdates_.front();
-        pendingRenderChunkUpdates_.pop_front();
+
+    update.uploads.reserve(resolvedSelection.uploads.size());
+    for (ChunkMeshBatchData& batch : resolvedSelection.uploads) {
+        const PendingChunkId chunkId = batch.id;
         ChunkTaskState* state = FindChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
         if (state == nullptr || !state->renderUpdateQueued) {
             MaybeCleanupChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
@@ -1084,17 +1221,23 @@ WorldRenderUpdate VoxelWorld::DrainRenderUpdates() {
         }
 
         state->renderUpdateQueued = false;
-        ChunkMeshBatchData batch{};
-        if (CopyChunkMeshBatch(chunkId.chunkX, chunkId.chunkZ, batch)) {
-            update.uploads.push_back(std::move(batch));
+        update.uploads.push_back(std::move(batch));
+        MaybeCleanupChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
+    }
+
+    for (const PendingChunkId& chunkId : resolvedSelection.failedUpdates) {
+        ChunkTaskState* state = FindChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
+        if (state == nullptr || !state->renderUpdateQueued) {
             MaybeCleanupChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
             continue;
         }
 
+        state->renderUpdateQueued = false;
         if (state->desired &&
             state->resident &&
-            (state->renderActive || HasPendingMeshWorkForChunk(chunkId.chunkX, chunkId.chunkZ) || state->loadInFlight)) {
-            QueueRenderChunkUpdate(chunkId.chunkX, chunkId.chunkZ);
+            (state->renderActive || state->loadInFlight || state->dirtyQueuedMask != 0 || state->dirtyInFlightMask != 0)) {
+            state->renderUpdateQueued = true;
+            pendingRenderChunkUpdates_.push_back(chunkId);
         }
         MaybeCleanupChunkTaskState(chunkId.chunkX, chunkId.chunkZ);
     }
@@ -1103,15 +1246,18 @@ WorldRenderUpdate VoxelWorld::DrainRenderUpdates() {
     return update;
 }
 
+WorldRenderUpdate VoxelWorld::DrainRenderUpdates() {
+    PendingRenderDrainSelection selection = AcquirePendingRenderDrainSelection();
+    PendingRenderDrainHandleSelection handleSelection = ResolvePendingRenderDrainHandles(selection);
+    ResolvedRenderDrainSelection resolvedSelection = ResolvePendingRenderDrainSelection(handleSelection);
+    return FinalizePendingRenderDrainSelection(selection, std::move(resolvedSelection));
+}
+
 bool VoxelWorld::HasPendingRenderUpdates() const {
     return renderStatsDirty_ || !pendingRenderChunkUpdates_.empty() || !pendingRenderChunkRemovals_.empty();
 }
 
-std::size_t VoxelWorld::FinalizeStreamingWindow(int centerChunkX, int centerChunkZ, int keepRadius, std::size_t unloadBudget) {
-    (void)centerChunkX;
-    (void)centerChunkZ;
-    (void)keepRadius;
-
+std::size_t VoxelWorld::CountRemainingStreamingWork() const {
     std::size_t inFlightLoadCount = 0;
     std::size_t inFlightDirtyCount = 0;
     std::size_t retiringCount = 0;
@@ -1130,8 +1276,41 @@ std::size_t VoxelWorld::FinalizeStreamingWindow(int centerChunkX, int centerChun
 
     const std::size_t remainingMissingCount = pendingChunkLoadQueue_.size() + inFlightLoadCount;
     const std::size_t remainingDirtyCount = dirtySubChunkQueue_.size() + inFlightDirtyCount;
-    UnloadRetiredChunks(unloadBudget);
     return remainingMissingCount + remainingDirtyCount + retiringCount;
+}
+
+std::vector<PendingChunkId> VoxelWorld::AcquireRetiredChunkUnloadCandidates(std::size_t unloadBudget) {
+    std::vector<PendingChunkId> unloads;
+    unloads.reserve(chunkTaskStates_.size());
+    for (const auto& [chunkKey, state] : chunkTaskStates_) {
+        (void)chunkKey;
+        if (unloads.size() >= unloadBudget) {
+            break;
+        }
+
+        if (!state.resident || state.desired || !state.retireRequested || state.loadInFlight || state.dirtyInFlightMask != 0) {
+            continue;
+        }
+
+        const std::uint64_t unsignedKey = static_cast<std::uint64_t>(chunkKey);
+        unloads.push_back({
+            static_cast<std::int32_t>(static_cast<std::uint32_t>(unsignedKey >> 32)),
+            static_cast<std::int32_t>(static_cast<std::uint32_t>(unsignedKey))
+        });
+    }
+
+    return unloads;
+}
+
+std::size_t VoxelWorld::FinalizeStreamingWindow(int centerChunkX, int centerChunkZ, int keepRadius, std::size_t unloadBudget) {
+    (void)centerChunkX;
+    (void)centerChunkZ;
+    (void)keepRadius;
+
+    std::vector<PendingChunkId> unloads = AcquireRetiredChunkUnloadCandidates(unloadBudget);
+    unloads = ExecuteChunkUnloads(unloads);
+    FinalizeUnloadedChunkStates(unloads);
+    return CountRemainingStreamingWork();
 }
 
 std::size_t VoxelWorld::UpdateStreamingWindow(int centerChunkX, int centerChunkZ, int keepRadius, std::size_t generationBudget) {
@@ -1167,14 +1346,17 @@ void VoxelWorld::EnsureChunkColumn(int chunkX, int chunkZ) {
         saveDirty_ = true;
     }
 
-    auto [it, inserted] = chunkColumns_.emplace(chunkKey, std::move(column));
+    auto [it, inserted] = chunkColumns_.emplace(
+        chunkKey,
+        std::make_shared<ChunkColumnData>(std::move(column))
+    );
     (void)inserted;
     ChunkTaskState& state = GetOrCreateChunkTaskState(chunkX, chunkZ);
     state.resident = true;
     state.desired = desiredChunks_.contains(PendingChunkId{chunkX, chunkZ});
     state.retireRequested = !state.desired;
     if (state.desired) {
-        EnqueueAllDirtySubChunks(chunkX, chunkZ, it->second);
+        EnqueueAllDirtySubChunks(chunkX, chunkZ, *it->second);
     }
 }
 
@@ -1198,6 +1380,16 @@ void VoxelWorld::EnsureInitialized() {
     EnsureTerrainConfigLoaded();
     LoadOrCreateSave();
     initialized_ = true;
+}
+
+std::shared_ptr<ChunkColumnData> VoxelWorld::FindChunkColumnHandle(int chunkX, int chunkZ) {
+    const auto it = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
+    return it == chunkColumns_.end() ? nullptr : it->second;
+}
+
+std::shared_ptr<const ChunkColumnData> VoxelWorld::FindChunkColumnHandle(int chunkX, int chunkZ) const {
+    const auto it = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
+    return it == chunkColumns_.end() ? nullptr : it->second;
 }
 
 ChunkTaskState& VoxelWorld::GetOrCreateChunkTaskState(int chunkX, int chunkZ) {
@@ -1363,28 +1555,39 @@ void VoxelWorld::RefreshStreamingQueue(int centerChunkX, int centerChunkZ, int k
 
         const auto columnIt = chunkColumns_.find(MakeChunkKey(id.chunkX, id.chunkZ));
         if (columnIt != chunkColumns_.end()) {
-            EnqueueAllDirtySubChunks(id.chunkX, id.chunkZ, columnIt->second);
-            QueueRenderUpdatesForChunk(id.chunkX, id.chunkZ, columnIt->second);
+            EnqueueAllDirtySubChunks(id.chunkX, id.chunkZ, *columnIt->second);
+            QueueRenderUpdatesForChunk(id.chunkX, id.chunkZ, *columnIt->second);
         }
     }
 
     RebuildPendingChunkQueue(centerChunkX, centerChunkZ);
 }
 
-void VoxelWorld::EnqueueDirtySubChunk(int chunkX, int chunkZ, int subChunkIndex) {
+void VoxelWorld::EnqueueDirtySubChunk(int chunkX, int chunkZ, int subChunkIndex, bool prioritize) {
     if (subChunkIndex < 0 || subChunkIndex >= kSubChunkCountY) {
         return;
     }
 
     ChunkTaskState& state = GetOrCreateChunkTaskState(chunkX, chunkZ);
     const std::uint32_t dirtyBit = GetSubChunkBit(subChunkIndex);
+    const DirtySubChunkId id{chunkX, chunkZ, subChunkIndex};
     if ((state.dirtyQueuedMask & dirtyBit) != 0) {
+        if (prioritize) {
+            dirtySubChunkQueue_.erase(
+                std::remove(dirtySubChunkQueue_.begin(), dirtySubChunkQueue_.end(), id),
+                dirtySubChunkQueue_.end()
+            );
+            dirtySubChunkQueue_.push_front(id);
+        }
         return;
     }
 
     state.dirtyQueuedMask |= dirtyBit;
-    const DirtySubChunkId id{chunkX, chunkZ, subChunkIndex};
-    dirtySubChunkQueue_.push_back(id);
+    if (prioritize) {
+        dirtySubChunkQueue_.push_front(id);
+    } else {
+        dirtySubChunkQueue_.push_back(id);
+    }
 }
 
 void VoxelWorld::EnqueueAllDirtySubChunks(int chunkX, int chunkZ, ChunkColumnData& column) {
@@ -1443,27 +1646,27 @@ void VoxelWorld::RemoveQueuedDirtySubChunksForChunk(int chunkX, int chunkZ) {
     dirtySubChunkQueue_ = std::move(retainedQueue);
 }
 
-void VoxelWorld::MarkSubChunkDirty(int chunkX, int chunkZ, int subChunkIndex) {
+void VoxelWorld::MarkSubChunkDirty(int chunkX, int chunkZ, int subChunkIndex, bool prioritize) {
     if (subChunkIndex < 0 || subChunkIndex >= kSubChunkCountY) {
         return;
     }
 
-    const auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
-    if (columnIt == chunkColumns_.end()) {
+    std::shared_ptr<ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
+    if (!columnHandle) {
         return;
     }
 
-    if (columnIt->second.subChunkMeshes.size() != kSubChunkCountY) {
-        InitializeSubChunkMeshes(columnIt->second, true);
-        EnqueueAllDirtySubChunks(chunkX, chunkZ, columnIt->second);
+    if (columnHandle->subChunkMeshes.size() != kSubChunkCountY) {
+        InitializeSubChunkMeshes(*columnHandle, true);
+        EnqueueAllDirtySubChunks(chunkX, chunkZ, *columnHandle);
         return;
     }
 
-    SubChunkMeshData& subChunkMesh = columnIt->second.subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
+    SubChunkMeshData& subChunkMesh = columnHandle->subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
     subChunkMesh.dirty = true;
     const ChunkTaskState* state = FindChunkTaskState(chunkX, chunkZ);
     if (state == nullptr || (state->desired && !state->retireRequested)) {
-        EnqueueDirtySubChunk(chunkX, chunkZ, subChunkIndex);
+        EnqueueDirtySubChunk(chunkX, chunkZ, subChunkIndex, prioritize);
     }
 }
 
@@ -1474,12 +1677,12 @@ bool VoxelWorld::HasPendingMeshWorkForChunk(int chunkX, int chunkZ) const {
         }
     }
 
-    const auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
-    if (columnIt == chunkColumns_.end() || columnIt->second.subChunkMeshes.size() != kSubChunkCountY) {
+    const std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
+    if (!columnHandle || columnHandle->subChunkMeshes.size() != kSubChunkCountY) {
         return false;
     }
 
-    for (const SubChunkMeshData& mesh : columnIt->second.subChunkMeshes) {
+    for (const SubChunkMeshData& mesh : columnHandle->subChunkMeshes) {
         if (mesh.dirty) {
             return true;
         }
@@ -1489,28 +1692,20 @@ bool VoxelWorld::HasPendingMeshWorkForChunk(int chunkX, int chunkZ) const {
 }
 
 void VoxelWorld::QueueRenderChunkUpdate(int chunkX, int chunkZ) {
+    const std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
+    if (!columnHandle || columnHandle->subChunkMeshes.size() != kSubChunkCountY) {
+        return;
+    }
+
     const PendingChunkId chunkId{chunkX, chunkZ};
     ChunkTaskState& state = GetOrCreateChunkTaskState(chunkX, chunkZ);
     if (!state.desired || !state.resident) {
         return;
     }
 
-    const auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
-    if (columnIt == chunkColumns_.end() || columnIt->second.subChunkMeshes.size() != kSubChunkCountY) {
-        return;
-    }
-
-    bool hasRenderableMesh = false;
-    for (const SubChunkMeshData& mesh : columnIt->second.subChunkMeshes) {
-        if (!mesh.quads.empty()) {
-            hasRenderableMesh = true;
-            break;
-        }
-    }
-
     state.renderRemovalQueued = false;
 
-    if (!hasRenderableMesh) {
+    if (!HasRenderableMesh(*columnHandle)) {
         if (state.renderActive) {
             state.renderActive = false;
             state.renderUpdateQueued = false;
@@ -1553,6 +1748,11 @@ void VoxelWorld::QueueRenderUpdatesForChunk(int chunkX, int chunkZ, const ChunkC
 }
 
 void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
+    const std::vector<PendingChunkId> unloads = AcquireRetiredChunkUnloadCandidates(unloadBudget);
+    FinalizeUnloadedChunkStates(ExecuteChunkUnloads(unloads));
+}
+
+std::vector<PendingChunkId> VoxelWorld::ExecuteChunkUnloads(const std::vector<PendingChunkId>& unloadCandidates) {
     const auto unloadStartTime = Clock::now();
     struct PendingUnload {
         int chunkX = 0;
@@ -1560,26 +1760,16 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
     };
 
     std::vector<PendingUnload> unloads;
-    unloads.reserve(chunkTaskStates_.size());
-    for (const auto& [chunkKey, state] : chunkTaskStates_) {
-        (void)chunkKey;
-        if (unloads.size() >= unloadBudget) {
-            break;
-        }
-
-        if (!state.resident || state.desired || !state.retireRequested || state.loadInFlight || state.dirtyInFlightMask != 0) {
-            continue;
-        }
-
-        const std::uint64_t unsignedKey = static_cast<std::uint64_t>(chunkKey);
+    unloads.reserve(unloadCandidates.size());
+    for (const PendingChunkId& unloadCandidate : unloadCandidates) {
         unloads.push_back({
-            static_cast<std::int32_t>(static_cast<std::uint32_t>(unsignedKey >> 32)),
-            static_cast<std::int32_t>(static_cast<std::uint32_t>(unsignedKey))
+            unloadCandidate.chunkX,
+            unloadCandidate.chunkZ
         });
     }
 
     if (unloads.empty()) {
-        return;
+        return {};
     }
 
     struct RegionUnloadGroup {
@@ -1598,6 +1788,8 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
         group.chunks.push_back(unload);
     }
 
+    std::vector<PendingChunkId> unloadedChunks;
+    unloadedChunks.reserve(unloads.size());
     std::size_t unloadedChunkCount = 0;
     for (auto& [regionKey, group] : unloadRegions) {
         (void)regionKey;
@@ -1606,15 +1798,15 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
         saveTask.regionZ = group.regionZ;
 
         for (const PendingUnload& unload : group.chunks) {
-            auto columnIt = chunkColumns_.find(MakeChunkKey(unload.chunkX, unload.chunkZ));
-            if (columnIt == chunkColumns_.end()) {
+            std::shared_ptr<ChunkColumnData> columnHandle = FindChunkColumnHandle(unload.chunkX, unload.chunkZ);
+            if (!columnHandle) {
                 continue;
             }
 
-            if (columnIt->second.modified) {
+            if (columnHandle->modified) {
                 RegionSaveChunkSnapshot snapshot{};
                 snapshot.id = {unload.chunkX, unload.chunkZ};
-                snapshot.column = columnIt->second;
+                snapshot.column = *columnHandle;
                 {
                     std::lock_guard lock(pendingSaveMutex_);
                     snapshot.generation = nextPendingSaveGeneration_++;
@@ -1631,28 +1823,19 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
         }
 
         for (const PendingUnload& unload : group.chunks) {
-            auto columnIt = chunkColumns_.find(MakeChunkKey(unload.chunkX, unload.chunkZ));
-            if (columnIt == chunkColumns_.end()) {
+            const std::int64_t chunkKey = MakeChunkKey(unload.chunkX, unload.chunkZ);
+            std::shared_ptr<ChunkColumnData> columnHandle = FindChunkColumnHandle(unload.chunkX, unload.chunkZ);
+            if (!columnHandle) {
+                unloadedChunks.push_back({unload.chunkX, unload.chunkZ});
                 continue;
             }
 
-            if (columnIt->second.modified) {
-                columnIt->second.modified = false;
+            if (columnHandle->modified) {
+                columnHandle->modified = false;
             }
-            QueueRenderChunkRemoval(unload.chunkX, unload.chunkZ);
-            RemoveQueuedDirtySubChunksForChunk(unload.chunkX, unload.chunkZ);
-            chunkColumns_.erase(columnIt);
+            chunkColumns_.erase(chunkKey);
+            unloadedChunks.push_back({unload.chunkX, unload.chunkZ});
             ++unloadedChunkCount;
-            if (ChunkTaskState* state = FindChunkTaskState(unload.chunkX, unload.chunkZ)) {
-                state->resident = false;
-                state->retireRequested = false;
-                state->renderActive = false;
-                state->renderUpdateQueued = false;
-                state->dirtyQueuedMask = 0;
-                state->dirtyInFlightMask = 0;
-            }
-            MaybeCleanupChunkTaskState(unload.chunkX, unload.chunkZ);
-            renderStatsDirty_ = true;
         }
     }
 
@@ -1670,12 +1853,34 @@ void VoxelWorld::UnloadRetiredChunks(std::size_t unloadBudget) {
     saveDirty_ = false;
     for (const auto& [key, column] : chunkColumns_) {
         (void)key;
-        if (column.modified) {
+        if (column->modified) {
             saveDirty_ = true;
             break;
         }
     }
 
+    return unloadedChunks;
+}
+
+void VoxelWorld::FinalizeUnloadedChunkStates(const std::vector<PendingChunkId>& unloadedChunks) {
+    if (unloadedChunks.empty()) {
+        return;
+    }
+
+    for (const PendingChunkId& unloadedChunk : unloadedChunks) {
+        QueueRenderChunkRemoval(unloadedChunk.chunkX, unloadedChunk.chunkZ);
+        RemoveQueuedDirtySubChunksForChunk(unloadedChunk.chunkX, unloadedChunk.chunkZ);
+        if (ChunkTaskState* state = FindChunkTaskState(unloadedChunk.chunkX, unloadedChunk.chunkZ)) {
+            state->resident = false;
+            state->retireRequested = false;
+            state->renderActive = false;
+            state->renderUpdateQueued = false;
+            state->dirtyQueuedMask = 0;
+            state->dirtyInFlightMask = 0;
+        }
+        MaybeCleanupChunkTaskState(unloadedChunk.chunkX, unloadedChunk.chunkZ);
+        renderStatsDirty_ = true;
+    }
 }
 
 void VoxelWorld::GenerateChunkColumn(int chunkX, int chunkZ, ChunkColumnData& outColumn) const {
@@ -1768,7 +1973,7 @@ void VoxelWorld::SaveAllDirtyChunks() {
 
     std::unordered_map<std::int64_t, DirtyRegionGroup> dirtyRegions;
     for (const auto& [key, column] : chunkColumns_) {
-        if (!column.modified) {
+        if (!column->modified) {
             continue;
         }
 
@@ -1788,13 +1993,13 @@ void VoxelWorld::SaveAllDirtyChunks() {
         std::unordered_map<std::int64_t, const ChunkColumnData*> overrides;
 
         for (const DirtyChunkRef& dirtyChunk : regionGroup.chunks) {
-            auto columnIt = chunkColumns_.find(MakeChunkKey(dirtyChunk.chunkX, dirtyChunk.chunkZ));
-            if (columnIt == chunkColumns_.end()) {
+            std::shared_ptr<ChunkColumnData> columnHandle = FindChunkColumnHandle(dirtyChunk.chunkX, dirtyChunk.chunkZ);
+            if (!columnHandle) {
                 continue;
             }
 
-            overrides[MakeChunkKey(dirtyChunk.chunkX, dirtyChunk.chunkZ)] = &columnIt->second;
-            columnIt->second.modified = false;
+            overrides[MakeChunkKey(dirtyChunk.chunkX, dirtyChunk.chunkZ)] = columnHandle.get();
+            columnHandle->modified = false;
         }
 
         SaveRegionOverrides(regionGroup.regionX, regionGroup.regionZ, overrides);
@@ -1940,6 +2145,46 @@ void VoxelWorld::RefreshRegionIndexCacheEntry(int regionX, int regionZ, const st
 void VoxelWorld::InvalidateRegionIndexCacheEntry(int regionX, int regionZ) const {
     std::lock_guard lock(regionIndexCacheMutex_);
     regionIndexCache_.erase(MakeRegionKey(regionX, regionZ));
+}
+
+std::uint32_t VoxelWorld::CollectDirtySubChunkMask(ChunkColumnData& column) {
+    std::uint32_t dirtyMask = 0;
+    if (column.subChunkMeshes.size() != kSubChunkCountY) {
+        return dirtyMask;
+    }
+
+    for (int subChunkIndex = 0; subChunkIndex < kSubChunkCountY; ++subChunkIndex) {
+        SubChunkMeshData& mesh = column.subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
+        if (!mesh.dirty) {
+            continue;
+        }
+
+        if (column.subChunks.size() == kSubChunkCountY) {
+            const SubChunkVoxelData& voxelSubChunk = column.subChunks[static_cast<std::size_t>(subChunkIndex)];
+            if (voxelSubChunk.isUniform && voxelSubChunk.uniformBlock == 0) {
+                mesh.dirty = false;
+                continue;
+            }
+        }
+
+        dirtyMask |= GetSubChunkBit(subChunkIndex);
+    }
+
+    return dirtyMask;
+}
+
+bool VoxelWorld::HasRenderableMesh(const ChunkColumnData& column) {
+    if (column.subChunkMeshes.size() != kSubChunkCountY) {
+        return false;
+    }
+
+    for (const SubChunkMeshData& mesh : column.subChunkMeshes) {
+        if (!mesh.quads.empty()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void VoxelWorld::SaveChunkColumn(int chunkX, int chunkZ, ChunkColumnData& column) {
@@ -2367,12 +2612,16 @@ void VoxelWorld::SaveRegionFile(int regionX, int regionZ, const std::unordered_m
 }
 
 std::uint16_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) {
+    return static_cast<const VoxelWorld&>(*this).GetBlock(worldX, worldY, worldZ);
+}
+
+std::uint16_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) const {
     const auto profileStartTime = Clock::now();
     if (worldY < 0 || worldY >= kWorldSizeY) {
         return 0;
     }
 
-    EnsureInitialized();
+    const_cast<VoxelWorld*>(this)->EnsureInitialized();
 
     const int chunkX = FloorDiv(worldX, kChunkSizeX);
     const int chunkZ = FloorDiv(worldZ, kChunkSizeZ);
@@ -2381,16 +2630,16 @@ std::uint16_t VoxelWorld::GetBlock(int worldX, int worldY, int worldZ) {
     const int subChunkIndex = GetSubChunkIndex(worldY);
     const int localY = worldY - subChunkIndex * kSubChunkSize;
 
-    const auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
+    const std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
     std::uint16_t blockValue = 0;
-    if (columnIt == chunkColumns_.end() || columnIt->second.subChunks.size() != kSubChunkCountY) {
+    if (!columnHandle || columnHandle->subChunks.size() != kSubChunkCountY) {
         blockValue = SampleGeneratedBlock(worldX, worldY, worldZ);
     } else {
         blockValue = GetSubChunkBlock(
-        columnIt->second.subChunks[static_cast<std::size_t>(subChunkIndex)],
-        localX,
-        localY,
-        localZ
+            columnHandle->subChunks[static_cast<std::size_t>(subChunkIndex)],
+            localX,
+            localY,
+            localZ
         );
     }
 
@@ -2419,16 +2668,16 @@ bool VoxelWorld::SetBlock(int worldX, int worldY, int worldZ, std::uint16_t bloc
     const int localY = worldY - subChunkIndex * kSubChunkSize;
 
     EnsureChunkColumn(chunkX, chunkZ);
-    auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
-    if (columnIt == chunkColumns_.end()) {
+    std::shared_ptr<ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
+    if (!columnHandle) {
         return false;
     }
 
-    if (columnIt->second.subChunks.size() != kSubChunkCountY) {
-        InitializeVoxelSubChunks(columnIt->second);
+    if (columnHandle->subChunks.size() != kSubChunkCountY) {
+        InitializeVoxelSubChunks(*columnHandle);
     }
 
-    SubChunkVoxelData& subChunk = columnIt->second.subChunks[static_cast<std::size_t>(subChunkIndex)];
+    SubChunkVoxelData& subChunk = columnHandle->subChunks[static_cast<std::size_t>(subChunkIndex)];
     if (GetSubChunkBlock(subChunk, localX, localY, localZ) == blockValue) {
         return false;
     }
@@ -2436,40 +2685,40 @@ bool VoxelWorld::SetBlock(int worldX, int worldY, int worldZ, std::uint16_t bloc
     SetSubChunkBlock(subChunk, localX, localY, localZ, blockValue);
     TryCollapseSubChunk(subChunk);
 
-    columnIt->second.modified = true;
+    columnHandle->modified = true;
     saveDirty_ = true;
 
-    MarkSubChunkDirty(chunkX, chunkZ, subChunkIndex);
+    MarkSubChunkDirty(chunkX, chunkZ, subChunkIndex, true);
     if (worldY > 0 && worldY % kSubChunkSize == 0) {
-        MarkSubChunkDirty(chunkX, chunkZ, subChunkIndex - 1);
+        MarkSubChunkDirty(chunkX, chunkZ, subChunkIndex - 1, true);
     }
     if (worldY + 1 < kWorldSizeY && (worldY + 1) % kSubChunkSize == 0) {
-        MarkSubChunkDirty(chunkX, chunkZ, subChunkIndex + 1);
+        MarkSubChunkDirty(chunkX, chunkZ, subChunkIndex + 1, true);
     }
 
     if (localX == 0) {
         EnsureChunkColumn(chunkX - 1, chunkZ);
-        MarkSubChunkDirty(chunkX - 1, chunkZ, subChunkIndex);
+        MarkSubChunkDirty(chunkX - 1, chunkZ, subChunkIndex, true);
     }
     if (localX == kChunkSizeX - 1) {
         EnsureChunkColumn(chunkX + 1, chunkZ);
-        MarkSubChunkDirty(chunkX + 1, chunkZ, subChunkIndex);
+        MarkSubChunkDirty(chunkX + 1, chunkZ, subChunkIndex, true);
     }
     if (localZ == 0) {
         EnsureChunkColumn(chunkX, chunkZ - 1);
-        MarkSubChunkDirty(chunkX, chunkZ - 1, subChunkIndex);
+        MarkSubChunkDirty(chunkX, chunkZ - 1, subChunkIndex, true);
     }
     if (localZ == kChunkSizeZ - 1) {
         EnsureChunkColumn(chunkX, chunkZ + 1);
-        MarkSubChunkDirty(chunkX, chunkZ + 1, subChunkIndex);
+        MarkSubChunkDirty(chunkX, chunkZ + 1, subChunkIndex, true);
     }
 
     return true;
 }
 
 bool VoxelWorld::CopyChunkMeshBatch(int chunkX, int chunkZ, ChunkMeshBatchData& outBatch) const {
-    const auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
-    if (columnIt == chunkColumns_.end() || columnIt->second.subChunkMeshes.size() != kSubChunkCountY) {
+    const std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
+    if (!columnHandle || columnHandle->subChunkMeshes.size() != kSubChunkCountY) {
         return false;
     }
 
@@ -2477,7 +2726,7 @@ bool VoxelWorld::CopyChunkMeshBatch(int chunkX, int chunkZ, ChunkMeshBatchData& 
     outBatch.quads.clear();
 
     std::size_t totalQuadCount = 0;
-    for (const SubChunkMeshData& subChunkMesh : columnIt->second.subChunkMeshes) {
+    for (const SubChunkMeshData& subChunkMesh : columnHandle->subChunkMeshes) {
         totalQuadCount += subChunkMesh.quads.size();
     }
 
@@ -2487,7 +2736,7 @@ bool VoxelWorld::CopyChunkMeshBatch(int chunkX, int chunkZ, ChunkMeshBatchData& 
 
     outBatch.quads.reserve(totalQuadCount);
 
-    for (const SubChunkMeshData& subChunkMesh : columnIt->second.subChunkMeshes) {
+    for (const SubChunkMeshData& subChunkMesh : columnHandle->subChunkMeshes) {
         if (subChunkMesh.quads.empty()) {
             continue;
         }
@@ -2607,17 +2856,17 @@ void VoxelWorld::BuildVisibleMesh(
             const int chunkX = centerChunkX + dx;
             const int chunkZ = centerChunkZ + dz;
 
-            auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
-            if (columnIt == chunkColumns_.end()) {
+            std::shared_ptr<const ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
+            if (!columnHandle) {
                 continue;
             }
 
-            if (columnIt->second.subChunkMeshes.size() != kSubChunkCountY) {
+            if (columnHandle->subChunkMeshes.size() != kSubChunkCountY) {
                 continue;
             }
 
             for (int subChunkIndex = 0; subChunkIndex < kSubChunkCountY; ++subChunkIndex) {
-                const SubChunkMeshData& subChunkMesh = columnIt->second.subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
+                const SubChunkMeshData& subChunkMesh = columnHandle->subChunkMeshes[static_cast<std::size_t>(subChunkIndex)];
                 if (subChunkMesh.quads.empty()) {
                     continue;
                 }
@@ -2654,12 +2903,12 @@ void VoxelWorld::EnsureTerrainConfigLoaded() {
 }
 
 void VoxelWorld::RebuildSubChunkMesh(int chunkX, int chunkZ, int subChunkIndex) {
-    auto columnIt = chunkColumns_.find(MakeChunkKey(chunkX, chunkZ));
-    if (columnIt == chunkColumns_.end()) {
+    std::shared_ptr<ChunkColumnData> columnHandle = FindChunkColumnHandle(chunkX, chunkZ);
+    if (!columnHandle) {
         return;
     }
 
-    ChunkColumnData& column = columnIt->second;
+    ChunkColumnData& column = *columnHandle;
     if (column.subChunkMeshes.size() != kSubChunkCountY) {
         InitializeSubChunkMeshes(column, true);
     }
