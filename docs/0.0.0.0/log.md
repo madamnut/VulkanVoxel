@@ -87,3 +87,7 @@
 - Vulkan graphics pipeline의 공통 생성 절차(shader module 생성/해제, viewport/scissor, rasterizer, depth, blend, pipeline layout/pipeline 생성)를 `src/render/VulkanPipelineBuilder.*`로 분리했다. `main.cpp`는 pipeline별 shader, vertex input, depth/blend/cull 설정만 넘긴다.
 - Vulkan descriptor set layout, descriptor pool, descriptor set allocation, buffer/image descriptor write helper를 `src/render/VulkanDescriptors.*`로 분리했다. `main.cpp`는 각 descriptor set에 연결할 buffer/texture만 지정한다.
 - Vulkan swapchain 지원 정보 조회, surface format/present mode/extent 선택, swapchain/image view 생성과 swapchain image view 파괴 로직을 `src/render/VulkanSwapchain.*`로 분리했다. `main.cpp`는 framebuffer 크기와 queue family만 넘기고, render pass/depth/framebuffer 수명 관리는 기존처럼 담당한다.
+- 블럭 상호작용 기본 거리를 5블럭으로 추가하고, 1인칭 카메라 위치/yaw/pitch 기준 20Hz voxel raycast를 `src/world/BlockRaycast.*`로 구현했다. 3인칭 카메라 상태에서도 raycast는 항상 1인칭 눈 위치에서 진행된다.
+- raycast 대상과 지상 충돌 판정은 로딩 완료된 청크에만 적용되도록 했다. 로딩되지 않은 청크는 raycast hit 대상에서 제외되고, ground collision에서는 solid로 취급해 접근을 막는다.
+- 선택된 블럭을 검정색 line-list outline으로 표시하는 `selection.vert/frag` shader와 selection pipeline/vertex buffer를 추가했다.
+- `WorldGenerator`에 block override map을 추가해 좌클릭은 선택 블럭을 air로 파괴하고, 우클릭은 선택 면의 바깥 칸에 rock을 설치하도록 했다. 편집된 블럭의 청크와 경계 인접 청크는 기존 mesh를 제거하고 worker queue에 재메싱 요청한다.

@@ -56,6 +56,8 @@ public:
     bool popCompletedChunkBuild(ChunkBuildResult& result);
     bool shouldAcceptCompletedChunk(ChunkCoord coord) const;
     void markChunkLoaded(ChunkCoord coord);
+    bool isChunkLoaded(ChunkCoord coord) const;
+    bool rebuildLoadedChunk(ChunkCoord coord);
 
     std::size_t loadedChunkCount() const;
     std::pair<std::size_t, std::size_t> queueSizes() const;
@@ -85,6 +87,7 @@ private:
     std::unordered_set<ChunkCoord, ChunkCoordHash> desiredChunks_;
     std::unordered_set<ChunkCoord, ChunkCoordHash> loadedChunks_;
     std::unordered_set<ChunkCoord, ChunkCoordHash> queuedChunks_;
+    std::unordered_set<ChunkCoord, ChunkCoordHash> rebuildingChunks_;
     std::vector<std::thread> workers_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;

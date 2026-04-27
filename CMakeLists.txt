@@ -33,6 +33,8 @@ set(SHADER_SOURCES
     shaders/block.frag
     shaders/player.vert
     shaders/player.frag
+    shaders/selection.vert
+    shaders/selection.frag
     shaders/debug_text.vert
     shaders/debug_text.frag
 )
@@ -70,6 +72,7 @@ add_executable(VulkanVoxel
     src/render/VulkanSwapchain.cpp
     src/render/TextureManager.cpp
     src/world/BlockRegistry.cpp
+    src/world/BlockRaycast.cpp
     src/world/ChunkMesher.cpp
     src/world/ChunkStreamingManager.cpp
     src/world/WorldGenerator.cpp

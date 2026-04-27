@@ -19,19 +19,9 @@ public:
     SubchunkBuildResult buildSubchunkMesh(ChunkBuildRequest request) const;
 
 private:
-    struct ChunkColumnData
-    {
-        std::array<int, kChunkSizeX * kChunkSizeZ> highestSolidY{};
-    };
-
-    static std::size_t chunkColumnIndex(int localX, int localZ);
-
     const BlockDefinition* blockDefinitionForId(std::uint16_t blockId) const;
     bool isSolidBlock(std::uint16_t blockId) const;
     std::uint32_t textureLayerForBlockFace(std::uint16_t blockId, BlockFace face) const;
-    int terrainHighestSolidYAt(int x, int z) const;
-    ChunkColumnData generateChunkColumnData(ChunkCoord chunk) const;
-    std::uint16_t generateBlockIdFromColumn(int y, int highestSolidY) const;
 
     void appendSubchunkMesh(
         int chunkX,

@@ -47,11 +47,6 @@ ChunkMesher::ChunkMesher(
 {
 }
 
-std::size_t ChunkMesher::chunkColumnIndex(int localX, int localZ)
-{
-    return static_cast<std::size_t>(localZ * kChunkSizeX + localX);
-}
-
 const BlockDefinition* ChunkMesher::blockDefinitionForId(std::uint16_t blockId) const
 {
     return blockRegistry_.definitionForId(blockId);
@@ -72,33 +67,8 @@ std::uint32_t ChunkMesher::textureLayerForBlockFace(std::uint16_t blockId, Block
     return definition->textureLayers[static_cast<std::size_t>(face)];
 }
 
-int ChunkMesher::terrainHighestSolidYAt(int x, int z) const
-{
-    return worldGenerator_.highestSolidYAt(x, z);
-}
-
-ChunkMesher::ChunkColumnData ChunkMesher::generateChunkColumnData(ChunkCoord chunk) const
-{
-    ChunkColumnData data{};
-    const int chunkBaseX = chunk.x * kChunkSizeX;
-    const int chunkBaseZ = chunk.z * kChunkSizeZ;
-    for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
-    {
-        for (int localX = 0; localX < kChunkSizeX; ++localX)
-        {
-            data.highestSolidY[chunkColumnIndex(localX, localZ)] =
-                terrainHighestSolidYAt(chunkBaseX + localX, chunkBaseZ + localZ);
-        }
-    }
-    return data;
-}
-
-std::uint16_t ChunkMesher::generateBlockIdFromColumn(int y, int highestSolidY) const
-{
-    return worldGenerator_.blockIdFromColumn(y, highestSolidY);
-}
 SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) const
-    {
+{
         const ChunkCoord chunk = request.coord;
         std::array<std::vector<BlockVertex>, kSubchunkSize> verticesByLocalY;
         std::array<std::vector<std::uint32_t>, kSubchunkSize> indicesByLocalY;
@@ -113,7 +83,6 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) co
         const int chunkBaseX = chunkX * kChunkSizeX;
         const int chunkBaseZ = chunkZ * kChunkSizeZ;
         const int subchunkMinY = subchunkY * kSubchunkSize;
-        const ChunkColumnData chunkColumnData = generateChunkColumnData(chunk);
 
         constexpr int kPaddedSubchunkSize = kSubchunkSize + 2;
         constexpr int kPaddedSubchunkArea = kPaddedSubchunkSize * kPaddedSubchunkSize;
@@ -127,29 +96,16 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) co
         };
 
         int nonAirBlockCount = 0;
-        auto highestSolidYAt = [&](int x, int z) -> int
-        {
-            const int localX = x - chunkBaseX;
-            const int localZ = z - chunkBaseZ;
-            if (localX >= 0 && localX < kChunkSizeX &&
-                localZ >= 0 && localZ < kChunkSizeZ)
-            {
-                return chunkColumnData.highestSolidY[chunkColumnIndex(localX, localZ)];
-            }
-            return terrainHighestSolidYAt(x, z);
-        };
-
         for (int localZ = 0; localZ < kPaddedSubchunkSize; ++localZ)
         {
             const int z = chunkBaseZ + localZ - 1;
             for (int localX = 0; localX < kPaddedSubchunkSize; ++localX)
             {
                 const int x = chunkBaseX + localX - 1;
-                const int highestSolidY = highestSolidYAt(x, z);
                 for (int localY = 0; localY < kPaddedSubchunkSize; ++localY)
                 {
                     const int y = subchunkMinY + localY - 1;
-                    const std::uint16_t blockId = generateBlockIdFromColumn(y, highestSolidY);
+                    const std::uint16_t blockId = worldGenerator_.blockIdAt(x, y, z);
                     blockIds[paddedBlockIndex(localX, localY, localZ)] = blockId;
                     if (localX > 0 && localX <= kSubchunkSize &&
                         localY > 0 && localY <= kSubchunkSize &&

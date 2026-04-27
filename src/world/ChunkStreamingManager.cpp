@@ -104,6 +104,7 @@ void ChunkStreamingManager::reset()
     desiredChunks_.clear();
     loadedChunks_.clear();
     queuedChunks_.clear();
+    rebuildingChunks_.clear();
     queuedGenerations_.clear();
     pendingChunkMeshes_.clear();
     loadedCenterChunkX_ = std::numeric_limits<int>::min();
@@ -150,6 +151,7 @@ ChunkLoadUpdateStats ChunkStreamingManager::updateLoadedChunks(
         for (ChunkCoord coord : chunksToUnload)
         {
             loadedChunks_.erase(coord);
+            rebuildingChunks_.erase(coord);
         }
         stats.unloaded = chunksToUnload.size();
 
@@ -262,13 +264,41 @@ bool ChunkStreamingManager::popCompletedChunkBuild(ChunkBuildResult& result)
 bool ChunkStreamingManager::shouldAcceptCompletedChunk(ChunkCoord coord) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return isChunkInCurrentLoadRangeLocked(coord) && !loadedChunks_.contains(coord);
+    return isChunkInCurrentLoadRangeLocked(coord) &&
+           (!loadedChunks_.contains(coord) || rebuildingChunks_.contains(coord));
 }
 
 void ChunkStreamingManager::markChunkLoaded(ChunkCoord coord)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     loadedChunks_.insert(coord);
+    rebuildingChunks_.erase(coord);
+}
+
+bool ChunkStreamingManager::isChunkLoaded(ChunkCoord coord) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return loadedChunks_.contains(coord);
+}
+
+bool ChunkStreamingManager::rebuildLoadedChunk(ChunkCoord coord)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!loadedChunks_.contains(coord))
+        {
+            return false;
+        }
+
+        queuedChunks_.erase(coord);
+        queuedGenerations_.erase(coord);
+        pendingChunkMeshes_.erase(coord);
+        rebuildingChunks_.insert(coord);
+        queueChunkBuildLocked(coord, priorityCenterChunkX_, priorityCenterChunkZ_);
+    }
+
+    cv_.notify_all();
+    return true;
 }
 
 std::size_t ChunkStreamingManager::loadedChunkCount() const
@@ -405,6 +435,7 @@ std::size_t ChunkStreamingManager::cancelQueuedChunksOutsideDesiredLocked()
         }
 
         queuedChunks_.erase(it->first);
+        rebuildingChunks_.erase(it->first);
         pendingChunkMeshes_.erase(it->first);
         it = queuedGenerations_.erase(it);
         ++canceledCount;

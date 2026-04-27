@@ -21,6 +21,7 @@
 #include "render/VulkanSwapchain.h"
 #include "world/Block.h"
 #include "world/BlockRegistry.h"
+#include "world/BlockRaycast.h"
 #include "world/ChunkMesher.h"
 #include "world/ChunkStreamingManager.h"
 #include "world/WorldGenerator.h"
@@ -55,6 +56,8 @@ constexpr int kDefaultChunkUploadsPerFrame = 1;
 constexpr int kMaxChunkUploadsPerFrame = 64;
 constexpr int kDefaultChunkBuildThreads = 4;
 constexpr int kMaxChunkBuildThreads = 16;
+constexpr float kDefaultInteractionDistance = 5.0f;
+constexpr std::size_t kSelectionOutlineVertexCount = 24;
 
 struct QueueFamilyIndices
 {
@@ -103,6 +106,11 @@ struct SkyUniform
 struct BlockUniform
 {
     alignas(16) float viewProjection[16];
+};
+
+struct SelectionVertex
+{
+    float position[3];
 };
 
 struct DebugTextOverlay
@@ -233,10 +241,12 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout blockPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout playerPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout selectionPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout debugTextPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
     VkPipeline blockPipeline_ = VK_NULL_HANDLE;
     VkPipeline playerPipeline_ = VK_NULL_HANDLE;
+    VkPipeline selectionPipeline_ = VK_NULL_HANDLE;
     VkPipeline debugTextPipeline_ = VK_NULL_HANDLE;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
@@ -260,15 +270,18 @@ private:
     Buffer crosshairVertexBuffer_{};
     Buffer playerVertexBuffer_{};
     Buffer playerIndexBuffer_{};
+    Buffer selectionVertexBuffer_{};
     void* uniformMappedMemory_ = nullptr;
     void* blockUniformMappedMemory_ = nullptr;
     void* debugTextVertexMappedMemory_ = nullptr;
     void* crosshairVertexMappedMemory_ = nullptr;
     void* playerVertexMappedMemory_ = nullptr;
+    void* selectionVertexMappedMemory_ = nullptr;
     std::uint32_t debugTextVertexCount_ = 0;
     std::uint32_t crosshairVertexCount_ = 0;
     std::uint32_t playerVertexCount_ = 0;
     std::uint32_t playerIndexCount_ = 0;
+    std::uint32_t selectionVertexCount_ = 0;
     std::vector<ChunkMesh> chunkMeshes_;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
@@ -283,6 +296,9 @@ private:
     FrameProfiler frameProfiler_{};
     bool debugTextVisible_ = true;
     int chunkUploadsPerFrame_ = kDefaultChunkUploadsPerFrame;
+    float interactionDistance_ = kDefaultInteractionDistance;
+    std::optional<BlockRaycastHit> selectedBlock_;
+    std::chrono::steady_clock::time_point lastInteractionRaycastTime_ = std::chrono::steady_clock::now();
     BlockRegistry blockRegistry_{};
     std::vector<std::wstring> blockTextureLayerNames_;
     ChunkMesher chunkMesher_{worldGenerator_, blockRegistry_};
@@ -328,7 +344,10 @@ private:
         if (!app->cursorCaptured_)
         {
             app->captureCursor();
+            return;
         }
+
+        app->handleMouseButton(button);
     }
 
     static void keyCallback(GLFWwindow* window, int key, int, int action, int)
@@ -349,6 +368,18 @@ private:
         else if (key == GLFW_KEY_F5 && action == GLFW_PRESS)
         {
             app->playerController_.cycleCameraViewMode();
+        }
+    }
+
+    void handleMouseButton(int button)
+    {
+        if (button == GLFW_MOUSE_BUTTON_LEFT)
+        {
+            editSelectedBlock(kAirBlockId);
+        }
+        else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+        {
+            editSelectedBlock(kRockBlockId);
         }
     }
 
@@ -405,6 +436,7 @@ private:
         createGraphicsPipeline();
         createBlockPipeline();
         createPlayerPipeline();
+        createSelectionPipeline();
         createDebugTextPipeline();
         createFramebuffers();
         createCommandPool();
@@ -463,6 +495,7 @@ private:
         resourceContext_.destroyBuffer(crosshairVertexBuffer_);
         resourceContext_.destroyBuffer(playerVertexBuffer_);
         resourceContext_.destroyBuffer(playerIndexBuffer_);
+        resourceContext_.destroyBuffer(selectionVertexBuffer_);
         destroyAllChunkMeshes();
 
         if (descriptorPool_ != VK_NULL_HANDLE)
@@ -1020,6 +1053,42 @@ private:
         playerPipeline_ = bundle.pipeline;
     }
 
+    void createSelectionPipeline()
+    {
+        const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
+
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(SelectionVertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        std::array<VkVertexInputAttributeDescription, 1> attributeDescriptions{};
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(SelectionVertex, position);
+
+        GraphicsPipelineConfig config{};
+        config.vertexShaderPath = shaderDir + "selection.vert.spv";
+        config.fragmentShaderPath = shaderDir + "selection.frag.spv";
+        config.extent = swapchainExtent_;
+        config.renderPass = renderPass_;
+        config.descriptorSetLayout = blockDescriptorSetLayout_;
+        config.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        config.depthTestEnable = true;
+        config.depthWriteEnable = false;
+        config.alphaBlendEnable = false;
+        config.vertexBindingDescription = &bindingDescription;
+        config.vertexAttributeDescriptions = attributeDescriptions.data();
+        config.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
+        config.layoutErrorMessage = "Failed to create Vulkan selection pipeline layout.";
+        config.pipelineErrorMessage = "Failed to create Vulkan selection graphics pipeline.";
+
+        const GraphicsPipelineBundle bundle = createGraphicsPipelineBundle(device_, config);
+        selectionPipelineLayout_ = bundle.layout;
+        selectionPipeline_ = bundle.pipeline;
+    }
+
     void createDebugTextPipeline()
     {
         const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
@@ -1288,6 +1357,7 @@ private:
                 continue;
             }
 
+            destroyChunkMeshes(result.coord);
             uploadChunkMesh(
                 result.coord.x,
                 result.coord.z,
@@ -1412,6 +1482,19 @@ private:
             0,
             &crosshairVertexMappedMemory_);
         updateCrosshairVertices();
+
+        selectionVertexBuffer_ = resourceContext_.createBuffer(
+            sizeof(SelectionVertex) * kSelectionOutlineVertexCount,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        vkMapMemory(
+            device_,
+            selectionVertexBuffer_.memory,
+            0,
+            sizeof(SelectionVertex) * kSelectionOutlineVertexCount,
+            0,
+            &selectionVertexMappedMemory_);
 
         if (playerModel_.isLoaded())
         {
@@ -1702,6 +1785,8 @@ private:
         currentProfile.chunkUploadMs = elapsedMs(sectionStart);
         currentProfile.chunksLoaded = static_cast<std::size_t>(currentProfile.chunksUploaded);
 
+        updateBlockSelection(false);
+
         sectionStart = mark();
         updateUniformBuffer();
         currentProfile.uniformMs = elapsedMs(sectionStart);
@@ -1795,8 +1880,35 @@ private:
         {
             return true;
         }
+        if (!isChunkLoadedForBlock(x, z))
+        {
+            return true;
+        }
 
         return blockRegistry_.isSolid(worldGenerator_.blockIdAt(x, y, z));
+    }
+
+    bool isRaycastBlockSolid(int x, int y, int z) const
+    {
+        if (y < 0 || y >= kChunkHeight || !isChunkLoadedForBlock(x, z))
+        {
+            return false;
+        }
+
+        return blockRegistry_.isSolid(worldGenerator_.blockIdAt(x, y, z));
+    }
+
+    bool isChunkLoadedForBlock(int x, int z) const
+    {
+        return chunkStreaming_.isChunkLoaded(chunkCoordForBlock(x, z));
+    }
+
+    ChunkCoord chunkCoordForBlock(int x, int z) const
+    {
+        return {
+            floorDiv(x, kChunkSizeX),
+            floorDiv(z, kChunkSizeZ),
+        };
     }
 
     Vec3 playerFeetPosition() const
@@ -1817,6 +1929,149 @@ private:
     Vec3 renderCameraPosition() const
     {
         return playerController_.renderCameraPosition(camera_);
+    }
+
+    void updateBlockSelection(bool force)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - lastInteractionRaycastTime_ < std::chrono::milliseconds(50))
+        {
+            return;
+        }
+        lastInteractionRaycastTime_ = now;
+
+        selectedBlock_ = raycastBlocks(
+            camera_.position,
+            cameraForward(camera_.yaw, camera_.pitch),
+            interactionDistance_,
+            [this](int x, int y, int z)
+            {
+                return isRaycastBlockSolid(x, y, z);
+            },
+            [this](int x, int y, int z)
+            {
+                return y >= 0 && y < kChunkHeight && isChunkLoadedForBlock(x, z);
+            });
+        updateSelectionOutlineVertices();
+    }
+
+    void editSelectedBlock(std::uint16_t blockId)
+    {
+        updateBlockSelection(true);
+        if (!selectedBlock_)
+        {
+            return;
+        }
+
+        int x = selectedBlock_->x;
+        int y = selectedBlock_->y;
+        int z = selectedBlock_->z;
+        if (blockId != kAirBlockId)
+        {
+            if (selectedBlock_->normalX == 0 &&
+                selectedBlock_->normalY == 0 &&
+                selectedBlock_->normalZ == 0)
+            {
+                return;
+            }
+            x += selectedBlock_->normalX;
+            y += selectedBlock_->normalY;
+            z += selectedBlock_->normalZ;
+        }
+
+        if (y < 0 || y >= kChunkHeight || !isChunkLoadedForBlock(x, z))
+        {
+            return;
+        }
+        if (blockId != kAirBlockId && isWorldBlockSolid(x, y, z))
+        {
+            return;
+        }
+
+        worldGenerator_.setBlockIdAt(x, y, z, blockId);
+        remeshEditedBlock(x, y, z);
+        updateBlockSelection(true);
+    }
+
+    void remeshEditedBlock(int x, int, int z)
+    {
+        const ChunkCoord coord = chunkCoordForBlock(x, z);
+        remeshChunk(coord);
+
+        const int localX = x - coord.x * kChunkSizeX;
+        const int localZ = z - coord.z * kChunkSizeZ;
+        if (localX == 0)
+        {
+            remeshChunk({coord.x - 1, coord.z});
+        }
+        else if (localX == kChunkSizeX - 1)
+        {
+            remeshChunk({coord.x + 1, coord.z});
+        }
+
+        if (localZ == 0)
+        {
+            remeshChunk({coord.x, coord.z - 1});
+        }
+        else if (localZ == kChunkSizeZ - 1)
+        {
+            remeshChunk({coord.x, coord.z + 1});
+        }
+    }
+
+    void remeshChunk(ChunkCoord coord)
+    {
+        chunkStreaming_.rebuildLoadedChunk(coord);
+    }
+
+    void updateSelectionOutlineVertices()
+    {
+        if (selectionVertexMappedMemory_ == nullptr)
+        {
+            selectionVertexCount_ = 0;
+            return;
+        }
+        if (!selectedBlock_)
+        {
+            selectionVertexCount_ = 0;
+            return;
+        }
+
+        const float minX = static_cast<float>(selectedBlock_->x) - 0.002f;
+        const float minY = static_cast<float>(selectedBlock_->y) - 0.002f;
+        const float minZ = static_cast<float>(selectedBlock_->z) - 0.002f;
+        const float maxX = static_cast<float>(selectedBlock_->x + 1) + 0.002f;
+        const float maxY = static_cast<float>(selectedBlock_->y + 1) + 0.002f;
+        const float maxZ = static_cast<float>(selectedBlock_->z + 1) + 0.002f;
+
+        const std::array<Vec3, 8> corners = {{
+            {minX, minY, minZ},
+            {maxX, minY, minZ},
+            {maxX, maxY, minZ},
+            {minX, maxY, minZ},
+            {minX, minY, maxZ},
+            {maxX, minY, maxZ},
+            {maxX, maxY, maxZ},
+            {minX, maxY, maxZ},
+        }};
+        constexpr std::array<std::array<int, 2>, 12> edges = {{
+            {{0, 1}}, {{1, 2}}, {{2, 3}}, {{3, 0}},
+            {{4, 5}}, {{5, 6}}, {{6, 7}}, {{7, 4}},
+            {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+        }};
+
+        std::array<SelectionVertex, kSelectionOutlineVertexCount> vertices{};
+        std::size_t vertexIndex = 0;
+        for (const auto& edge : edges)
+        {
+            const Vec3 a = corners[static_cast<std::size_t>(edge[0])];
+            const Vec3 b = corners[static_cast<std::size_t>(edge[1])];
+            vertices[vertexIndex++] = {{a.x, a.y, a.z}};
+            vertices[vertexIndex++] = {{b.x, b.y, b.z}};
+        }
+
+        std::memcpy(selectionVertexMappedMemory_, vertices.data(), sizeof(vertices));
+        selectionVertexCount_ = static_cast<std::uint32_t>(vertices.size());
     }
 
     void updatePlayerRenderMesh()
@@ -2137,6 +2392,24 @@ private:
             }
         }
 
+        if (selectionVertexCount_ > 0)
+        {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selectionPipeline_);
+            vkCmdBindDescriptorSets(
+                commandBuffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                selectionPipelineLayout_,
+                0,
+                1,
+                &blockDescriptorSet_,
+                0,
+                nullptr);
+            VkBuffer vertexBuffers[] = {selectionVertexBuffer_.buffer};
+            VkDeviceSize offsets[] = {0};
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+            vkCmdDraw(commandBuffer, selectionVertexCount_, 1, 0, 0);
+        }
+
         if (playerVertexCount_ > 0 && playerIndexCount_ > 0)
         {
             vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, playerPipeline_);
@@ -2220,6 +2493,7 @@ private:
         createGraphicsPipeline();
         createBlockPipeline();
         createPlayerPipeline();
+        createSelectionPipeline();
         createDebugTextPipeline();
         createFramebuffers();
         updateCrosshairVertices();
@@ -2248,6 +2522,11 @@ private:
             vkDestroyPipeline(device_, playerPipeline_, nullptr);
             playerPipeline_ = VK_NULL_HANDLE;
         }
+        if (selectionPipeline_ != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(device_, selectionPipeline_, nullptr);
+            selectionPipeline_ = VK_NULL_HANDLE;
+        }
         if (debugTextPipeline_ != VK_NULL_HANDLE)
         {
             vkDestroyPipeline(device_, debugTextPipeline_, nullptr);
@@ -2268,6 +2547,11 @@ private:
         {
             vkDestroyPipelineLayout(device_, playerPipelineLayout_, nullptr);
             playerPipelineLayout_ = VK_NULL_HANDLE;
+        }
+        if (selectionPipelineLayout_ != VK_NULL_HANDLE)
+        {
+            vkDestroyPipelineLayout(device_, selectionPipelineLayout_, nullptr);
+            selectionPipelineLayout_ = VK_NULL_HANDLE;
         }
         if (debugTextPipelineLayout_ != VK_NULL_HANDLE)
         {

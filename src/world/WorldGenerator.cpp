@@ -2,6 +2,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+
+std::int64_t WorldGenerator::blockKey(int x, int y, int z)
+{
+    constexpr std::int64_t mask = (1ll << 21) - 1ll;
+    return ((static_cast<std::int64_t>(x) & mask) << 43) |
+           ((static_cast<std::int64_t>(z) & mask) << 22) |
+           (static_cast<std::int64_t>(y) & ((1ll << 22) - 1ll));
+}
 
 int WorldGenerator::terrainHeightAt(int x, int z) const
 {
@@ -56,5 +65,28 @@ std::uint16_t WorldGenerator::blockIdFromColumn(int y, int highestSolidY) const
 
 std::uint16_t WorldGenerator::blockIdAt(int x, int y, int z) const
 {
+    {
+        std::shared_lock lock(overrideMutex_);
+        const auto overrideIt = blockOverrides_.find(blockKey(x, y, z));
+        if (overrideIt != blockOverrides_.end())
+        {
+            return overrideIt->second;
+        }
+    }
+
     return blockIdFromColumn(y, highestSolidYAt(x, z));
+}
+
+void WorldGenerator::setBlockIdAt(int x, int y, int z, std::uint16_t blockId)
+{
+    const std::uint16_t generatedBlockId = blockIdFromColumn(y, highestSolidYAt(x, z));
+    std::unique_lock lock(overrideMutex_);
+    const std::int64_t key = blockKey(x, y, z);
+    if (blockId == generatedBlockId)
+    {
+        blockOverrides_.erase(key);
+        return;
+    }
+
+    blockOverrides_[key] = blockId;
 }
