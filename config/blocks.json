@@ -1,0 +1,24 @@
+{
+  "blocks": [
+    {
+      "id": 1,
+      "name": "rock",
+      "solid": true
+    },
+    {
+      "id": 2,
+      "name": "dirt",
+      "solid": true
+    },
+    {
+      "id": 3,
+      "name": "grass",
+      "solid": true
+    },
+    {
+      "id": 65535,
+      "name": "bedrock",
+      "solid": true
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "chunkLoadRadius": 30,
+  "chunkUploadsPerFrame": 32,
+  "chunkBuildThreads": 4
+}

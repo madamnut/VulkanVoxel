@@ -1,0 +1,69 @@
+# Version 0.0.0.0 Development Log
+
+## 2026-04-24
+
+- 프로젝트 시작 버전을 `0.0.0.0`으로 정했다.
+- 에셋은 루트 `assets/` 폴더에 보관하기로 했다.
+- 개발 문서는 `docs/<version>/` 단위로 누적하고, 다음 버전으로 넘어가기 전에 `summary.md`에 총정리하기로 했다.
+- 빌드는 CMake + Ninja 기반 Windows x64 구성을 기준으로 잡았다.
+- 초기 Vulkan/GLFW 실행 파일 스캐폴드를 추가했다.
+- 빌드와 실행 확인은 프로젝트 소유자가 직접 수행하기로 했다.
+- 고정 하늘색 clear, 마우스 시선 회전, `+X` 동쪽 기준의 해와 `-X` 반대 방향의 달 sprite 렌더링 작업을 시작했다.
+- 마우스 회전 방향을 보정하고, 휠 클릭 cursor release, 창 클릭 cursor capture, F11 fullscreen toggle을 추가했다.
+- `assets/fonts/VCR_OSD_MONO.ttf`를 사용해 좌상단 debug text에 FPS/MS를 20Hz로 갱신하도록 추가했다.
+- Vulkan viewport를 negative height 방식으로 보정해 화면 좌표에서 `+Y`가 위쪽을 향하도록 맞췄다.
+- negative height viewport 보정 후 마우스 yaw/pitch 입력 부호를 다시 일반 FPS 감각에 맞췄다.
+- debug text는 UI와 분리된 렌더 경로로 유지하고, 기본 표시 상태에서 F3으로 토글할 수 있게 했다.
+- debug text에 카메라 yaw/pitch 각도 표시를 추가하고, 흰색 글자와 검정색 테두리로 렌더링하도록 바꿨다.
+- 태양 방향을 완전한 정동쪽 `+X`로 맞추고, 달은 그 정반대 `-X`로 유지했다.
+- 카메라 yaw를 `[-pi, +pi]` 범위로 wrap하고, debug text 크기를 1.5배로 키웠다.
+- 카메라 pitch clamp를 정확히 `-89도`에서 `+89도` 범위로 변경했다.
+- 16x16x512 청크 10x10개를 생성하고, 높이 300~310의 deterministic random rock 지형을 표면 메쉬로 렌더링하도록 추가했다.
+- 블럭 id는 `uint16_t` 기반으로 10000종까지 대응할 수 있게 두고, 현재는 `0 air`, `1 rock`만 사용한다.
+- rock 블럭 6면 텍스처는 `assets/textures/block/rock.png`를 공통으로 사용한다.
+- rock 옆면 텍스처는 월드 `+Y` 방향이 이미지의 위쪽이 되도록 UV를 유지한다.
+- rock 옆면 텍스처의 U 좌표를 반전해 좌우 방향을 맞췄다.
+- 카메라 시작 위치를 지형 중앙 근처 `Y=310`으로 두고, WASD 전후좌우, Space 상승, Shift 하강 fly movement를 추가했다.
+- debug text에 `POS: 0000.00 / 0000.00 / 0000.00` 형식의 카메라 위치 표시를 FPS와 카메라 각도 사이에 추가했다.
+- 청크 메싱과 렌더링 단위를 16x16x16 서브청크로 분리했다. 하나의 16x16x512 청크는 수직으로 32개 서브청크를 가진다.
+- 우측 상단 debug text 블록을 추가해 버전, GPU/CPU 하드웨어 정보, RAM/VRAM 사용량, Vulkan API/driver 버전, draw call/subchunk/vertex/index/triangle 통계를 표시한다.
+- 우측 debug text의 고정 항목은 캐싱하고, `CHUNKS`는 단순 총 개수로 표시한다.
+- 우측 debug text에서 `SUBCHUNKS` 항목을 제거하고, 성능 저하를 줄이기 위해 좌측/우측 debug texture 크기와 갱신 주기를 분리했다.
+- debug text outline 렌더링을 상하좌우 4방향 오프셋으로 줄여 GDI 텍스트 그리기 비용을 낮췄다.
+- debug text를 문자열 비트맵 재업로드 방식에서 ASCII glyph atlas와 문자 quad vertex buffer 방식으로 전환했다.
+- debug text pipeline의 vertex input 설정을 glyph quad 전용으로 고정하고, sky pipeline은 vertex input 없이 유지하도록 수정했다.
+- debug glyph atlas cell을 넉넉하게 키우고 glyph별 GDI metric 기반 UV/크기/advance를 사용하도록 보정했다.
+- block mesh의 면 방향을 바깥쪽 counter-clockwise 기준으로 정리하고, block pipeline에 counter-clockwise front-face back-face culling을 적용했다.
+- 서브청크 메싱을 단일 블럭 면 생성 방식에서 greedy meshing 방식으로 변경해 같은 방향의 인접 rock 면을 직사각형 quad로 병합한다.
+- 병합된 block quad에서도 텍스쳐가 늘어나지 않도록 block fragment shader에서 UV 반복 샘플링을 적용했다.
+- 루트 `config/world.json`을 추가하고 `chunkLoadRadius`로 플레이어 주변 청크 로딩 반경을 실행 시 설정할 수 있게 했다. 현재 값은 `0`에서 `64` 사이로 clamp한다.
+- 고정 10x10 청크 생성 방식에서 현재 플레이어 청크 중심의 `(2n + 1)^2` 정사각형 로딩/언로딩 방식으로 변경했다.
+- 월드 높이맵은 저장 없이 월드 좌표 기반 deterministic heightmap을 유지해 청크를 다시 로딩해도 같은 지형이 나오도록 했다.
+- fly movement의 WASD는 pitch를 무시하고 카메라 yaw 기준 수평 이동만 하도록 조정했다. 상하 이동은 Space/Shift가 담당한다.
+- 월드 높이맵을 해시 기반 랜덤 높이에서 sin/cos 기반 굴곡형 높이로 변경했다. 기본 높이는 192, 최고점과 최저점의 높이 차이는 40이다.
+- block vertex에 ambient occlusion 값을 추가하고, 주변 block 점유 상태 기반의 Minecraft 스타일 vertex AO를 block shader에서 텍스쳐 색에 곱하도록 구현했다.
+- greedy meshing은 면 존재 여부뿐 아니라 4개 vertex AO 값이 같은 면만 병합하도록 변경했다.
+- 서브청크별 GPU vertex/index buffer를 청크별 GPU buffer 1쌍으로 통합했다.
+- 서브청크는 메싱/dirty 확장 단위로 남기고, 청크 buffer 내부의 `firstIndex`, `indexCount`, `vertexOffset` draw range로 렌더링하도록 변경했다.
+- 청크 언로드 경로에서 `vkDeviceWaitIdle`을 제거하고, 언로드된 청크 GPU buffer는 `kMaxFramesInFlight` 프레임 뒤 삭제하는 deferred destruction으로 변경했다.
+- 우측 debug text에 deferred destroy 대기 개수를 표시하도록 추가했다.
+- 일회용 upload command 경로의 `vkQueueWaitIdle`을 제거하고, staging buffer와 upload command buffer를 `kMaxFramesInFlight` 프레임 뒤 회수하는 deferred upload cleanup으로 변경했다.
+- 우측 debug text에 deferred upload cleanup 대기 개수를 표시하도록 추가했다.
+- 청크 CPU 메싱을 worker thread로 분리했다. worker는 `BlockVertex`, index, `SubchunkDraw` 범위만 생성하고 Vulkan buffer 생성/업로드는 메인 thread에서 수행한다.
+- 완료된 청크 메쉬 결과는 프레임당 최대 1개만 GPU upload하며, 청크 build queue는 플레이어가 속한 청크에 가까운 순서로 요청한다.
+- 우측 debug text에 chunk build queue와 completed build result 개수를 표시하도록 추가했다.
+- `config/world.json`에 `chunkUploadsPerFrame`을 추가해 완료된 청크 메쉬의 프레임당 GPU upload 개수를 재빌드 없이 조정할 수 있게 했다. 현재 값은 `1`에서 `64` 사이로 clamp한다.
+- `config/world.json`에 `chunkBuildThreads`를 추가하고, 청크 CPU 메싱 worker thread를 설정값만큼 여러 개 생성하도록 변경했다. 현재 값은 `1`에서 `16` 사이로 clamp한다.
+- 청크 build queue를 FIFO에서 거리 우선순위 heap으로 변경하고, 플레이어 중심 청크가 바뀔 때 대기 중인 stale build request를 제거하도록 했다. 새 청크 요청은 bulk enqueue 후 heap으로 재정렬해 대량 반경에서의 큐 갱신 비용을 줄였다.
+- 청크 CPU 메싱 작업 단위를 청크 1개에서 16x16x16 서브청크 1개로 변경했다. worker thread는 서브청크별 mesh를 병렬 생성하고, 메인 thread는 32개 서브청크 결과가 모두 모인 뒤 기존 청크 단위 GPU buffer로 조립해 업로드한다.
+- 우측 debug text의 `BUILD QUEUE` 라벨을 `BUILD JOBS`로 변경해 대기 중인 서브청크 작업 개수임을 드러내도록 했다.
+- fly 이동속도를 초당 32블럭에서 64블럭으로 올렸다.
+- 서브청크 메싱 전에 패딩 포함 18x18x18 블럭 데이터를 만들고, 내부 16x16x16 영역이 모두 air이면 greedy meshing을 건너뛰도록 했다. 면 생성 판정도 높이 비교식 대신 블럭 데이터의 `solid && !neighborSolid` 기준으로 변경했다.
+- `config/blocks.json`을 추가해 블럭 ID/name/solid 정의를 코드 밖으로 분리했다. 현재 `0` air, `1` rock, `2` dirt, `3` grass, `65535` bedrock을 사용한다.
+- block texture를 단일 rock texture에서 texture array로 변경하고, `name`, `name_top`, `name_side`, `name_bottom` 파일 규칙으로 면별 texture layer를 선택하도록 했다.
+- 청크 생성 데이터에 16x16 컬럼별 `highestSolidY` 캐시를 추가하고, 기본 지형 생성 pass와 표면 후처리 pass를 분리했다. 후처리에서 `y == 0`은 bedrock, 최상단 solid는 grass, 그 아래 4블럭은 dirt로 치환한다.
+- 좌하단 debug text에 프레임 병목 후보 지표를 추가했다. CPU frame, fence wait, acquire, chunk load update, subchunk result 처리, chunk upload, uniform update, debug text 갱신, command record, submit/present 시간을 20Hz 샘플링으로 표시한다.
+- `updateLoadedChunks()`를 전체 로딩 반경 재계산 방식에서 증분 갱신 방식으로 바꿨다. 청크 중심이 이동하면 빠진 행/열만 제거하고 새 행/열만 추가하며, 취소된 pending build job은 worker가 꺼낼 때 generation 검사로 lazy discard한다.
+- 증분 로딩 이후 기존 pending build job이 예전 중심 기준 거리 우선순위를 유지하던 문제를 줄이기 위해, worker가 job을 꺼낼 때 현재 중심 기준 거리로 lazy re-priority하도록 했다.
+- 청크 로딩을 다시 단순한 `desiredChunks_` set 방식으로 되돌렸다. 플레이어가 새 청크로 들어가면 `(2r + 1)^2` 정사각형 범위를 다시 만들고, 그 set 기준으로 unload/load queue를 한 번에 갱신한다.
+- 플레이어가 새 청크로 들어갈 때 기존 pending subchunk build job의 거리 우선순위를 현재 중심 청크 기준으로 즉시 재계산하고 heap을 재구성하도록 했다. 이 과정에서 취소된 generation의 stale job도 제거한다.
