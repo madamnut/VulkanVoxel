@@ -8,11 +8,12 @@ layout(location = 0) out vec4 outColor;
 
 void main()
 {
-    float alpha = texture(debugTextTexture, inUv).a * inColor.a;
+    vec4 sampled = texture(debugTextTexture, inUv);
+    float alpha = sampled.a * inColor.a;
     if (alpha < 0.01)
     {
         discard;
     }
 
-    outColor = vec4(inColor.rgb, alpha);
+    outColor = vec4(sampled.rgb * inColor.rgb, alpha);
 }

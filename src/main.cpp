@@ -3,97 +3,58 @@
 
 #define NOMINMAX
 #include <Windows.h>
-#include <psapi.h>
-#include <wincodec.h>
-#include <wrl/client.h>
+
+#include "core/FileSystem.h"
+#include "core/GameConfig.h"
+#include "core/Math.h"
+#include "core/SystemInfo.h"
+#include "player/PlayerController.h"
+#include "player/PlayerTypes.h"
+#include "render/CrosshairRenderer.h"
+#include "render/DebugTextRenderer.h"
+#include "render/PlayerModel.h"
+#include "render/VulkanDescriptors.h"
+#include "render/VulkanHelpers.h"
+#include "render/VulkanPipelineBuilder.h"
+#include "render/TextureManager.h"
+#include "render/VulkanResourceContext.h"
+#include "render/VulkanSwapchain.h"
+#include "world/Block.h"
+#include "world/BlockRegistry.h"
+#include "world/ChunkMesher.h"
+#include "world/ChunkStreamingManager.h"
+#include "world/WorldGenerator.h"
 
 #include <algorithm>
-#include <atomic>
 #include <array>
 #include <chrono>
-#include <condition_variable>
 #include <cmath>
 #include <cstddef>
-#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <exception>
-#include <fstream>
 #include <iomanip>
-#include <intrin.h>
 #include <iostream>
-#include <iterator>
 #include <limits>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
-
-using Microsoft::WRL::ComPtr;
 
 namespace
 {
 constexpr std::uint32_t kWindowWidth = 1280;
 constexpr std::uint32_t kWindowHeight = 720;
 constexpr int kMaxFramesInFlight = 2;
-constexpr float kPi = 3.14159265358979323846f;
-constexpr int kChunkSizeX = 16;
-constexpr int kChunkSizeZ = 16;
-constexpr int kSubchunkSize = 16;
-constexpr int kChunkHeight = 512;
-constexpr int kSubchunksPerChunk = kChunkHeight / kSubchunkSize;
-constexpr int kTerrainBaseHeight = 192;
-constexpr int kTerrainHeightRange = 40;
 constexpr int kDefaultChunkLoadRadius = 5;
 constexpr int kMaxChunkLoadRadius = 64;
 constexpr int kDefaultChunkUploadsPerFrame = 1;
 constexpr int kMaxChunkUploadsPerFrame = 64;
 constexpr int kDefaultChunkBuildThreads = 4;
 constexpr int kMaxChunkBuildThreads = 16;
-constexpr std::size_t kBlockIdCount =
-    static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1;
-constexpr std::uint16_t kAirBlockId = 0;
-constexpr std::uint16_t kRockBlockId = 1;
-constexpr std::uint16_t kDirtBlockId = 2;
-constexpr std::uint16_t kGrassBlockId = 3;
-constexpr std::uint16_t kBedrockBlockId = std::numeric_limits<std::uint16_t>::max();
-constexpr int kDebugGlyphFirst = 32;
-constexpr int kDebugGlyphLast = 126;
-constexpr int kDebugGlyphCount = kDebugGlyphLast - kDebugGlyphFirst + 1;
-constexpr int kDebugGlyphColumns = 16;
-constexpr int kDebugGlyphCellWidth = 64;
-constexpr int kDebugGlyphCellHeight = 64;
-constexpr std::uint32_t kDebugFontAtlasWidth = kDebugGlyphColumns * kDebugGlyphCellWidth;
-constexpr std::uint32_t kDebugFontAtlasHeight =
-    ((kDebugGlyphCount + kDebugGlyphColumns - 1) / kDebugGlyphColumns) * kDebugGlyphCellHeight;
-constexpr std::size_t kMaxDebugTextVertices = 48000;
-
-struct Vec3
-{
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-};
-
-struct Mat4
-{
-    float m[16]{};
-};
-
-struct ImagePixels
-{
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    std::vector<std::uint8_t> rgba;
-};
 
 struct QueueFamilyIndices
 {
@@ -104,86 +65,6 @@ struct QueueFamilyIndices
     {
         return graphicsFamily.has_value() && presentFamily.has_value();
     }
-};
-
-struct SwapchainSupportDetails
-{
-    VkSurfaceCapabilitiesKHR capabilities{};
-    std::vector<VkSurfaceFormatKHR> formats;
-    std::vector<VkPresentModeKHR> presentModes;
-};
-
-struct Texture
-{
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-};
-
-struct Buffer
-{
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-};
-
-struct BlockVertex
-{
-    float position[3];
-    float uv[2];
-    float ao = 1.0f;
-    float textureLayer = 0.0f;
-};
-
-struct FaceMaskCell
-{
-    bool filled = false;
-    std::uint32_t textureLayer = 0;
-    std::array<std::uint8_t, 4> ao{};
-
-    bool operator==(const FaceMaskCell& other) const
-    {
-        return filled == other.filled && (!filled || (textureLayer == other.textureLayer && ao == other.ao));
-    }
-};
-
-enum class BlockFace : std::uint8_t
-{
-    Top = 0,
-    Side = 1,
-    Bottom = 2,
-};
-
-struct BlockDefinition
-{
-    std::uint16_t id = kAirBlockId;
-    std::string name;
-    bool solid = false;
-    std::array<std::uint32_t, 3> textureLayers{};
-};
-
-struct ChunkColumnData
-{
-    std::array<int, kChunkSizeX * kChunkSizeZ> highestSolidY{};
-};
-
-struct MeshRange
-{
-    std::uint32_t vertexCount = 0;
-    std::uint32_t firstIndex = 0;
-    std::uint32_t indexCount = 0;
-    std::int32_t vertexOffset = 0;
-};
-
-struct SubchunkDraw
-{
-    int chunkX = 0;
-    int chunkZ = 0;
-    int subchunkY = 0;
-    MeshRange range{};
 };
 
 struct ChunkMesh
@@ -211,73 +92,6 @@ struct DeferredUploadCleanup
     std::uint64_t retireFrame = 0;
 };
 
-struct ChunkCoord
-{
-    int x = 0;
-    int z = 0;
-
-    bool operator==(ChunkCoord other) const
-    {
-        return x == other.x && z == other.z;
-    }
-};
-
-struct ChunkCoordHash
-{
-    std::size_t operator()(ChunkCoord coord) const
-    {
-        const std::uint64_t x = static_cast<std::uint32_t>(coord.x);
-        const std::uint64_t z = static_cast<std::uint32_t>(coord.z);
-        return static_cast<std::size_t>((x << 32) ^ z);
-    }
-};
-
-struct ChunkBuildResult
-{
-    ChunkCoord coord{};
-    std::vector<BlockVertex> vertices;
-    std::vector<std::uint32_t> indices;
-    std::vector<SubchunkDraw> subchunks;
-};
-
-struct ChunkBuildRequest
-{
-    ChunkCoord coord{};
-    int subchunkY = 0;
-    std::int64_t priorityDistanceSq = 0;
-    std::uint64_t generation = 0;
-};
-
-struct SubchunkBuildResult
-{
-    ChunkCoord coord{};
-    int subchunkY = 0;
-    std::uint64_t generation = 0;
-    std::vector<BlockVertex> vertices;
-    std::vector<std::uint32_t> indices;
-};
-
-struct PendingChunkMesh
-{
-    std::uint64_t generation = 0;
-    int completedSubchunks = 0;
-    std::array<bool, kSubchunksPerChunk> received{};
-    std::array<std::vector<BlockVertex>, kSubchunksPerChunk> vertices;
-    std::array<std::vector<std::uint32_t>, kSubchunksPerChunk> indices;
-};
-
-struct ChunkBuildRequestPriority
-{
-    bool operator()(const ChunkBuildRequest& lhs, const ChunkBuildRequest& rhs) const
-    {
-        if (lhs.priorityDistanceSq != rhs.priorityDistanceSq)
-        {
-            return lhs.priorityDistanceSq > rhs.priorityDistanceSq;
-        }
-        return lhs.generation < rhs.generation;
-    }
-};
-
 struct SkyUniform
 {
     alignas(16) float camera[4];      // yaw, pitch, aspect, tan(fovY / 2)
@@ -289,16 +103,6 @@ struct SkyUniform
 struct BlockUniform
 {
     alignas(16) float viewProjection[16];
-};
-
-struct CameraState
-{
-    float yaw = 0.0f;   // +X is east, so the initial view looks east.
-    float pitch = 0.0f;
-    Vec3 position{80.0f, 310.0f, 80.0f};
-    bool firstMouse = true;
-    double lastMouseX = 0.0;
-    double lastMouseY = 0.0;
 };
 
 struct DebugTextOverlay
@@ -364,164 +168,9 @@ struct FrameProfiler
     std::size_t chunksQueued = 0;
 };
 
-struct ChunkLoadUpdateStats
-{
-    std::size_t loaded = 0;
-    std::size_t unloaded = 0;
-    std::size_t queued = 0;
-};
-
-struct DebugGlyph
-{
-    float u0 = 0.0f;
-    float v0 = 0.0f;
-    float u1 = 0.0f;
-    float v1 = 0.0f;
-    float advance = 0.0f;
-    float width = 0.0f;
-    float height = 0.0f;
-};
-
-struct DebugTextVertex
-{
-    float position[2];
-    float uv[2];
-    float color[4];
-};
-
 void glfwErrorCallback(int errorCode, const char* description)
 {
     std::cerr << "GLFW error " << errorCode << ": " << description << '\n';
-}
-
-std::vector<char> readBinaryFile(const std::string& path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file.is_open())
-    {
-        throw std::runtime_error("Failed to open file: " + path);
-    }
-
-    const std::streamsize fileSize = file.tellg();
-    std::vector<char> buffer(static_cast<std::size_t>(fileSize));
-    file.seekg(0);
-    file.read(buffer.data(), fileSize);
-    return buffer;
-}
-
-std::uint32_t findMemoryType(
-    VkPhysicalDevice physicalDevice,
-    std::uint32_t typeFilter,
-    VkMemoryPropertyFlags properties)
-{
-    VkPhysicalDeviceMemoryProperties memoryProperties{};
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
-
-    for (std::uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i)
-    {
-        if ((typeFilter & (1u << i)) != 0 &&
-            (memoryProperties.memoryTypes[i].propertyFlags & properties) == properties)
-        {
-            return i;
-        }
-    }
-
-    throw std::runtime_error("Failed to find a suitable Vulkan memory type.");
-}
-
-ImagePixels loadPngWithWic(const std::wstring& path)
-{
-    ComPtr<IWICImagingFactory> factory;
-    HRESULT result = CoCreateInstance(
-        CLSID_WICImagingFactory,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&factory));
-    if (FAILED(result))
-    {
-        throw std::runtime_error("Failed to create WIC imaging factory.");
-    }
-
-    ComPtr<IWICBitmapDecoder> decoder;
-    result = factory->CreateDecoderFromFilename(
-        path.c_str(),
-        nullptr,
-        GENERIC_READ,
-        WICDecodeMetadataCacheOnLoad,
-        &decoder);
-    if (FAILED(result))
-    {
-        throw std::runtime_error("Failed to open PNG texture.");
-    }
-
-    ComPtr<IWICBitmapFrameDecode> frame;
-    result = decoder->GetFrame(0, &frame);
-    if (FAILED(result))
-    {
-        throw std::runtime_error("Failed to decode PNG frame.");
-    }
-
-    ComPtr<IWICFormatConverter> converter;
-    result = factory->CreateFormatConverter(&converter);
-    if (FAILED(result))
-    {
-        throw std::runtime_error("Failed to create WIC format converter.");
-    }
-
-    result = converter->Initialize(
-        frame.Get(),
-        GUID_WICPixelFormat32bppRGBA,
-        WICBitmapDitherTypeNone,
-        nullptr,
-        0.0,
-        WICBitmapPaletteTypeCustom);
-    if (FAILED(result))
-    {
-        throw std::runtime_error("Failed to convert PNG to RGBA.");
-    }
-
-    ImagePixels image{};
-    result = converter->GetSize(&image.width, &image.height);
-    if (FAILED(result) || image.width == 0 || image.height == 0)
-    {
-        throw std::runtime_error("PNG texture has an invalid size.");
-    }
-
-    const std::uint32_t stride = image.width * 4;
-    image.rgba.resize(static_cast<std::size_t>(stride) * image.height);
-    result = converter->CopyPixels(nullptr, stride, static_cast<UINT>(image.rgba.size()), image.rgba.data());
-    if (FAILED(result))
-    {
-        throw std::runtime_error("Failed to copy PNG pixels.");
-    }
-
-    return image;
-}
-
-std::wstring sourcePathWide(const wchar_t* relativePath)
-{
-    return std::wstring(VULKAN_VOXEL_SOURCE_DIR_WIDE) + relativePath;
-}
-
-std::wstring sourcePathWide(const std::wstring& relativePath)
-{
-    return std::wstring(VULKAN_VOXEL_SOURCE_DIR_WIDE) + relativePath;
-}
-
-std::string sourcePath(const char* relativePath)
-{
-    return std::string(VULKAN_VOXEL_SOURCE_DIR) + relativePath;
-}
-
-std::wstring asciiToWide(const std::string& text)
-{
-    return std::wstring(text.begin(), text.end());
-}
-
-bool fileExists(const std::wstring& path)
-{
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
 int floorDiv(int value, int divisor)
@@ -538,203 +187,6 @@ int floorDiv(int value, int divisor)
 int chunkCoordForWorldPosition(float position, int chunkSize)
 {
     return floorDiv(static_cast<int>(std::floor(position)), chunkSize);
-}
-
-std::int64_t chunkDistanceSq(ChunkCoord coord, int centerChunkX, int centerChunkZ)
-{
-    const std::int64_t dx = static_cast<std::int64_t>(coord.x) - centerChunkX;
-    const std::int64_t dz = static_cast<std::int64_t>(coord.z) - centerChunkZ;
-    return dx * dx + dz * dz;
-}
-
-Vec3 operator+(Vec3 lhs, Vec3 rhs)
-{
-    return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
-}
-
-Vec3 operator-(Vec3 lhs, Vec3 rhs)
-{
-    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
-}
-
-Vec3 operator*(Vec3 value, float scalar)
-{
-    return {value.x * scalar, value.y * scalar, value.z * scalar};
-}
-
-float dot(Vec3 lhs, Vec3 rhs)
-{
-    return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
-}
-
-Vec3 cross(Vec3 lhs, Vec3 rhs)
-{
-    return {
-        lhs.y * rhs.z - lhs.z * rhs.y,
-        lhs.z * rhs.x - lhs.x * rhs.z,
-        lhs.x * rhs.y - lhs.y * rhs.x,
-    };
-}
-
-Vec3 normalize(Vec3 value)
-{
-    const float length = std::sqrt(dot(value, value));
-    if (length <= 0.00001f)
-    {
-        return {};
-    }
-
-    return value * (1.0f / length);
-}
-
-std::uint8_t vertexAo(bool side1, bool side2, bool corner)
-{
-    if (side1 && side2)
-    {
-        return 0;
-    }
-
-    return static_cast<std::uint8_t>(
-        3 - static_cast<int>(side1) - static_cast<int>(side2) - static_cast<int>(corner));
-}
-
-float aoFactor(std::uint8_t ao)
-{
-    return 0.55f + 0.15f * static_cast<float>(ao);
-}
-
-Vec3 cameraForward(float yaw, float pitch)
-{
-    return normalize({
-        std::cos(pitch) * std::cos(yaw),
-        std::sin(pitch),
-        std::cos(pitch) * std::sin(yaw),
-    });
-}
-
-Vec3 cameraRight(float yaw)
-{
-    return normalize({-std::sin(yaw), 0.0f, std::cos(yaw)});
-}
-
-Mat4 multiply(Mat4 lhs, Mat4 rhs)
-{
-    Mat4 result{};
-    for (int column = 0; column < 4; ++column)
-    {
-        for (int row = 0; row < 4; ++row)
-        {
-            for (int i = 0; i < 4; ++i)
-            {
-                result.m[column * 4 + row] += lhs.m[i * 4 + row] * rhs.m[column * 4 + i];
-            }
-        }
-    }
-
-    return result;
-}
-
-Mat4 makeViewMatrix(Vec3 position, float yaw, float pitch)
-{
-    const Vec3 forward = cameraForward(yaw, pitch);
-    const Vec3 right = normalize(cross(forward, {0.0f, 1.0f, 0.0f}));
-    const Vec3 up = normalize(cross(right, forward));
-
-    Mat4 view{};
-    view.m[0] = right.x;
-    view.m[1] = up.x;
-    view.m[2] = forward.x;
-    view.m[4] = right.y;
-    view.m[5] = up.y;
-    view.m[6] = forward.y;
-    view.m[8] = right.z;
-    view.m[9] = up.z;
-    view.m[10] = forward.z;
-    view.m[12] = -dot(right, position);
-    view.m[13] = -dot(up, position);
-    view.m[14] = -dot(forward, position);
-    view.m[15] = 1.0f;
-    return view;
-}
-
-Mat4 makePerspectiveMatrix(float fovYRadians, float aspect, float nearPlane, float farPlane)
-{
-    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
-    const float depthScale = farPlane / (farPlane - nearPlane);
-
-    Mat4 projection{};
-    projection.m[0] = 1.0f / (aspect * tanHalfFov);
-    projection.m[5] = 1.0f / tanHalfFov;
-    projection.m[10] = depthScale;
-    projection.m[11] = 1.0f;
-    projection.m[14] = -nearPlane * depthScale;
-    return projection;
-}
-
-std::wstring formatFixedWidth(double value, int width, int precision)
-{
-    std::wostringstream stream;
-    stream << std::fixed << std::setprecision(precision) << std::setw(width) << std::setfill(L'0') << value;
-    return stream.str();
-}
-
-std::wstring versionString(std::uint32_t version)
-{
-    std::wostringstream stream;
-    stream << VK_VERSION_MAJOR(version) << L'.'
-           << VK_VERSION_MINOR(version) << L'.'
-           << VK_VERSION_PATCH(version);
-    return stream.str();
-}
-
-std::wstring narrowToWide(const char* text)
-{
-    if (text == nullptr)
-    {
-        return L"";
-    }
-
-    const int length = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
-    if (length <= 1)
-    {
-        return L"";
-    }
-
-    std::wstring result(static_cast<std::size_t>(length), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text, -1, result.data(), length);
-    result.pop_back();
-    return result;
-}
-
-std::wstring getCpuBrandString()
-{
-    int cpuInfo[4] = {};
-    __cpuid(cpuInfo, 0x80000000);
-    const unsigned int maxExtendedId = static_cast<unsigned int>(cpuInfo[0]);
-    if (maxExtendedId < 0x80000004)
-    {
-        return L"N/A";
-    }
-
-    char brand[49] = {};
-    for (unsigned int id = 0; id < 3; ++id)
-    {
-        int brandInfo[4] = {};
-        __cpuid(brandInfo, static_cast<int>(0x80000002 + id));
-        std::memcpy(brand + id * 16, brandInfo, sizeof(brandInfo));
-    }
-
-    std::string trimmed = brand;
-    trimmed.erase(trimmed.begin(), std::find_if(trimmed.begin(), trimmed.end(), [](unsigned char ch)
-    {
-        return !std::isspace(ch);
-    }));
-    trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), [](unsigned char ch)
-    {
-        return !std::isspace(ch);
-    }).base(), trimmed.end());
-
-    return narrowToWide(trimmed.c_str());
 }
 
 class VulkanVoxelApp
@@ -755,6 +207,10 @@ private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties physicalDeviceProperties_{};
     bool memoryBudgetSupported_ = false;
+    VulkanResourceContext resourceContext_{};
+    TextureManager textureManager_{};
+    DebugTextRenderer debugTextRenderer_{};
+    PlayerModel playerModel_{};
     std::wstring versionDebugLine_;
     std::wstring gpuDebugLine_;
     std::wstring cpuDebugLine_;
@@ -776,9 +232,11 @@ private:
     VkDescriptorSetLayout debugTextDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout blockPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout playerPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout debugTextPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
     VkPipeline blockPipeline_ = VK_NULL_HANDLE;
+    VkPipeline playerPipeline_ = VK_NULL_HANDLE;
     VkPipeline debugTextPipeline_ = VK_NULL_HANDLE;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
@@ -792,52 +250,47 @@ private:
     Texture sunTexture_{};
     Texture moonTexture_{};
     Texture blockTextureArray_{};
+    Texture playerTexture_{};
+    Texture crosshairTexture_{};
     Texture debugFontAtlasTexture_{};
     VkSampler textureSampler_ = VK_NULL_HANDLE;
     Buffer uniformBuffer_{};
     Buffer blockUniformBuffer_{};
     Buffer debugTextVertexBuffer_{};
+    Buffer crosshairVertexBuffer_{};
+    Buffer playerVertexBuffer_{};
+    Buffer playerIndexBuffer_{};
     void* uniformMappedMemory_ = nullptr;
     void* blockUniformMappedMemory_ = nullptr;
     void* debugTextVertexMappedMemory_ = nullptr;
+    void* crosshairVertexMappedMemory_ = nullptr;
+    void* playerVertexMappedMemory_ = nullptr;
     std::uint32_t debugTextVertexCount_ = 0;
+    std::uint32_t crosshairVertexCount_ = 0;
+    std::uint32_t playerVertexCount_ = 0;
+    std::uint32_t playerIndexCount_ = 0;
     std::vector<ChunkMesh> chunkMeshes_;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
     VkDescriptorSet blockDescriptorSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet playerDescriptorSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet crosshairDescriptorSet_ = VK_NULL_HANDLE;
     VkDescriptorSet debugTextDescriptorSet_ = VK_NULL_HANDLE;
     CameraState camera_{};
+    PlayerController playerController_{};
+    WorldGenerator worldGenerator_{};
     DebugTextOverlay debugTextOverlay_{};
     FrameProfiler frameProfiler_{};
     bool debugTextVisible_ = true;
-    int chunkLoadRadius_ = kDefaultChunkLoadRadius;
     int chunkUploadsPerFrame_ = kDefaultChunkUploadsPerFrame;
-    int chunkBuildThreads_ = kDefaultChunkBuildThreads;
-    int loadedCenterChunkX_ = std::numeric_limits<int>::min();
-    int loadedCenterChunkZ_ = std::numeric_limits<int>::min();
-    std::vector<BlockDefinition> blockDefinitions_;
-    std::array<int, kBlockIdCount> blockDefinitionIndices_{};
+    BlockRegistry blockRegistry_{};
     std::vector<std::wstring> blockTextureLayerNames_;
-    std::unordered_set<ChunkCoord, ChunkCoordHash> desiredChunks_;
-    std::unordered_set<ChunkCoord, ChunkCoordHash> loadedChunks_;
-    std::unordered_set<ChunkCoord, ChunkCoordHash> queuedChunks_;
-    std::vector<std::thread> chunkBuildWorkers_;
-    std::mutex chunkBuildMutex_;
-    std::condition_variable chunkBuildCv_;
-    std::vector<ChunkBuildRequest> pendingChunkBuilds_;
-    std::deque<SubchunkBuildResult> completedSubchunkBuilds_;
-    std::deque<ChunkBuildResult> completedChunkBuilds_;
-    std::atomic_bool chunkBuildWorkerRunning_ = false;
-    std::uint64_t chunkBuildGeneration_ = 0;
-    int chunkBuildPriorityCenterX_ = 0;
-    int chunkBuildPriorityCenterZ_ = 0;
-    std::unordered_map<ChunkCoord, std::uint64_t, ChunkCoordHash> queuedChunkGenerations_;
-    std::unordered_map<ChunkCoord, PendingChunkMesh, ChunkCoordHash> pendingChunkMeshes_;
+    ChunkMesher chunkMesher_{worldGenerator_, blockRegistry_};
+    ChunkStreamingManager chunkStreaming_{chunkMesher_};
     std::vector<DeferredChunkBufferDestroy> deferredChunkBufferDestroys_;
     std::vector<DeferredUploadCleanup> deferredUploadCleanups_;
     std::size_t meshVertexCount_ = 0;
     std::size_t meshIndexCount_ = 0;
-    std::array<DebugGlyph, kDebugGlyphCount> debugGlyphs_{};
     std::chrono::steady_clock::time_point lastFrameTime_ = std::chrono::steady_clock::now();
     bool cursorCaptured_ = true;
     bool fullscreen_ = false;
@@ -889,6 +342,14 @@ private:
         {
             app->debugTextVisible_ = !app->debugTextVisible_;
         }
+        else if (key == GLFW_KEY_F && action == GLFW_PRESS)
+        {
+            app->playerController_.toggleMovementMode();
+        }
+        else if (key == GLFW_KEY_F5 && action == GLFW_PRESS)
+        {
+            app->playerController_.cycleCameraViewMode();
+        }
     }
 
     void initWindow()
@@ -936,17 +397,23 @@ private:
 
         pickPhysicalDevice();
         createLogicalDevice();
+        resourceContext_.setDevice(physicalDevice_, device_);
         createSwapchain();
-        createImageViews();
         createRenderPass();
         createDepthResources();
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createBlockPipeline();
+        createPlayerPipeline();
         createDebugTextPipeline();
         createFramebuffers();
         createCommandPool();
+        resourceContext_.setTransferContext(commandPool_, graphicsQueue_);
+        textureManager_.setContext(device_, resourceContext_);
         createSkyTextures();
+        createCrosshairTexture();
+        loadPlayerMesh();
+        createPlayerTexture();
         loadBlockDefinitions();
         createBlockTextureArray();
         loadWorldConfig();
@@ -960,6 +427,8 @@ private:
         createDescriptorPool();
         createDescriptorSet();
         createBlockDescriptorSet();
+        createPlayerDescriptorSet();
+        createCrosshairDescriptorSet();
         createDebugTextDescriptorSet();
         createCommandBuffers();
         createSyncObjects();
@@ -988,9 +457,12 @@ private:
 
         cleanupSwapchain();
 
-        destroyBuffer(uniformBuffer_);
-        destroyBuffer(blockUniformBuffer_);
-        destroyBuffer(debugTextVertexBuffer_);
+        resourceContext_.destroyBuffer(uniformBuffer_);
+        resourceContext_.destroyBuffer(blockUniformBuffer_);
+        resourceContext_.destroyBuffer(debugTextVertexBuffer_);
+        resourceContext_.destroyBuffer(crosshairVertexBuffer_);
+        resourceContext_.destroyBuffer(playerVertexBuffer_);
+        resourceContext_.destroyBuffer(playerIndexBuffer_);
         destroyAllChunkMeshes();
 
         if (descriptorPool_ != VK_NULL_HANDLE)
@@ -1003,10 +475,12 @@ private:
             vkDestroySampler(device_, textureSampler_, nullptr);
         }
 
-        destroyTexture(sunTexture_);
-        destroyTexture(moonTexture_);
-        destroyTexture(blockTextureArray_);
-        destroyTexture(debugFontAtlasTexture_);
+        resourceContext_.destroyTexture(sunTexture_);
+        resourceContext_.destroyTexture(moonTexture_);
+        resourceContext_.destroyTexture(blockTextureArray_);
+        resourceContext_.destroyTexture(playerTexture_);
+        resourceContext_.destroyTexture(crosshairTexture_);
+        resourceContext_.destroyTexture(debugFontAtlasTexture_);
         RemoveFontResourceExW(sourcePathWide(L"/assets/fonts/VCR_OSD_MONO.ttf").c_str(), FR_PRIVATE, nullptr);
 
         if (descriptorSetLayout_ != VK_NULL_HANDLE)
@@ -1126,7 +600,7 @@ private:
         bool swapchainAdequate = false;
         if (extensionsSupported)
         {
-            SwapchainSupportDetails swapchainSupport = querySwapchainSupport(device);
+            SwapchainSupportDetails swapchainSupport = querySwapchainSupport(device, surface_);
             swapchainAdequate = !swapchainSupport.formats.empty() && !swapchainSupport.presentModes.empty();
         }
 
@@ -1203,30 +677,6 @@ private:
         return false;
     }
 
-    SwapchainSupportDetails querySwapchainSupport(VkPhysicalDevice device) const
-    {
-        SwapchainSupportDetails details{};
-        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface_, &details.capabilities);
-
-        std::uint32_t formatCount = 0;
-        vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface_, &formatCount, nullptr);
-        if (formatCount != 0)
-        {
-            details.formats.resize(formatCount);
-            vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface_, &formatCount, details.formats.data());
-        }
-
-        std::uint32_t presentModeCount = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface_, &presentModeCount, nullptr);
-        if (presentModeCount != 0)
-        {
-            details.presentModes.resize(presentModeCount);
-            vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface_, &presentModeCount, details.presentModes.data());
-        }
-
-        return details;
-    }
-
     void createLogicalDevice()
     {
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice_);
@@ -1279,160 +729,26 @@ private:
 
     void createSwapchain()
     {
-        SwapchainSupportDetails support = querySwapchainSupport(physicalDevice_);
-        VkSurfaceFormatKHR surfaceFormat = chooseSwapSurfaceFormat(support.formats);
-        VkPresentModeKHR presentMode = chooseSwapPresentMode(support.presentModes);
-        VkExtent2D extent = chooseSwapExtent(support.capabilities);
-
-        std::uint32_t imageCount = support.capabilities.minImageCount + 1;
-        if (support.capabilities.maxImageCount > 0 && imageCount > support.capabilities.maxImageCount)
-        {
-            imageCount = support.capabilities.maxImageCount;
-        }
-
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice_);
-        std::array<std::uint32_t, 2> queueFamilyIndices = {
-            indices.graphicsFamily.value(),
-            indices.presentFamily.value(),
-        };
-
-        VkSwapchainCreateInfoKHR createInfo{};
-        createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-        createInfo.surface = surface_;
-        createInfo.minImageCount = imageCount;
-        createInfo.imageFormat = surfaceFormat.format;
-        createInfo.imageColorSpace = surfaceFormat.colorSpace;
-        createInfo.imageExtent = extent;
-        createInfo.imageArrayLayers = 1;
-        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-
-        if (indices.graphicsFamily != indices.presentFamily)
-        {
-            createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
-            createInfo.queueFamilyIndexCount = static_cast<std::uint32_t>(queueFamilyIndices.size());
-            createInfo.pQueueFamilyIndices = queueFamilyIndices.data();
-        }
-        else
-        {
-            createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        }
-
-        createInfo.preTransform = support.capabilities.currentTransform;
-        createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        createInfo.presentMode = presentMode;
-        createInfo.clipped = VK_TRUE;
-        createInfo.oldSwapchain = VK_NULL_HANDLE;
-
-        if (vkCreateSwapchainKHR(device_, &createInfo, nullptr, &swapchain_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan swapchain.");
-        }
-
-        vkGetSwapchainImagesKHR(device_, swapchain_, &imageCount, nullptr);
-        swapchainImages_.resize(imageCount);
-        vkGetSwapchainImagesKHR(device_, swapchain_, &imageCount, swapchainImages_.data());
-
-        swapchainImageFormat_ = surfaceFormat.format;
-        swapchainExtent_ = extent;
-    }
-
-    VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats) const
-    {
-        for (const VkSurfaceFormatKHR& format : availableFormats)
-        {
-            if (format.format == VK_FORMAT_B8G8R8A8_SRGB &&
-                format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-            {
-                return format;
-            }
-        }
-
-        return availableFormats.front();
-    }
-
-    VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& availablePresentModes) const
-    {
-        for (VkPresentModeKHR presentMode : availablePresentModes)
-        {
-            if (presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR)
-            {
-                return presentMode;
-            }
-        }
-
-        for (VkPresentModeKHR presentMode : availablePresentModes)
-        {
-            if (presentMode == VK_PRESENT_MODE_MAILBOX_KHR)
-            {
-                return presentMode;
-            }
-        }
-
-        return VK_PRESENT_MODE_FIFO_KHR;
-    }
-
-    VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities) const
-    {
-        if (capabilities.currentExtent.width != std::numeric_limits<std::uint32_t>::max())
-        {
-            return capabilities.currentExtent;
-        }
-
         int width = 0;
         int height = 0;
         glfwGetFramebufferSize(window_, &width, &height);
 
-        VkExtent2D actualExtent = {
+        VulkanSwapchainResources resources = createVulkanSwapchain({
+            physicalDevice_,
+            device_,
+            surface_,
+            indices.graphicsFamily.value(),
+            indices.presentFamily.value(),
             static_cast<std::uint32_t>(width),
             static_cast<std::uint32_t>(height),
-        };
+        });
 
-        actualExtent.width = std::clamp(
-            actualExtent.width,
-            capabilities.minImageExtent.width,
-            capabilities.maxImageExtent.width);
-        actualExtent.height = std::clamp(
-            actualExtent.height,
-            capabilities.minImageExtent.height,
-            capabilities.maxImageExtent.height);
-
-        return actualExtent;
-    }
-
-    void createImageViews()
-    {
-        swapchainImageViews_.resize(swapchainImages_.size());
-        for (std::size_t i = 0; i < swapchainImages_.size(); ++i)
-        {
-            swapchainImageViews_[i] = createImageView(swapchainImages_[i], swapchainImageFormat_);
-        }
-    }
-
-    VkImageView createImageView(
-        VkImage image,
-        VkFormat format,
-        VkImageAspectFlags aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D,
-        std::uint32_t layerCount = 1)
-    {
-        VkImageViewCreateInfo createInfo{};
-        createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        createInfo.image = image;
-        createInfo.viewType = viewType;
-        createInfo.format = format;
-        createInfo.subresourceRange.aspectMask = aspectMask;
-        createInfo.subresourceRange.baseMipLevel = 0;
-        createInfo.subresourceRange.levelCount = 1;
-        createInfo.subresourceRange.baseArrayLayer = 0;
-        createInfo.subresourceRange.layerCount = layerCount;
-
-        VkImageView imageView = VK_NULL_HANDLE;
-        if (vkCreateImageView(device_, &createInfo, nullptr, &imageView) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan image view.");
-        }
-
-        return imageView;
+        swapchain_ = resources.swapchain;
+        swapchainImageFormat_ = resources.imageFormat;
+        swapchainExtent_ = resources.extent;
+        swapchainImages_ = std::move(resources.images);
+        swapchainImageViews_ = std::move(resources.imageViews);
     }
 
     void createRenderPass()
@@ -1548,7 +864,7 @@ private:
         depthTexture_.width = swapchainExtent_.width;
         depthTexture_.height = swapchainExtent_.height;
 
-        createImage(
+        resourceContext_.createImage(
             depthTexture_.width,
             depthTexture_.height,
             depthTexture_.format,
@@ -1558,237 +874,62 @@ private:
             depthTexture_.image,
             depthTexture_.memory);
 
-        depthTexture_.view = createImageView(depthTexture_.image, depthTexture_.format, VK_IMAGE_ASPECT_DEPTH_BIT);
+        depthTexture_.view = createVulkanImageView(
+            device_,
+            depthTexture_.image,
+            depthTexture_.format,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
         depthTexture_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     }
 
     void createDescriptorSetLayout()
     {
-        VkDescriptorSetLayoutBinding uniformBinding{};
-        uniformBinding.binding = 0;
-        uniformBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        uniformBinding.descriptorCount = 1;
-        uniformBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-
-        VkDescriptorSetLayoutBinding sunTextureBinding{};
-        sunTextureBinding.binding = 1;
-        sunTextureBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sunTextureBinding.descriptorCount = 1;
-        sunTextureBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding moonTextureBinding{};
-        moonTextureBinding.binding = 2;
-        moonTextureBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        moonTextureBinding.descriptorCount = 1;
-        moonTextureBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        std::array<VkDescriptorSetLayoutBinding, 3> bindings = {
-            uniformBinding,
-            sunTextureBinding,
-            moonTextureBinding,
+        const std::array<VkDescriptorSetLayoutBinding, 3> bindings = {
+            descriptorSetLayoutBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT),
+            descriptorSetLayoutBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT),
+            descriptorSetLayoutBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT),
         };
+        descriptorSetLayout_ = createVulkanDescriptorSetLayout(
+            device_,
+            bindings,
+            "Failed to create Vulkan descriptor set layout.");
 
-        VkDescriptorSetLayoutCreateInfo layoutInfo{};
-        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
-        layoutInfo.pBindings = bindings.data();
-
-        if (vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan descriptor set layout.");
-        }
-
-        VkDescriptorSetLayoutBinding blockUniformBinding{};
-        blockUniformBinding.binding = 0;
-        blockUniformBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        blockUniformBinding.descriptorCount = 1;
-        blockUniformBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-
-        VkDescriptorSetLayoutBinding blockTextureBinding{};
-        blockTextureBinding.binding = 1;
-        blockTextureBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        blockTextureBinding.descriptorCount = 1;
-        blockTextureBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        std::array<VkDescriptorSetLayoutBinding, 2> blockBindings = {
-            blockUniformBinding,
-            blockTextureBinding,
+        const std::array<VkDescriptorSetLayoutBinding, 2> blockBindings = {
+            descriptorSetLayoutBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT),
+            descriptorSetLayoutBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT),
         };
+        blockDescriptorSetLayout_ = createVulkanDescriptorSetLayout(
+            device_,
+            blockBindings,
+            "Failed to create Vulkan block descriptor set layout.");
 
-        VkDescriptorSetLayoutCreateInfo blockLayoutInfo{};
-        blockLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        blockLayoutInfo.bindingCount = static_cast<std::uint32_t>(blockBindings.size());
-        blockLayoutInfo.pBindings = blockBindings.data();
-
-        if (vkCreateDescriptorSetLayout(device_, &blockLayoutInfo, nullptr, &blockDescriptorSetLayout_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan block descriptor set layout.");
-        }
-
-        VkDescriptorSetLayoutBinding debugTextTextureBinding{};
-        debugTextTextureBinding.binding = 0;
-        debugTextTextureBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        debugTextTextureBinding.descriptorCount = 1;
-        debugTextTextureBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutCreateInfo debugTextLayoutInfo{};
-        debugTextLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        debugTextLayoutInfo.bindingCount = 1;
-        debugTextLayoutInfo.pBindings = &debugTextTextureBinding;
-
-        if (vkCreateDescriptorSetLayout(device_, &debugTextLayoutInfo, nullptr, &debugTextDescriptorSetLayout_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan debug text descriptor set layout.");
-        }
+        const std::array<VkDescriptorSetLayoutBinding, 1> debugTextBindings = {
+            descriptorSetLayoutBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT),
+        };
+        debugTextDescriptorSetLayout_ = createVulkanDescriptorSetLayout(
+            device_,
+            debugTextBindings,
+            "Failed to create Vulkan debug text descriptor set layout.");
     }
 
     void createGraphicsPipeline()
     {
         const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
-        std::vector<char> vertexShaderCode = readBinaryFile(shaderDir + "sky.vert.spv");
-        std::vector<char> fragmentShaderCode = readBinaryFile(shaderDir + "sky.frag.spv");
+        GraphicsPipelineConfig config{};
+        config.vertexShaderPath = shaderDir + "sky.vert.spv";
+        config.fragmentShaderPath = shaderDir + "sky.frag.spv";
+        config.extent = swapchainExtent_;
+        config.renderPass = renderPass_;
+        config.descriptorSetLayout = descriptorSetLayout_;
 
-        VkShaderModule vertexShaderModule = createShaderModule(vertexShaderCode);
-        VkShaderModule fragmentShaderModule = createShaderModule(fragmentShaderCode);
-
-        VkPipelineShaderStageCreateInfo vertexShaderStageInfo{};
-        vertexShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        vertexShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
-        vertexShaderStageInfo.module = vertexShaderModule;
-        vertexShaderStageInfo.pName = "main";
-
-        VkPipelineShaderStageCreateInfo fragmentShaderStageInfo{};
-        fragmentShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        fragmentShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        fragmentShaderStageInfo.module = fragmentShaderModule;
-        fragmentShaderStageInfo.pName = "main";
-
-        std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages = {
-            vertexShaderStageInfo,
-            fragmentShaderStageInfo,
-        };
-
-        VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
-        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkViewport viewport{};
-        viewport.x = 0.0f;
-        viewport.y = static_cast<float>(swapchainExtent_.height);
-        viewport.width = static_cast<float>(swapchainExtent_.width);
-        viewport.height = -static_cast<float>(swapchainExtent_.height);
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
-
-        VkRect2D scissor{};
-        scissor.offset = {0, 0};
-        scissor.extent = swapchainExtent_;
-
-        VkPipelineViewportStateCreateInfo viewportState{};
-        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewportState.viewportCount = 1;
-        viewportState.pViewports = &viewport;
-        viewportState.scissorCount = 1;
-        viewportState.pScissors = &scissor;
-
-        VkPipelineRasterizationStateCreateInfo rasterizer{};
-        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-        rasterizer.lineWidth = 1.0f;
-        rasterizer.cullMode = VK_CULL_MODE_NONE;
-        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
-
-        VkPipelineMultisampleStateCreateInfo multisampling{};
-        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo depthStencil{};
-        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depthStencil.depthTestEnable = VK_FALSE;
-        depthStencil.depthWriteEnable = VK_FALSE;
-        depthStencil.stencilTestEnable = VK_FALSE;
-
-        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-        colorBlendAttachment.colorWriteMask =
-            VK_COLOR_COMPONENT_R_BIT |
-            VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT |
-            VK_COLOR_COMPONENT_A_BIT;
-        colorBlendAttachment.blendEnable = VK_TRUE;
-        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
-
-        VkPipelineColorBlendStateCreateInfo colorBlending{};
-        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        colorBlending.attachmentCount = 1;
-        colorBlending.pAttachments = &colorBlendAttachment;
-
-        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 1;
-        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout_;
-
-        if (vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &pipelineLayout_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan pipeline layout.");
-        }
-
-        VkGraphicsPipelineCreateInfo pipelineInfo{};
-        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pipelineInfo.stageCount = static_cast<std::uint32_t>(shaderStages.size());
-        pipelineInfo.pStages = shaderStages.data();
-        pipelineInfo.pVertexInputState = &vertexInputInfo;
-        pipelineInfo.pInputAssemblyState = &inputAssembly;
-        pipelineInfo.pViewportState = &viewportState;
-        pipelineInfo.pRasterizationState = &rasterizer;
-        pipelineInfo.pMultisampleState = &multisampling;
-        pipelineInfo.pDepthStencilState = &depthStencil;
-        pipelineInfo.pColorBlendState = &colorBlending;
-        pipelineInfo.layout = pipelineLayout_;
-        pipelineInfo.renderPass = renderPass_;
-        pipelineInfo.subpass = 0;
-
-        if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan graphics pipeline.");
-        }
-
-        vkDestroyShaderModule(device_, fragmentShaderModule, nullptr);
-        vkDestroyShaderModule(device_, vertexShaderModule, nullptr);
+        const GraphicsPipelineBundle bundle = createGraphicsPipelineBundle(device_, config);
+        pipelineLayout_ = bundle.layout;
+        graphicsPipeline_ = bundle.pipeline;
     }
 
     void createBlockPipeline()
     {
         const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
-        std::vector<char> vertexShaderCode = readBinaryFile(shaderDir + "block.vert.spv");
-        std::vector<char> fragmentShaderCode = readBinaryFile(shaderDir + "block.frag.spv");
-
-        VkShaderModule vertexShaderModule = createShaderModule(vertexShaderCode);
-        VkShaderModule fragmentShaderModule = createShaderModule(fragmentShaderCode);
-
-        VkPipelineShaderStageCreateInfo vertexShaderStageInfo{};
-        vertexShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        vertexShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
-        vertexShaderStageInfo.module = vertexShaderModule;
-        vertexShaderStageInfo.pName = "main";
-
-        VkPipelineShaderStageCreateInfo fragmentShaderStageInfo{};
-        fragmentShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        fragmentShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        fragmentShaderStageInfo.module = fragmentShaderModule;
-        fragmentShaderStageInfo.pName = "main";
-
-        std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages = {
-            vertexShaderStageInfo,
-            fragmentShaderStageInfo,
-        };
 
         VkVertexInputBindingDescription bindingDescription{};
         bindingDescription.binding = 0;
@@ -1813,127 +954,75 @@ private:
         attributeDescriptions[3].format = VK_FORMAT_R32_SFLOAT;
         attributeDescriptions[3].offset = offsetof(BlockVertex, textureLayer);
 
-        VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
-        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount = 1;
-        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
-        vertexInputInfo.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
-        vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
+        GraphicsPipelineConfig config{};
+        config.vertexShaderPath = shaderDir + "block.vert.spv";
+        config.fragmentShaderPath = shaderDir + "block.frag.spv";
+        config.extent = swapchainExtent_;
+        config.renderPass = renderPass_;
+        config.descriptorSetLayout = blockDescriptorSetLayout_;
+        config.cullMode = VK_CULL_MODE_BACK_BIT;
+        config.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        config.depthTestEnable = true;
+        config.depthWriteEnable = true;
+        config.alphaBlendEnable = false;
+        config.vertexBindingDescription = &bindingDescription;
+        config.vertexAttributeDescriptions = attributeDescriptions.data();
+        config.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
+        config.layoutErrorMessage = "Failed to create Vulkan block pipeline layout.";
+        config.pipelineErrorMessage = "Failed to create Vulkan block graphics pipeline.";
 
-        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        const GraphicsPipelineBundle bundle = createGraphicsPipelineBundle(device_, config);
+        blockPipelineLayout_ = bundle.layout;
+        blockPipeline_ = bundle.pipeline;
+    }
 
-        VkViewport viewport{};
-        viewport.x = 0.0f;
-        viewport.y = static_cast<float>(swapchainExtent_.height);
-        viewport.width = static_cast<float>(swapchainExtent_.width);
-        viewport.height = -static_cast<float>(swapchainExtent_.height);
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
+    void createPlayerPipeline()
+    {
+        const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
 
-        VkRect2D scissor{};
-        scissor.offset = {0, 0};
-        scissor.extent = swapchainExtent_;
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(BlockVertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-        VkPipelineViewportStateCreateInfo viewportState{};
-        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewportState.viewportCount = 1;
-        viewportState.pViewports = &viewport;
-        viewportState.scissorCount = 1;
-        viewportState.pScissors = &scissor;
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(BlockVertex, position);
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(BlockVertex, uv);
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(BlockVertex, ao);
 
-        VkPipelineRasterizationStateCreateInfo rasterizer{};
-        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-        rasterizer.lineWidth = 1.0f;
-        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-        // Mesh vertices are authored outward CCW.
-        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        GraphicsPipelineConfig config{};
+        config.vertexShaderPath = shaderDir + "player.vert.spv";
+        config.fragmentShaderPath = shaderDir + "player.frag.spv";
+        config.extent = swapchainExtent_;
+        config.renderPass = renderPass_;
+        config.descriptorSetLayout = blockDescriptorSetLayout_;
+        config.cullMode = VK_CULL_MODE_BACK_BIT;
+        config.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        config.depthTestEnable = true;
+        config.depthWriteEnable = true;
+        config.vertexBindingDescription = &bindingDescription;
+        config.vertexAttributeDescriptions = attributeDescriptions.data();
+        config.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
+        config.layoutErrorMessage = "Failed to create Vulkan player pipeline layout.";
+        config.pipelineErrorMessage = "Failed to create Vulkan player graphics pipeline.";
 
-        VkPipelineMultisampleStateCreateInfo multisampling{};
-        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo depthStencil{};
-        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depthStencil.depthTestEnable = VK_TRUE;
-        depthStencil.depthWriteEnable = VK_TRUE;
-        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
-        depthStencil.depthBoundsTestEnable = VK_FALSE;
-        depthStencil.stencilTestEnable = VK_FALSE;
-
-        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-        colorBlendAttachment.colorWriteMask =
-            VK_COLOR_COMPONENT_R_BIT |
-            VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT |
-            VK_COLOR_COMPONENT_A_BIT;
-
-        VkPipelineColorBlendStateCreateInfo colorBlending{};
-        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        colorBlending.attachmentCount = 1;
-        colorBlending.pAttachments = &colorBlendAttachment;
-
-        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 1;
-        pipelineLayoutInfo.pSetLayouts = &blockDescriptorSetLayout_;
-
-        if (vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &blockPipelineLayout_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan block pipeline layout.");
-        }
-
-        VkGraphicsPipelineCreateInfo pipelineInfo{};
-        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pipelineInfo.stageCount = static_cast<std::uint32_t>(shaderStages.size());
-        pipelineInfo.pStages = shaderStages.data();
-        pipelineInfo.pVertexInputState = &vertexInputInfo;
-        pipelineInfo.pInputAssemblyState = &inputAssembly;
-        pipelineInfo.pViewportState = &viewportState;
-        pipelineInfo.pRasterizationState = &rasterizer;
-        pipelineInfo.pMultisampleState = &multisampling;
-        pipelineInfo.pDepthStencilState = &depthStencil;
-        pipelineInfo.pColorBlendState = &colorBlending;
-        pipelineInfo.layout = blockPipelineLayout_;
-        pipelineInfo.renderPass = renderPass_;
-        pipelineInfo.subpass = 0;
-
-        if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &blockPipeline_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan block graphics pipeline.");
-        }
-
-        vkDestroyShaderModule(device_, fragmentShaderModule, nullptr);
-        vkDestroyShaderModule(device_, vertexShaderModule, nullptr);
+        const GraphicsPipelineBundle bundle = createGraphicsPipelineBundle(device_, config);
+        playerPipelineLayout_ = bundle.layout;
+        playerPipeline_ = bundle.pipeline;
     }
 
     void createDebugTextPipeline()
     {
         const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
-        std::vector<char> vertexShaderCode = readBinaryFile(shaderDir + "debug_text.vert.spv");
-        std::vector<char> fragmentShaderCode = readBinaryFile(shaderDir + "debug_text.frag.spv");
-
-        VkShaderModule vertexShaderModule = createShaderModule(vertexShaderCode);
-        VkShaderModule fragmentShaderModule = createShaderModule(fragmentShaderCode);
-
-        VkPipelineShaderStageCreateInfo vertexShaderStageInfo{};
-        vertexShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        vertexShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
-        vertexShaderStageInfo.module = vertexShaderModule;
-        vertexShaderStageInfo.pName = "main";
-
-        VkPipelineShaderStageCreateInfo fragmentShaderStageInfo{};
-        fragmentShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        fragmentShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        fragmentShaderStageInfo.module = fragmentShaderModule;
-        fragmentShaderStageInfo.pName = "main";
-
-        std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages = {
-            vertexShaderStageInfo,
-            fragmentShaderStageInfo,
-        };
 
         VkVertexInputBindingDescription bindingDescription{};
         bindingDescription.binding = 0;
@@ -1954,120 +1043,21 @@ private:
         attributeDescriptions[2].format = VK_FORMAT_R32G32B32A32_SFLOAT;
         attributeDescriptions[2].offset = offsetof(DebugTextVertex, color);
 
-        VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
-        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount = 1;
-        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
-        vertexInputInfo.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
-        vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
+        GraphicsPipelineConfig config{};
+        config.vertexShaderPath = shaderDir + "debug_text.vert.spv";
+        config.fragmentShaderPath = shaderDir + "debug_text.frag.spv";
+        config.extent = swapchainExtent_;
+        config.renderPass = renderPass_;
+        config.descriptorSetLayout = debugTextDescriptorSetLayout_;
+        config.vertexBindingDescription = &bindingDescription;
+        config.vertexAttributeDescriptions = attributeDescriptions.data();
+        config.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
+        config.layoutErrorMessage = "Failed to create Vulkan debug text pipeline layout.";
+        config.pipelineErrorMessage = "Failed to create Vulkan debug text graphics pipeline.";
 
-        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkViewport viewport{};
-        viewport.x = 0.0f;
-        viewport.y = static_cast<float>(swapchainExtent_.height);
-        viewport.width = static_cast<float>(swapchainExtent_.width);
-        viewport.height = -static_cast<float>(swapchainExtent_.height);
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
-
-        VkRect2D scissor{};
-        scissor.offset = {0, 0};
-        scissor.extent = swapchainExtent_;
-
-        VkPipelineViewportStateCreateInfo viewportState{};
-        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewportState.viewportCount = 1;
-        viewportState.pViewports = &viewport;
-        viewportState.scissorCount = 1;
-        viewportState.pScissors = &scissor;
-
-        VkPipelineRasterizationStateCreateInfo rasterizer{};
-        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-        rasterizer.lineWidth = 1.0f;
-        rasterizer.cullMode = VK_CULL_MODE_NONE;
-        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
-
-        VkPipelineMultisampleStateCreateInfo multisampling{};
-        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo depthStencil{};
-        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depthStencil.depthTestEnable = VK_FALSE;
-        depthStencil.depthWriteEnable = VK_FALSE;
-        depthStencil.stencilTestEnable = VK_FALSE;
-
-        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-        colorBlendAttachment.colorWriteMask =
-            VK_COLOR_COMPONENT_R_BIT |
-            VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT |
-            VK_COLOR_COMPONENT_A_BIT;
-        colorBlendAttachment.blendEnable = VK_TRUE;
-        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
-
-        VkPipelineColorBlendStateCreateInfo colorBlending{};
-        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        colorBlending.attachmentCount = 1;
-        colorBlending.pAttachments = &colorBlendAttachment;
-
-        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 1;
-        pipelineLayoutInfo.pSetLayouts = &debugTextDescriptorSetLayout_;
-
-        if (vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &debugTextPipelineLayout_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan debug text pipeline layout.");
-        }
-
-        VkGraphicsPipelineCreateInfo pipelineInfo{};
-        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pipelineInfo.stageCount = static_cast<std::uint32_t>(shaderStages.size());
-        pipelineInfo.pStages = shaderStages.data();
-        pipelineInfo.pVertexInputState = &vertexInputInfo;
-        pipelineInfo.pInputAssemblyState = &inputAssembly;
-        pipelineInfo.pViewportState = &viewportState;
-        pipelineInfo.pRasterizationState = &rasterizer;
-        pipelineInfo.pMultisampleState = &multisampling;
-        pipelineInfo.pDepthStencilState = &depthStencil;
-        pipelineInfo.pColorBlendState = &colorBlending;
-        pipelineInfo.layout = debugTextPipelineLayout_;
-        pipelineInfo.renderPass = renderPass_;
-        pipelineInfo.subpass = 0;
-
-        if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &debugTextPipeline_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan debug text graphics pipeline.");
-        }
-
-        vkDestroyShaderModule(device_, fragmentShaderModule, nullptr);
-        vkDestroyShaderModule(device_, vertexShaderModule, nullptr);
-    }
-
-    VkShaderModule createShaderModule(const std::vector<char>& code)
-    {
-        VkShaderModuleCreateInfo createInfo{};
-        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        createInfo.codeSize = code.size();
-        createInfo.pCode = reinterpret_cast<const std::uint32_t*>(code.data());
-
-        VkShaderModule shaderModule = VK_NULL_HANDLE;
-        if (vkCreateShaderModule(device_, &createInfo, nullptr, &shaderModule) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan shader module.");
-        }
-
-        return shaderModule;
+        const GraphicsPipelineBundle bundle = createGraphicsPipelineBundle(device_, config);
+        debugTextPipelineLayout_ = bundle.layout;
+        debugTextPipeline_ = bundle.pipeline;
     }
 
     void createFramebuffers()
@@ -2117,148 +1107,26 @@ private:
         moonTexture_ = createTexture(sourcePathWide(L"/assets/textures/sky/Moon.png"));
     }
 
-    void addBlockDefinition(std::uint16_t id, std::string name, bool solid)
+    void createCrosshairTexture()
     {
-        BlockDefinition definition{};
-        definition.id = id;
-        definition.name = std::move(name);
-        definition.solid = solid;
-        blockDefinitionIndices_[id] = static_cast<int>(blockDefinitions_.size());
-        blockDefinitions_.push_back(std::move(definition));
+        crosshairTexture_ = createTexture(sourcePathWide(L"/assets/textures/ui/Crosshair.png"));
     }
 
-    static std::optional<std::uint32_t> readJsonUInt(const std::string& object, const char* key)
+    void createPlayerTexture()
     {
-        const std::string pattern = "\"" + std::string(key) + "\"";
-        const std::size_t keyPos = object.find(pattern);
-        if (keyPos == std::string::npos)
-        {
-            return std::nullopt;
-        }
-
-        const std::size_t colonPos = object.find(':', keyPos + pattern.size());
-        if (colonPos == std::string::npos)
-        {
-            return std::nullopt;
-        }
-
-        std::size_t valuePos = colonPos + 1;
-        while (valuePos < object.size() && std::isspace(static_cast<unsigned char>(object[valuePos])))
-        {
-            ++valuePos;
-        }
-
-        std::size_t endPos = valuePos;
-        while (endPos < object.size() && std::isdigit(static_cast<unsigned char>(object[endPos])))
-        {
-            ++endPos;
-        }
-        if (endPos == valuePos)
-        {
-            return std::nullopt;
-        }
-
-        return static_cast<std::uint32_t>(std::stoul(object.substr(valuePos, endPos - valuePos)));
+        playerTexture_ = createTexture(sourcePathWide(L"/assets/textures/character/Character.png"));
     }
 
-    static std::optional<std::string> readJsonString(const std::string& object, const char* key)
+    void loadPlayerMesh()
     {
-        const std::string pattern = "\"" + std::string(key) + "\"";
-        const std::size_t keyPos = object.find(pattern);
-        if (keyPos == std::string::npos)
-        {
-            return std::nullopt;
-        }
-
-        const std::size_t colonPos = object.find(':', keyPos + pattern.size());
-        const std::size_t quotePos = object.find('"', colonPos == std::string::npos ? keyPos : colonPos);
-        if (colonPos == std::string::npos || quotePos == std::string::npos)
-        {
-            return std::nullopt;
-        }
-
-        const std::size_t endQuotePos = object.find('"', quotePos + 1);
-        if (endQuotePos == std::string::npos)
-        {
-            return std::nullopt;
-        }
-        return object.substr(quotePos + 1, endQuotePos - quotePos - 1);
-    }
-
-    static bool readJsonBool(const std::string& object, const char* key, bool fallback)
-    {
-        const std::string pattern = "\"" + std::string(key) + "\"";
-        const std::size_t keyPos = object.find(pattern);
-        if (keyPos == std::string::npos)
-        {
-            return fallback;
-        }
-
-        const std::size_t colonPos = object.find(':', keyPos + pattern.size());
-        if (colonPos == std::string::npos)
-        {
-            return fallback;
-        }
-
-        std::size_t valuePos = colonPos + 1;
-        while (valuePos < object.size() && std::isspace(static_cast<unsigned char>(object[valuePos])))
-        {
-            ++valuePos;
-        }
-        return object.compare(valuePos, 4, "true") == 0;
+        playerModel_.loadFromFile(sourcePath("/assets/textures/character/Character.mesh"));
+        playerIndexCount_ = static_cast<std::uint32_t>(playerModel_.indexCount());
     }
 
     void loadBlockDefinitions()
     {
-        blockDefinitions_.clear();
-        blockDefinitionIndices_.fill(-1);
         blockTextureLayerNames_.clear();
-
-        std::ifstream configFile(sourcePath("/config/blocks.json"));
-        if (configFile)
-        {
-            const std::string config(
-                (std::istreambuf_iterator<char>(configFile)),
-                std::istreambuf_iterator<char>());
-            const std::size_t blocksPos = config.find("\"blocks\"");
-            const std::size_t arrayBegin = config.find('[', blocksPos);
-            const std::size_t arrayEnd = config.find(']', arrayBegin);
-            std::size_t cursor = arrayBegin;
-            while (cursor != std::string::npos && cursor < arrayEnd)
-            {
-                const std::size_t objectBegin = config.find('{', cursor);
-                if (objectBegin == std::string::npos || objectBegin > arrayEnd)
-                {
-                    break;
-                }
-                const std::size_t objectEnd = config.find('}', objectBegin);
-                if (objectEnd == std::string::npos || objectEnd > arrayEnd)
-                {
-                    break;
-                }
-
-                const std::string object = config.substr(objectBegin, objectEnd - objectBegin + 1);
-                const auto id = readJsonUInt(object, "id");
-                const auto name = readJsonString(object, "name");
-                if (id && *id <= std::numeric_limits<std::uint16_t>::max() && name && !name->empty())
-                {
-                    addBlockDefinition(
-                        static_cast<std::uint16_t>(*id),
-                        *name,
-                        readJsonBool(object, "solid", true));
-                }
-
-                cursor = objectEnd + 1;
-            }
-        }
-
-        if (blockDefinitions_.empty())
-        {
-            addBlockDefinition(kRockBlockId, "rock", true);
-            addBlockDefinition(kDirtBlockId, "dirt", true);
-            addBlockDefinition(kGrassBlockId, "grass", true);
-            addBlockDefinition(kBedrockBlockId, "bedrock", true);
-        }
+        blockRegistry_.loadFromConfig(sourcePath("/config/blocks.json"));
     }
 
     std::uint32_t addBlockTextureLayer(const std::wstring& relativePath)
@@ -2292,7 +1160,7 @@ private:
 
     void createBlockTextureArray()
     {
-        for (BlockDefinition& definition : blockDefinitions_)
+        for (BlockDefinition& definition : blockRegistry_.mutableDefinitions())
         {
             if (!definition.solid || definition.id == kAirBlockId)
             {
@@ -2307,85 +1175,32 @@ private:
                 resolveBlockTextureLayer(definition.name, L"_bottom");
         }
 
-        std::vector<ImagePixels> layers;
-        layers.reserve(blockTextureLayerNames_.size());
+        std::vector<std::wstring> texturePaths;
+        texturePaths.reserve(blockTextureLayerNames_.size());
         for (const std::wstring& relativePath : blockTextureLayerNames_)
         {
-            layers.push_back(loadPngWithWic(sourcePathWide(relativePath)));
+            texturePaths.push_back(sourcePathWide(relativePath));
         }
-        if (layers.empty())
+        if (texturePaths.empty())
         {
             throw std::runtime_error("No block textures were loaded.");
         }
 
-        blockTextureArray_ = createTextureArrayFromPixels(layers, VK_FORMAT_R8G8B8A8_SRGB);
-    }
-
-    int terrainHeightAt(int x, int z) const
-    {
-        constexpr float amplitude = static_cast<float>(kTerrainHeightRange) * 0.5f;
-        const float xWave = std::sin(static_cast<float>(x) * 0.035f);
-        const float zWave = std::cos(static_cast<float>(z) * 0.041f);
-        const float diagonalWave = std::sin(static_cast<float>(x + z) * 0.018f) * 0.35f;
-        const float normalizedWave = std::clamp((xWave + zWave + diagonalWave) / 2.35f, -1.0f, 1.0f);
-        return kTerrainBaseHeight + static_cast<int>(std::lround(normalizedWave * amplitude));
+        blockTextureArray_ = finalizeTextureUpload(
+            textureManager_.createTextureArrayFromFiles(texturePaths, VK_FORMAT_R8G8B8A8_SRGB));
     }
 
     void loadWorldConfig()
     {
-        std::ifstream configFile(sourcePath("/config/world.json"));
-        if (!configFile)
-        {
-            return;
-        }
+        const WorldConfig config = loadWorldConfigFile(
+            sourcePath("/config/world.json"),
+            {kDefaultChunkLoadRadius, kDefaultChunkUploadsPerFrame, kDefaultChunkBuildThreads},
+            {0, 1, 1},
+            {kMaxChunkLoadRadius, kMaxChunkUploadsPerFrame, kMaxChunkBuildThreads});
 
-        const std::string config(
-            (std::istreambuf_iterator<char>(configFile)),
-            std::istreambuf_iterator<char>());
-        auto readInt = [&](const std::string& key, int fallback) -> int
-        {
-            const std::string quotedKey = "\"" + key + "\"";
-            const std::size_t keyPosition = config.find(quotedKey);
-            if (keyPosition == std::string::npos)
-            {
-                return fallback;
-            }
-
-            const std::size_t colonPosition = config.find(':', keyPosition + quotedKey.size());
-            if (colonPosition == std::string::npos)
-            {
-                return fallback;
-            }
-
-            const std::size_t valueStart = config.find_first_of("-0123456789", colonPosition + 1);
-            if (valueStart == std::string::npos)
-            {
-                return fallback;
-            }
-
-            const std::size_t valueEnd = config.find_first_not_of("0123456789", valueStart + 1);
-            try
-            {
-                return std::stoi(config.substr(valueStart, valueEnd - valueStart));
-            }
-            catch (const std::exception&)
-            {
-                return fallback;
-            }
-        };
-
-        chunkLoadRadius_ = std::clamp(
-            readInt("chunkLoadRadius", kDefaultChunkLoadRadius),
-            0,
-            kMaxChunkLoadRadius);
-        chunkUploadsPerFrame_ = std::clamp(
-            readInt("chunkUploadsPerFrame", kDefaultChunkUploadsPerFrame),
-            1,
-            kMaxChunkUploadsPerFrame);
-        chunkBuildThreads_ = std::clamp(
-            readInt("chunkBuildThreads", kDefaultChunkBuildThreads),
-            1,
-            kMaxChunkBuildThreads);
+        chunkUploadsPerFrame_ = config.chunkUploadsPerFrame;
+        chunkStreaming_.setLoadRadius(config.chunkLoadRadius);
+        chunkStreaming_.setBuildThreadCount(config.chunkBuildThreads);
     }
 
     void createChunkMesh()
@@ -2396,1039 +1211,25 @@ private:
 
     void startChunkBuildWorkers()
     {
-        chunkBuildWorkerRunning_ = true;
-        chunkBuildWorkers_.reserve(static_cast<std::size_t>(chunkBuildThreads_));
-        for (int i = 0; i < chunkBuildThreads_; ++i)
-        {
-            chunkBuildWorkers_.emplace_back([this]()
-            {
-                chunkBuildWorkerLoop();
-            });
-        }
+        chunkStreaming_.startWorkers();
     }
 
     void stopChunkBuildWorkers()
     {
-        if (!chunkBuildWorkerRunning_ && chunkBuildWorkers_.empty())
-        {
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-            chunkBuildWorkerRunning_ = false;
-            pendingChunkBuilds_.clear();
-            completedSubchunkBuilds_.clear();
-        }
-        chunkBuildCv_.notify_all();
-
-        for (std::thread& worker : chunkBuildWorkers_)
-        {
-            if (worker.joinable())
-            {
-                worker.join();
-            }
-        }
-        chunkBuildWorkers_.clear();
-
-        {
-            std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-            pendingChunkBuilds_.clear();
-            completedSubchunkBuilds_.clear();
-            completedChunkBuilds_.clear();
-        }
-        queuedChunks_.clear();
-        desiredChunks_.clear();
-        queuedChunkGenerations_.clear();
-        pendingChunkMeshes_.clear();
-    }
-
-    void chunkBuildWorkerLoop()
-    {
-        while (true)
-        {
-            ChunkBuildRequest request{};
-            bool hasRequest = false;
-            {
-                std::unique_lock<std::mutex> lock(chunkBuildMutex_);
-                chunkBuildCv_.wait(lock, [this]()
-                {
-                    return !chunkBuildWorkerRunning_ || !pendingChunkBuilds_.empty();
-                });
-
-                while (chunkBuildWorkerRunning_ && !pendingChunkBuilds_.empty())
-                {
-                    std::pop_heap(
-                        pendingChunkBuilds_.begin(),
-                        pendingChunkBuilds_.end(),
-                        ChunkBuildRequestPriority{});
-                    request = pendingChunkBuilds_.back();
-                    pendingChunkBuilds_.pop_back();
-
-                    const auto generationIt = queuedChunkGenerations_.find(request.coord);
-                    if (generationIt != queuedChunkGenerations_.end() &&
-                        generationIt->second == request.generation)
-                    {
-                        const std::int64_t currentDistanceSq = chunkDistanceSq(
-                            request.coord,
-                            chunkBuildPriorityCenterX_,
-                            chunkBuildPriorityCenterZ_);
-                        if (currentDistanceSq != request.priorityDistanceSq)
-                        {
-                            request.priorityDistanceSq = currentDistanceSq;
-                            pendingChunkBuilds_.push_back(request);
-                            std::push_heap(
-                                pendingChunkBuilds_.begin(),
-                                pendingChunkBuilds_.end(),
-                                ChunkBuildRequestPriority{});
-                            continue;
-                        }
-
-                        hasRequest = true;
-                        break;
-                    }
-                }
-
-                if (!chunkBuildWorkerRunning_)
-                {
-                    return;
-                }
-            }
-
-            if (!hasRequest)
-            {
-                continue;
-            }
-
-            SubchunkBuildResult result = buildSubchunkMeshCpu(request);
-
-            {
-                std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-                completedSubchunkBuilds_.push_back(std::move(result));
-            }
-        }
-    }
-
-    void cancelQueuedChunkBuild(ChunkCoord coord)
-    {
-        std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-        queuedChunks_.erase(coord);
-        queuedChunkGenerations_.erase(coord);
-        pendingChunkMeshes_.erase(coord);
-    }
-
-    bool isChunkInLoadRange(ChunkCoord coord, int centerChunkX, int centerChunkZ) const
-    {
-        return std::abs(coord.x - centerChunkX) <= chunkLoadRadius_ &&
-               std::abs(coord.z - centerChunkZ) <= chunkLoadRadius_;
-    }
-
-    bool isChunkInCurrentLoadRange(ChunkCoord coord) const
-    {
-        if (loadedCenterChunkX_ == std::numeric_limits<int>::min() ||
-            loadedCenterChunkZ_ == std::numeric_limits<int>::min())
-        {
-            return false;
-        }
-        return isChunkInLoadRange(coord, loadedCenterChunkX_, loadedCenterChunkZ_);
-    }
-
-    bool queueChunkBuild(
-        ChunkCoord coord,
-        int centerChunkX,
-        int centerChunkZ)
-    {
-        {
-            std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-            chunkBuildPriorityCenterX_ = centerChunkX;
-            chunkBuildPriorityCenterZ_ = centerChunkZ;
-            if (loadedChunks_.contains(coord) || queuedChunks_.contains(coord))
-            {
-                return false;
-            }
-
-            queuedChunks_.insert(coord);
-            const std::uint64_t generation = ++chunkBuildGeneration_;
-            queuedChunkGenerations_[coord] = generation;
-            const std::int64_t priorityDistanceSq = chunkDistanceSq(coord, centerChunkX, centerChunkZ);
-            for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
-            {
-                pendingChunkBuilds_.push_back({
-                    coord,
-                    subchunkY,
-                    priorityDistanceSq,
-                    generation,
-                });
-                std::push_heap(
-                    pendingChunkBuilds_.begin(),
-                    pendingChunkBuilds_.end(),
-                    ChunkBuildRequestPriority{});
-            }
-        }
-
-        return true;
-    }
-
-    void reprioritizePendingChunkBuilds(int centerChunkX, int centerChunkZ)
-    {
-        std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-        chunkBuildPriorityCenterX_ = centerChunkX;
-        chunkBuildPriorityCenterZ_ = centerChunkZ;
-        pendingChunkBuilds_.erase(
-            std::remove_if(
-                pendingChunkBuilds_.begin(),
-                pendingChunkBuilds_.end(),
-                [this](const ChunkBuildRequest& request)
-                {
-                    const auto generationIt = queuedChunkGenerations_.find(request.coord);
-                    return generationIt == queuedChunkGenerations_.end() ||
-                           generationIt->second != request.generation;
-                }),
-            pendingChunkBuilds_.end());
-        for (ChunkBuildRequest& request : pendingChunkBuilds_)
-        {
-            request.priorityDistanceSq = chunkDistanceSq(request.coord, centerChunkX, centerChunkZ);
-        }
-        std::make_heap(
-            pendingChunkBuilds_.begin(),
-            pendingChunkBuilds_.end(),
-            ChunkBuildRequestPriority{});
-    }
-
-    std::size_t cancelQueuedChunksOutsideDesired()
-    {
-        std::size_t canceledCount = 0;
-        std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-        for (auto it = queuedChunkGenerations_.begin(); it != queuedChunkGenerations_.end();)
-        {
-            if (desiredChunks_.contains(it->first))
-            {
-                ++it;
-                continue;
-            }
-
-            queuedChunks_.erase(it->first);
-            pendingChunkMeshes_.erase(it->first);
-            it = queuedChunkGenerations_.erase(it);
-            ++canceledCount;
-        }
-        return canceledCount;
+        chunkStreaming_.stopWorkers();
     }
 
     ChunkLoadUpdateStats updateLoadedChunks()
     {
-        ChunkLoadUpdateStats stats{};
         const int centerChunkX = chunkCoordForWorldPosition(camera_.position.x, kChunkSizeX);
         const int centerChunkZ = chunkCoordForWorldPosition(camera_.position.z, kChunkSizeZ);
-        {
-            std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-            chunkBuildPriorityCenterX_ = centerChunkX;
-            chunkBuildPriorityCenterZ_ = centerChunkZ;
-        }
-
-        if (centerChunkX != loadedCenterChunkX_ ||
-            centerChunkZ != loadedCenterChunkZ_)
-        {
-            const std::size_t sideLength = static_cast<std::size_t>(chunkLoadRadius_ * 2 + 1);
-            desiredChunks_.clear();
-            desiredChunks_.reserve(sideLength * sideLength);
-            for (int dz = -chunkLoadRadius_; dz <= chunkLoadRadius_; ++dz)
-            {
-                for (int dx = -chunkLoadRadius_; dx <= chunkLoadRadius_; ++dx)
-                {
-                    desiredChunks_.insert({centerChunkX + dx, centerChunkZ + dz});
-                }
-            }
-
-            std::vector<ChunkCoord> chunksToUnload;
-            for (ChunkCoord coord : loadedChunks_)
-            {
-                if (!desiredChunks_.contains(coord))
-                {
-                    chunksToUnload.push_back(coord);
-                }
-            }
-
-            for (ChunkCoord coord : chunksToUnload)
+        return chunkStreaming_.updateLoadedChunks(
+            centerChunkX,
+            centerChunkZ,
+            [this](ChunkCoord coord)
             {
                 destroyChunkMeshes(coord);
-                loadedChunks_.erase(coord);
-            }
-            stats.unloaded = chunksToUnload.size();
-
-            cancelQueuedChunksOutsideDesired();
-            reprioritizePendingChunkBuilds(centerChunkX, centerChunkZ);
-            for (ChunkCoord coord : desiredChunks_)
-            {
-                if (loadedChunks_.contains(coord))
-                {
-                    continue;
-                }
-                if (queueChunkBuild(coord, centerChunkX, centerChunkZ))
-                {
-                    ++stats.queued;
-                }
-            }
-            if (stats.queued > 0)
-            {
-                chunkBuildCv_.notify_all();
-            }
-
-            loadedCenterChunkX_ = centerChunkX;
-            loadedCenterChunkZ_ = centerChunkZ;
-        }
-
-        return stats;
-    }
-
-    const BlockDefinition* blockDefinitionForId(std::uint16_t blockId) const
-    {
-        const int index = blockDefinitionIndices_[blockId];
-        if (index < 0)
-        {
-            return nullptr;
-        }
-        return &blockDefinitions_[static_cast<std::size_t>(index)];
-    }
-
-    bool isSolidBlock(std::uint16_t blockId) const
-    {
-        const BlockDefinition* definition = blockDefinitionForId(blockId);
-        return definition != nullptr && definition->solid;
-    }
-
-    std::uint32_t textureLayerForBlockFace(std::uint16_t blockId, BlockFace face) const
-    {
-        const BlockDefinition* definition = blockDefinitionForId(blockId);
-        if (definition == nullptr)
-        {
-            return 0;
-        }
-        return definition->textureLayers[static_cast<std::size_t>(face)];
-    }
-
-    static std::size_t chunkColumnIndex(int localX, int localZ)
-    {
-        return static_cast<std::size_t>(localZ * kChunkSizeX + localX);
-    }
-
-    int terrainHighestSolidYAt(int x, int z) const
-    {
-        const int terrainHeight = terrainHeightAt(x, z);
-        return terrainHeight > 0 ? terrainHeight - 1 : -1;
-    }
-
-    ChunkColumnData generateChunkColumnData(ChunkCoord chunk) const
-    {
-        ChunkColumnData data{};
-        const int chunkBaseX = chunk.x * kChunkSizeX;
-        const int chunkBaseZ = chunk.z * kChunkSizeZ;
-        for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
-        {
-            for (int localX = 0; localX < kChunkSizeX; ++localX)
-            {
-                data.highestSolidY[chunkColumnIndex(localX, localZ)] =
-                    terrainHighestSolidYAt(chunkBaseX + localX, chunkBaseZ + localZ);
-            }
-        }
-        return data;
-    }
-
-    std::uint16_t generateBaseTerrainBlock(int y, int highestSolidY) const
-    {
-        if (y < 0 || highestSolidY < 0 || y > highestSolidY)
-        {
-            return kAirBlockId;
-        }
-        return kRockBlockId;
-    }
-
-    std::uint16_t applyTerrainPostProcess(std::uint16_t blockId, int y, int highestSolidY) const
-    {
-        if (blockId == kAirBlockId)
-        {
-            return blockId;
-        }
-        if (y == 0)
-        {
-            return kBedrockBlockId;
-        }
-        if (y == highestSolidY)
-        {
-            return kGrassBlockId;
-        }
-        if (y >= highestSolidY - 4 && y < highestSolidY)
-        {
-            return kDirtBlockId;
-        }
-        return blockId;
-    }
-
-    std::uint16_t generateBlockIdFromColumn(int y, int highestSolidY) const
-    {
-        return applyTerrainPostProcess(
-            generateBaseTerrainBlock(y, highestSolidY),
-            y,
-            highestSolidY);
-    }
-
-    SubchunkBuildResult buildSubchunkMeshCpu(ChunkBuildRequest request)
-    {
-        const ChunkCoord chunk = request.coord;
-        std::array<std::vector<BlockVertex>, kSubchunkSize> verticesByLocalY;
-        std::array<std::vector<std::uint32_t>, kSubchunkSize> indicesByLocalY;
-        std::vector<BlockVertex> subchunkVertices;
-        std::vector<std::uint32_t> subchunkIndices;
-        std::vector<SubchunkDraw> subchunkDraws;
-        subchunkDraws.reserve(1);
-
-        const int chunkX = chunk.x;
-        const int chunkZ = chunk.z;
-        const int subchunkY = request.subchunkY;
-        const int chunkBaseX = chunkX * kChunkSizeX;
-        const int chunkBaseZ = chunkZ * kChunkSizeZ;
-        const int subchunkMinY = subchunkY * kSubchunkSize;
-        const ChunkColumnData chunkColumnData = generateChunkColumnData(chunk);
-
-        constexpr int kPaddedSubchunkSize = kSubchunkSize + 2;
-        constexpr int kPaddedSubchunkArea = kPaddedSubchunkSize * kPaddedSubchunkSize;
-        constexpr int kPaddedSubchunkVolume = kPaddedSubchunkArea * kPaddedSubchunkSize;
-        std::array<std::uint16_t, kPaddedSubchunkVolume> blockIds{};
-
-        auto paddedBlockIndex = [&](int localX, int localY, int localZ) -> std::size_t
-        {
-            return static_cast<std::size_t>(
-                (localY * kPaddedSubchunkSize + localZ) * kPaddedSubchunkSize + localX);
-        };
-
-        int nonAirBlockCount = 0;
-        auto highestSolidYAt = [&](int x, int z) -> int
-        {
-            const int localX = x - chunkBaseX;
-            const int localZ = z - chunkBaseZ;
-            if (localX >= 0 && localX < kChunkSizeX &&
-                localZ >= 0 && localZ < kChunkSizeZ)
-            {
-                return chunkColumnData.highestSolidY[chunkColumnIndex(localX, localZ)];
-            }
-            return terrainHighestSolidYAt(x, z);
-        };
-
-        for (int localZ = 0; localZ < kPaddedSubchunkSize; ++localZ)
-        {
-            const int z = chunkBaseZ + localZ - 1;
-            for (int localX = 0; localX < kPaddedSubchunkSize; ++localX)
-            {
-                const int x = chunkBaseX + localX - 1;
-                const int highestSolidY = highestSolidYAt(x, z);
-                for (int localY = 0; localY < kPaddedSubchunkSize; ++localY)
-                {
-                    const int y = subchunkMinY + localY - 1;
-                    const std::uint16_t blockId = generateBlockIdFromColumn(y, highestSolidY);
-                    blockIds[paddedBlockIndex(localX, localY, localZ)] = blockId;
-                    if (localX > 0 && localX <= kSubchunkSize &&
-                        localY > 0 && localY <= kSubchunkSize &&
-                        localZ > 0 && localZ <= kSubchunkSize &&
-                        blockId != kAirBlockId)
-                    {
-                        ++nonAirBlockCount;
-                    }
-                }
-            }
-        }
-
-        if (nonAirBlockCount == 0)
-        {
-            return {
-                chunk,
-                subchunkY,
-                request.generation,
-                {},
-                {},
-            };
-        }
-
-        auto isSolid = [&](int x, int y, int z) -> bool
-        {
-            const int localX = x - chunkBaseX + 1;
-            const int localY = y - subchunkMinY + 1;
-            const int localZ = z - chunkBaseZ + 1;
-            if (localX < 0 || localX >= kPaddedSubchunkSize ||
-                localY < 0 || localY >= kPaddedSubchunkSize ||
-                localZ < 0 || localZ >= kPaddedSubchunkSize)
-            {
-                return false;
-            }
-            return isSolidBlock(blockIds[paddedBlockIndex(localX, localY, localZ)]);
-        };
-
-        auto blockIdAt = [&](int x, int y, int z) -> std::uint16_t
-        {
-            const int localX = x - chunkBaseX + 1;
-            const int localY = y - subchunkMinY + 1;
-            const int localZ = z - chunkBaseZ + 1;
-            if (localX < 0 || localX >= kPaddedSubchunkSize ||
-                localY < 0 || localY >= kPaddedSubchunkSize ||
-                localZ < 0 || localZ >= kPaddedSubchunkSize)
-            {
-                return kAirBlockId;
-            }
-            return blockIds[paddedBlockIndex(localX, localY, localZ)];
-        };
-
-        auto emitGreedyRectangles = [](
-            int width,
-            int height,
-            auto cellAt,
-            auto emitRectangle)
-        {
-            std::array<bool, kSubchunkSize * kSubchunkSize> consumed{};
-            auto index = [](int u, int v) -> std::size_t
-            {
-                return static_cast<std::size_t>(v * kSubchunkSize + u);
-            };
-
-            for (int v = 0; v < height; ++v)
-            {
-                for (int u = 0; u < width; ++u)
-                {
-                    const FaceMaskCell baseCell = cellAt(u, v);
-                    if (consumed[index(u, v)] || !baseCell.filled)
-                    {
-                        continue;
-                    }
-
-                    int rectWidth = 1;
-                    while (u + rectWidth < width &&
-                           !consumed[index(u + rectWidth, v)] &&
-                           cellAt(u + rectWidth, v) == baseCell)
-                    {
-                        ++rectWidth;
-                    }
-
-                    int rectHeight = 1;
-                    bool canGrow = true;
-                    while (v + rectHeight < height && canGrow)
-                    {
-                        for (int du = 0; du < rectWidth; ++du)
-                        {
-                            if (consumed[index(u + du, v + rectHeight)] ||
-                                !(cellAt(u + du, v + rectHeight) == baseCell))
-                            {
-                                canGrow = false;
-                                break;
-                            }
-                        }
-
-                        if (canGrow)
-                        {
-                            ++rectHeight;
-                        }
-                    }
-
-                    for (int dv = 0; dv < rectHeight; ++dv)
-                    {
-                        for (int du = 0; du < rectWidth; ++du)
-                        {
-                            consumed[index(u + du, v + dv)] = true;
-                        }
-                    }
-
-                    emitRectangle(u, v, rectWidth, rectHeight, baseCell);
-                }
-            }
-        };
-
-        auto addFace = [&](
-            int subchunkLocalY,
-            std::array<Vec3, 4> corners,
-            std::array<std::array<float, 2>, 4> uvs,
-            std::uint32_t textureLayer,
-            std::array<std::uint8_t, 4> ao)
-        {
-            std::vector<BlockVertex>& vertices = verticesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
-            std::vector<std::uint32_t>& indices = indicesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
-            const std::uint32_t baseIndex = static_cast<std::uint32_t>(vertices.size());
-            const float layer = static_cast<float>(textureLayer);
-            vertices.push_back({{corners[0].x, corners[0].y, corners[0].z}, {uvs[0][0], uvs[0][1]}, aoFactor(ao[0]), layer});
-            vertices.push_back({{corners[1].x, corners[1].y, corners[1].z}, {uvs[1][0], uvs[1][1]}, aoFactor(ao[1]), layer});
-            vertices.push_back({{corners[2].x, corners[2].y, corners[2].z}, {uvs[2][0], uvs[2][1]}, aoFactor(ao[2]), layer});
-            vertices.push_back({{corners[3].x, corners[3].y, corners[3].z}, {uvs[3][0], uvs[3][1]}, aoFactor(ao[3]), layer});
-
-            indices.push_back(baseIndex + 0);
-            indices.push_back(baseIndex + 1);
-            indices.push_back(baseIndex + 2);
-            indices.push_back(baseIndex + 0);
-            indices.push_back(baseIndex + 2);
-            indices.push_back(baseIndex + 3);
-        };
-
-        auto computeAo = [&](
-            int side1X, int side1Y, int side1Z,
-            int side2X, int side2Y, int side2Z,
-            int cornerX, int cornerY, int cornerZ) -> std::uint8_t
-        {
-            return vertexAo(
-                isSolid(side1X, side1Y, side1Z),
-                isSolid(side2X, side2Y, side2Z),
-                isSolid(cornerX, cornerY, cornerZ));
-        };
-
-        auto topFaceAo = [&](int x, int z, int faceY) -> std::array<std::uint8_t, 4>
-        {
-            return {{
-                computeAo(x - 1, faceY, z, x, faceY, z - 1, x - 1, faceY, z - 1),
-                computeAo(x - 1, faceY, z, x, faceY, z + 1, x - 1, faceY, z + 1),
-                computeAo(x + 1, faceY, z, x, faceY, z + 1, x + 1, faceY, z + 1),
-                computeAo(x + 1, faceY, z, x, faceY, z - 1, x + 1, faceY, z - 1),
-            }};
-        };
-
-        auto bottomFaceAo = [&](int x, int z, int faceY) -> std::array<std::uint8_t, 4>
-        {
-            const int outsideY = faceY - 1;
-            return {{
-                computeAo(x - 1, outsideY, z, x, outsideY, z + 1, x - 1, outsideY, z + 1),
-                computeAo(x - 1, outsideY, z, x, outsideY, z - 1, x - 1, outsideY, z - 1),
-                computeAo(x + 1, outsideY, z, x, outsideY, z - 1, x + 1, outsideY, z - 1),
-                computeAo(x + 1, outsideY, z, x, outsideY, z + 1, x + 1, outsideY, z + 1),
-            }};
-        };
-
-        auto positiveXFaceAo = [&](int x, int y, int z) -> std::array<std::uint8_t, 4>
-        {
-            const int outsideX = x + 1;
-            return {{
-                computeAo(outsideX, y - 1, z, outsideX, y, z - 1, outsideX, y - 1, z - 1),
-                computeAo(outsideX, y + 1, z, outsideX, y, z - 1, outsideX, y + 1, z - 1),
-                computeAo(outsideX, y + 1, z, outsideX, y, z + 1, outsideX, y + 1, z + 1),
-                computeAo(outsideX, y - 1, z, outsideX, y, z + 1, outsideX, y - 1, z + 1),
-            }};
-        };
-
-        auto negativeXFaceAo = [&](int x, int y, int z) -> std::array<std::uint8_t, 4>
-        {
-            const int outsideX = x - 1;
-            return {{
-                computeAo(outsideX, y - 1, z, outsideX, y, z + 1, outsideX, y - 1, z + 1),
-                computeAo(outsideX, y + 1, z, outsideX, y, z + 1, outsideX, y + 1, z + 1),
-                computeAo(outsideX, y + 1, z, outsideX, y, z - 1, outsideX, y + 1, z - 1),
-                computeAo(outsideX, y - 1, z, outsideX, y, z - 1, outsideX, y - 1, z - 1),
-            }};
-        };
-
-        auto positiveZFaceAo = [&](int x, int y, int z) -> std::array<std::uint8_t, 4>
-        {
-            const int outsideZ = z + 1;
-            return {{
-                computeAo(x, y - 1, outsideZ, x + 1, y, outsideZ, x + 1, y - 1, outsideZ),
-                computeAo(x, y + 1, outsideZ, x + 1, y, outsideZ, x + 1, y + 1, outsideZ),
-                computeAo(x, y + 1, outsideZ, x - 1, y, outsideZ, x - 1, y + 1, outsideZ),
-                computeAo(x, y - 1, outsideZ, x - 1, y, outsideZ, x - 1, y - 1, outsideZ),
-            }};
-        };
-
-        auto negativeZFaceAo = [&](int x, int y, int z) -> std::array<std::uint8_t, 4>
-        {
-            const int outsideZ = z - 1;
-            return {{
-                computeAo(x, y - 1, outsideZ, x - 1, y, outsideZ, x - 1, y - 1, outsideZ),
-                computeAo(x, y + 1, outsideZ, x - 1, y, outsideZ, x - 1, y + 1, outsideZ),
-                computeAo(x, y + 1, outsideZ, x + 1, y, outsideZ, x + 1, y + 1, outsideZ),
-                computeAo(x, y - 1, outsideZ, x + 1, y, outsideZ, x + 1, y - 1, outsideZ),
-            }};
-        };
-
-        auto addTopFace = [&](
-            int subchunkLocalY,
-            int faceY,
-            int x,
-            int z,
-            int width,
-            int depth,
-            std::uint32_t textureLayer,
-            std::array<std::uint8_t, 4> ao)
-        {
-            const float fx = static_cast<float>(x);
-            const float fz = static_cast<float>(z);
-            const float xEnd = static_cast<float>(x + width);
-            const float zEnd = static_cast<float>(z + depth);
-            const float y = static_cast<float>(faceY);
-            addFace(
-                subchunkLocalY,
-                {{
-                    {fx, y, fz},
-                    {fx, y, zEnd},
-                    {xEnd, y, zEnd},
-                    {xEnd, y, fz},
-                }},
-                {{
-                    {{0.0f, 0.0f}},
-                    {{static_cast<float>(depth), 0.0f}},
-                    {{static_cast<float>(depth), static_cast<float>(width)}},
-                    {{0.0f, static_cast<float>(width)}},
-                }},
-                textureLayer,
-                ao);
-        };
-
-        auto addBottomFace = [&](
-            int subchunkLocalY,
-            int faceY,
-            int x,
-            int z,
-            int width,
-            int depth,
-            std::uint32_t textureLayer,
-            std::array<std::uint8_t, 4> ao)
-        {
-            const float fx = static_cast<float>(x);
-            const float fz = static_cast<float>(z);
-            const float xEnd = static_cast<float>(x + width);
-            const float zEnd = static_cast<float>(z + depth);
-            const float y = static_cast<float>(faceY);
-            addFace(
-                subchunkLocalY,
-                {{
-                    {fx, y, zEnd},
-                    {fx, y, fz},
-                    {xEnd, y, fz},
-                    {xEnd, y, zEnd},
-                }},
-                {{
-                    {{0.0f, 0.0f}},
-                    {{static_cast<float>(depth), 0.0f}},
-                    {{static_cast<float>(depth), static_cast<float>(width)}},
-                    {{0.0f, static_cast<float>(width)}},
-                }},
-                textureLayer,
-                ao);
-        };
-
-        auto addSideFace = [&](
-            int subchunkLocalY,
-            std::array<Vec3, 4> corners,
-            int width,
-            int height,
-            std::uint32_t textureLayer,
-            std::array<std::uint8_t, 4> ao)
-        {
-            addFace(
-                subchunkLocalY,
-                corners,
-                {{
-                    {{static_cast<float>(width), static_cast<float>(height)}},
-                    {{static_cast<float>(width), 0.0f}},
-                    {{0.0f, 0.0f}},
-                    {{0.0f, static_cast<float>(height)}},
-                }},
-                textureLayer,
-                ao);
-        };
-
-        for (auto& vertices : verticesByLocalY)
-        {
-            vertices.clear();
-        }
-        for (auto& indices : indicesByLocalY)
-        {
-            indices.clear();
-        }
-
-            for (int localY = 0; localY < kSubchunkSize; ++localY)
-            {
-                const int faceY = subchunkMinY + localY + 1;
-                emitGreedyRectangles(
-                    kChunkSizeX,
-                    kChunkSizeZ,
-                    [&](int localX, int localZ) -> FaceMaskCell
-                    {
-                        const int x = chunkBaseX + localX;
-                        const int z = chunkBaseZ + localZ;
-                        if (!(isSolid(x, faceY - 1, z) && !isSolid(x, faceY, z)))
-                        {
-                            return {};
-                        }
-                        return {
-                            true,
-                            textureLayerForBlockFace(blockIdAt(x, faceY - 1, z), BlockFace::Top),
-                            topFaceAo(x, z, faceY),
-                        };
-                    },
-                    [&](int localX, int localZ, int width, int depth, const FaceMaskCell& cell)
-                    {
-                        addTopFace(
-                            localY,
-                            faceY,
-                            chunkBaseX + localX,
-                            chunkBaseZ + localZ,
-                            width,
-                            depth,
-                            cell.textureLayer,
-                            cell.ao);
-                    });
-
-                const int bottomFaceY = subchunkMinY + localY;
-                emitGreedyRectangles(
-                    kChunkSizeX,
-                    kChunkSizeZ,
-                    [&](int localX, int localZ) -> FaceMaskCell
-                    {
-                        const int x = chunkBaseX + localX;
-                        const int z = chunkBaseZ + localZ;
-                        if (!(isSolid(x, bottomFaceY, z) && !isSolid(x, bottomFaceY - 1, z)))
-                        {
-                            return {};
-                        }
-                        return {
-                            true,
-                            textureLayerForBlockFace(blockIdAt(x, bottomFaceY, z), BlockFace::Bottom),
-                            bottomFaceAo(x, z, bottomFaceY),
-                        };
-                    },
-                    [&](int localX, int localZ, int width, int depth, const FaceMaskCell& cell)
-                    {
-                        addBottomFace(
-                            localY,
-                            bottomFaceY,
-                            chunkBaseX + localX,
-                            chunkBaseZ + localZ,
-                            width,
-                            depth,
-                            cell.textureLayer,
-                            cell.ao);
-                    });
-            }
-
-            for (int localX = 0; localX < kChunkSizeX; ++localX)
-            {
-                const int x = chunkBaseX + localX;
-                const float faceX = static_cast<float>(x + 1);
-                emitGreedyRectangles(
-                    kChunkSizeZ,
-                    kSubchunkSize,
-                    [&](int localZ, int localY) -> FaceMaskCell
-                    {
-                        const int z = chunkBaseZ + localZ;
-                        const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x + 1, y, z)))
-                        {
-                            return {};
-                        }
-                        return {
-                            true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
-                            positiveXFaceAo(x, y, z),
-                        };
-                    },
-                    [&](int localZ, int localY, int width, int height, const FaceMaskCell& cell)
-                    {
-                        const float bottom = static_cast<float>(subchunkMinY + localY);
-                        const float top = static_cast<float>(subchunkMinY + localY + height);
-                        const float z0 = static_cast<float>(chunkBaseZ + localZ);
-                        const float z1 = static_cast<float>(chunkBaseZ + localZ + width);
-                        addSideFace(
-                            localY,
-                            {{
-                            {faceX, bottom, z0},
-                            {faceX, top, z0},
-                            {faceX, top, z1},
-                            {faceX, bottom, z1},
-                        }},
-                        width,
-                        height,
-                        cell.textureLayer,
-                        cell.ao);
-                    });
-
-                const float oppositeFaceX = static_cast<float>(x);
-                emitGreedyRectangles(
-                    kChunkSizeZ,
-                    kSubchunkSize,
-                    [&](int localZ, int localY) -> FaceMaskCell
-                    {
-                        const int z = chunkBaseZ + localZ;
-                        const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x - 1, y, z)))
-                        {
-                            return {};
-                        }
-                        return {
-                            true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
-                            negativeXFaceAo(x, y, z),
-                        };
-                    },
-                    [&](int localZ, int localY, int width, int height, const FaceMaskCell& cell)
-                    {
-                        const float bottom = static_cast<float>(subchunkMinY + localY);
-                        const float top = static_cast<float>(subchunkMinY + localY + height);
-                        const float z0 = static_cast<float>(chunkBaseZ + localZ);
-                        const float z1 = static_cast<float>(chunkBaseZ + localZ + width);
-                        addSideFace(
-                            localY,
-                            {{
-                                {oppositeFaceX, bottom, z1},
-                                {oppositeFaceX, top, z1},
-                            {oppositeFaceX, top, z0},
-                            {oppositeFaceX, bottom, z0},
-                        }},
-                        width,
-                        height,
-                        cell.textureLayer,
-                        cell.ao);
-                    });
-            }
-
-            for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
-            {
-                const int z = chunkBaseZ + localZ;
-                const float faceZ = static_cast<float>(z + 1);
-                emitGreedyRectangles(
-                    kChunkSizeX,
-                    kSubchunkSize,
-                    [&](int localX, int localY) -> FaceMaskCell
-                    {
-                        const int x = chunkBaseX + localX;
-                        const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x, y, z + 1)))
-                        {
-                            return {};
-                        }
-                        return {
-                            true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
-                            positiveZFaceAo(x, y, z),
-                        };
-                    },
-                    [&](int localX, int localY, int width, int height, const FaceMaskCell& cell)
-                    {
-                        const float bottom = static_cast<float>(subchunkMinY + localY);
-                        const float top = static_cast<float>(subchunkMinY + localY + height);
-                        const float x0 = static_cast<float>(chunkBaseX + localX);
-                        const float x1 = static_cast<float>(chunkBaseX + localX + width);
-                        addSideFace(
-                            localY,
-                            {{
-                                {x1, bottom, faceZ},
-                                {x1, top, faceZ},
-                            {x0, top, faceZ},
-                            {x0, bottom, faceZ},
-                        }},
-                        width,
-                        height,
-                        cell.textureLayer,
-                        cell.ao);
-                    });
-
-                const float oppositeFaceZ = static_cast<float>(z);
-                emitGreedyRectangles(
-                    kChunkSizeX,
-                    kSubchunkSize,
-                    [&](int localX, int localY) -> FaceMaskCell
-                    {
-                        const int x = chunkBaseX + localX;
-                        const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x, y, z - 1)))
-                        {
-                            return {};
-                        }
-                        return {
-                            true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
-                            negativeZFaceAo(x, y, z),
-                        };
-                    },
-                    [&](int localX, int localY, int width, int height, const FaceMaskCell& cell)
-                    {
-                        const float bottom = static_cast<float>(subchunkMinY + localY);
-                        const float top = static_cast<float>(subchunkMinY + localY + height);
-                        const float x0 = static_cast<float>(chunkBaseX + localX);
-                        const float x1 = static_cast<float>(chunkBaseX + localX + width);
-                        addSideFace(
-                            localY,
-                            {{
-                                {x0, bottom, oppositeFaceZ},
-                                {x0, top, oppositeFaceZ},
-                            {x1, top, oppositeFaceZ},
-                            {x1, bottom, oppositeFaceZ},
-                        }},
-                        width,
-                        height,
-                        cell.textureLayer,
-                        cell.ao);
-                    });
-            }
-
-        appendSubchunkMesh(
-            chunkX,
-            chunkZ,
-            subchunkY,
-            verticesByLocalY,
-            indicesByLocalY,
-            subchunkVertices,
-            subchunkIndices,
-            subchunkDraws);
-
-        return {
-            chunk,
-            subchunkY,
-            request.generation,
-            std::move(subchunkVertices),
-            std::move(subchunkIndices),
-        };
-    }
-
-    void appendSubchunkMesh(
-        int chunkX,
-        int chunkZ,
-        int subchunkY,
-        const std::array<std::vector<BlockVertex>, kSubchunkSize>& verticesByLocalY,
-        const std::array<std::vector<std::uint32_t>, kSubchunkSize>& indicesByLocalY,
-        std::vector<BlockVertex>& chunkVertices,
-        std::vector<std::uint32_t>& chunkIndices,
-        std::vector<SubchunkDraw>& subchunkDraws)
-    {
-        std::size_t vertexCount = 0;
-        std::size_t indexCount = 0;
-        for (int localY = 0; localY < kSubchunkSize; ++localY)
-        {
-            vertexCount += verticesByLocalY[static_cast<std::size_t>(localY)].size();
-            indexCount += indicesByLocalY[static_cast<std::size_t>(localY)].size();
-        }
-
-        if (indexCount == 0)
-        {
-            return;
-        }
-
-        const std::uint32_t vertexOffset = static_cast<std::uint32_t>(chunkVertices.size());
-        const std::uint32_t firstIndex = static_cast<std::uint32_t>(chunkIndices.size());
-        std::uint32_t subchunkVertexCount = 0;
-
-        for (int localY = 0; localY < kSubchunkSize; ++localY)
-        {
-            const auto& sourceVertices = verticesByLocalY[static_cast<std::size_t>(localY)];
-            const auto& sourceIndices = indicesByLocalY[static_cast<std::size_t>(localY)];
-            const std::uint32_t baseVertex = subchunkVertexCount;
-
-            chunkVertices.insert(chunkVertices.end(), sourceVertices.begin(), sourceVertices.end());
-            for (std::uint32_t index : sourceIndices)
-            {
-                chunkIndices.push_back(baseVertex + index);
-            }
-            subchunkVertexCount += static_cast<std::uint32_t>(sourceVertices.size());
-        }
-
-        SubchunkDraw draw{};
-        draw.chunkX = chunkX;
-        draw.chunkZ = chunkZ;
-        draw.subchunkY = subchunkY;
-        draw.range.vertexCount = static_cast<std::uint32_t>(vertexCount);
-        draw.range.firstIndex = firstIndex;
-        draw.range.indexCount = static_cast<std::uint32_t>(indexCount);
-        draw.range.vertexOffset = static_cast<std::int32_t>(vertexOffset);
-        subchunkDraws.push_back(draw);
+            });
     }
 
     void uploadChunkMesh(
@@ -3466,107 +1267,9 @@ private:
         chunkMeshes_.push_back(std::move(mesh));
     }
 
-    ChunkBuildResult assembleChunkMesh(ChunkCoord coord, PendingChunkMesh& pendingMesh)
-    {
-        ChunkBuildResult result{};
-        result.coord = coord;
-
-        std::size_t vertexCount = 0;
-        std::size_t indexCount = 0;
-        for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
-        {
-            vertexCount += pendingMesh.vertices[static_cast<std::size_t>(subchunkY)].size();
-            indexCount += pendingMesh.indices[static_cast<std::size_t>(subchunkY)].size();
-        }
-
-        result.vertices.reserve(vertexCount);
-        result.indices.reserve(indexCount);
-        result.subchunks.reserve(kSubchunksPerChunk);
-
-        for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
-        {
-            auto& sourceVertices = pendingMesh.vertices[static_cast<std::size_t>(subchunkY)];
-            auto& sourceIndices = pendingMesh.indices[static_cast<std::size_t>(subchunkY)];
-            if (sourceIndices.empty())
-            {
-                continue;
-            }
-
-            SubchunkDraw draw{};
-            draw.chunkX = coord.x;
-            draw.chunkZ = coord.z;
-            draw.subchunkY = subchunkY;
-            draw.range.vertexCount = static_cast<std::uint32_t>(sourceVertices.size());
-            draw.range.firstIndex = static_cast<std::uint32_t>(result.indices.size());
-            draw.range.indexCount = static_cast<std::uint32_t>(sourceIndices.size());
-            draw.range.vertexOffset = static_cast<std::int32_t>(result.vertices.size());
-
-            result.vertices.insert(result.vertices.end(), sourceVertices.begin(), sourceVertices.end());
-            result.indices.insert(result.indices.end(), sourceIndices.begin(), sourceIndices.end());
-            result.subchunks.push_back(draw);
-        }
-
-        return result;
-    }
-
     std::size_t processCompletedSubchunkBuilds()
     {
-        std::deque<SubchunkBuildResult> completedSubchunks;
-        {
-            std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-            completedSubchunks.swap(completedSubchunkBuilds_);
-        }
-
-        std::size_t processedCount = 0;
-        while (!completedSubchunks.empty())
-        {
-            SubchunkBuildResult result = std::move(completedSubchunks.front());
-            completedSubchunks.pop_front();
-            ++processedCount;
-            if (result.subchunkY < 0 || result.subchunkY >= kSubchunksPerChunk)
-            {
-                continue;
-            }
-
-            const auto generationIt = queuedChunkGenerations_.find(result.coord);
-            if (generationIt == queuedChunkGenerations_.end() || generationIt->second != result.generation)
-            {
-                continue;
-            }
-            if (!isChunkInCurrentLoadRange(result.coord) || loadedChunks_.contains(result.coord))
-            {
-                continue;
-            }
-
-            auto [pendingIt, inserted] = pendingChunkMeshes_.try_emplace(result.coord);
-            PendingChunkMesh& pendingMesh = pendingIt->second;
-            if (inserted)
-            {
-                pendingMesh.generation = result.generation;
-            }
-            if (pendingMesh.generation != result.generation)
-            {
-                continue;
-            }
-
-            const std::size_t subchunkIndex = static_cast<std::size_t>(result.subchunkY);
-            if (pendingMesh.received[subchunkIndex])
-            {
-                continue;
-            }
-
-            pendingMesh.vertices[subchunkIndex] = std::move(result.vertices);
-            pendingMesh.indices[subchunkIndex] = std::move(result.indices);
-            pendingMesh.received[subchunkIndex] = true;
-            ++pendingMesh.completedSubchunks;
-
-            if (pendingMesh.completedSubchunks == kSubchunksPerChunk)
-            {
-                completedChunkBuilds_.push_back(assembleChunkMesh(result.coord, pendingMesh));
-                pendingChunkMeshes_.erase(pendingIt);
-            }
-        }
-        return processedCount;
+        return chunkStreaming_.processCompletedSubchunkBuilds();
     }
 
     int processCompletedChunkUploads()
@@ -3575,18 +1278,12 @@ private:
         for (int uploaded = 0; uploaded < chunkUploadsPerFrame_; ++uploaded)
         {
             ChunkBuildResult result{};
-            if (completedChunkBuilds_.empty())
+            if (!chunkStreaming_.popCompletedChunkBuild(result))
             {
                 return uploadedCount;
             }
 
-            result = std::move(completedChunkBuilds_.front());
-            completedChunkBuilds_.pop_front();
-
-            queuedChunks_.erase(result.coord);
-            queuedChunkGenerations_.erase(result.coord);
-            pendingChunkMeshes_.erase(result.coord);
-            if (!isChunkInCurrentLoadRange(result.coord) || loadedChunks_.contains(result.coord))
+            if (!chunkStreaming_.shouldAcceptCompletedChunk(result.coord))
             {
                 continue;
             }
@@ -3597,7 +1294,7 @@ private:
                 result.vertices,
                 result.indices,
                 result.subchunks);
-            loadedChunks_.insert(result.coord);
+            chunkStreaming_.markChunkLoaded(result.coord);
             ++uploadedCount;
         }
         return uploadedCount;
@@ -3611,24 +1308,32 @@ private:
 
     std::pair<std::size_t, std::size_t> chunkBuildQueueSizes()
     {
-        std::lock_guard<std::mutex> lock(chunkBuildMutex_);
-        return {pendingChunkBuilds_.size(), completedSubchunkBuilds_.size() + completedChunkBuilds_.size()};
+        return chunkStreaming_.queueSizes();
     }
 
     void createDebugFontAtlasTexture()
     {
         AddFontResourceExW(sourcePathWide(L"/assets/fonts/VCR_OSD_MONO.ttf").c_str(), FR_PRIVATE, nullptr);
         debugFontAtlasTexture_ = createTextureFromPixels(
-            renderDebugGlyphAtlas(),
+            debugTextRenderer_.renderGlyphAtlas(),
             kDebugFontAtlasWidth,
             kDebugFontAtlasHeight,
             VK_FORMAT_R8G8B8A8_UNORM);
     }
 
+    Texture finalizeTextureUpload(TextureUpload upload)
+    {
+        for (VkCommandBuffer commandBuffer : upload.commandBuffers)
+        {
+            deferUploadCommandBuffer(commandBuffer);
+        }
+        deferUploadStagingBuffer(upload.stagingBuffer);
+        return upload.texture;
+    }
+
     Texture createTexture(const std::wstring& path)
     {
-        ImagePixels pixels = loadPngWithWic(path);
-        return createTextureFromPixels(pixels.rgba, pixels.width, pixels.height, VK_FORMAT_R8G8B8A8_SRGB);
+        return finalizeTextureUpload(textureManager_.createTextureFromFile(path, VK_FORMAT_R8G8B8A8_SRGB));
     }
 
     Texture createTextureFromPixels(
@@ -3637,233 +1342,7 @@ private:
         std::uint32_t height,
         VkFormat format)
     {
-        const VkDeviceSize imageSize = static_cast<VkDeviceSize>(pixels.size());
-        Buffer stagingBuffer = createBuffer(
-            imageSize,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        void* data = nullptr;
-        vkMapMemory(device_, stagingBuffer.memory, 0, imageSize, 0, &data);
-        std::memcpy(data, pixels.data(), static_cast<std::size_t>(imageSize));
-        vkUnmapMemory(device_, stagingBuffer.memory);
-
-        Texture texture{};
-        texture.format = format;
-        texture.width = width;
-        texture.height = height;
-        createImage(
-            width,
-            height,
-            format,
-            VK_IMAGE_TILING_OPTIMAL,
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            texture.image,
-            texture.memory);
-
-        transitionImageLayout(
-            texture.image,
-            format,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        copyBufferToImage(stagingBuffer.buffer, texture.image, width, height);
-        transitionImageLayout(
-            texture.image,
-            format,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-        deferUploadStagingBuffer(stagingBuffer);
-        texture.view = createImageView(texture.image, format);
-        texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        return texture;
-    }
-
-    Texture createTextureArrayFromPixels(const std::vector<ImagePixels>& layers, VkFormat format)
-    {
-        if (layers.empty())
-        {
-            throw std::runtime_error("Cannot create an empty Vulkan texture array.");
-        }
-
-        const std::uint32_t width = layers.front().width;
-        const std::uint32_t height = layers.front().height;
-        const VkDeviceSize layerSize = static_cast<VkDeviceSize>(width) * height * 4;
-        std::vector<std::uint8_t> pixels;
-        pixels.reserve(static_cast<std::size_t>(layerSize) * layers.size());
-        for (const ImagePixels& layer : layers)
-        {
-            if (layer.width != width || layer.height != height ||
-                layer.rgba.size() != static_cast<std::size_t>(layerSize))
-            {
-                throw std::runtime_error("Block texture array layers must have the same size.");
-            }
-            pixels.insert(pixels.end(), layer.rgba.begin(), layer.rgba.end());
-        }
-
-        const VkDeviceSize imageSize = static_cast<VkDeviceSize>(pixels.size());
-        Buffer stagingBuffer = createBuffer(
-            imageSize,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        void* data = nullptr;
-        vkMapMemory(device_, stagingBuffer.memory, 0, imageSize, 0, &data);
-        std::memcpy(data, pixels.data(), static_cast<std::size_t>(imageSize));
-        vkUnmapMemory(device_, stagingBuffer.memory);
-
-        Texture texture{};
-        texture.format = format;
-        texture.width = width;
-        texture.height = height;
-        const std::uint32_t layerCount = static_cast<std::uint32_t>(layers.size());
-        createImage(
-            width,
-            height,
-            format,
-            VK_IMAGE_TILING_OPTIMAL,
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            texture.image,
-            texture.memory,
-            layerCount);
-
-        transitionImageLayout(
-            texture.image,
-            format,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            layerCount);
-        copyBufferToImageArray(stagingBuffer.buffer, texture.image, width, height, layerCount);
-        transitionImageLayout(
-            texture.image,
-            format,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            layerCount);
-
-        deferUploadStagingBuffer(stagingBuffer);
-        texture.view = createImageView(
-            texture.image,
-            format,
-            VK_IMAGE_ASPECT_COLOR_BIT,
-            VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-            layerCount);
-        texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        return texture;
-    }
-
-    std::vector<std::uint8_t> renderDebugGlyphAtlas()
-    {
-        const int textureWidth = static_cast<int>(kDebugFontAtlasWidth);
-        const int textureHeight = static_cast<int>(kDebugFontAtlasHeight);
-
-        BITMAPINFO bitmapInfo{};
-        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bitmapInfo.bmiHeader.biWidth = textureWidth;
-        bitmapInfo.bmiHeader.biHeight = -textureHeight;
-        bitmapInfo.bmiHeader.biPlanes = 1;
-        bitmapInfo.bmiHeader.biBitCount = 32;
-        bitmapInfo.bmiHeader.biCompression = BI_RGB;
-
-        void* bitmapBits = nullptr;
-        HDC screenDc = GetDC(nullptr);
-        HDC memoryDc = CreateCompatibleDC(screenDc);
-        HBITMAP bitmap = CreateDIBSection(screenDc, &bitmapInfo, DIB_RGB_COLORS, &bitmapBits, nullptr, 0);
-        ReleaseDC(nullptr, screenDc);
-
-        if (memoryDc == nullptr || bitmap == nullptr || bitmapBits == nullptr)
-        {
-            if (bitmap != nullptr)
-            {
-                DeleteObject(bitmap);
-            }
-            if (memoryDc != nullptr)
-            {
-                DeleteDC(memoryDc);
-            }
-            throw std::runtime_error("Failed to create debug glyph atlas bitmap.");
-        }
-
-        std::memset(bitmapBits, 0, static_cast<std::size_t>(textureWidth * textureHeight * 4));
-        HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
-        HFONT font = CreateFontW(
-            -42,
-            0,
-            0,
-            0,
-            FW_NORMAL,
-            FALSE,
-            FALSE,
-            FALSE,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE,
-            L"VCR OSD Mono");
-        bool ownsFont = true;
-        if (font == nullptr)
-        {
-            font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-            ownsFont = false;
-        }
-        HGDIOBJ oldFont = SelectObject(memoryDc, font);
-
-        SetBkMode(memoryDc, TRANSPARENT);
-        SetTextColor(memoryDc, RGB(255, 255, 255));
-        TEXTMETRICW textMetric{};
-        GetTextMetricsW(memoryDc, &textMetric);
-
-        const auto* bgra = static_cast<const std::uint8_t*>(bitmapBits);
-
-        for (int glyphIndex = 0; glyphIndex < kDebugGlyphCount; ++glyphIndex)
-        {
-            const wchar_t character = static_cast<wchar_t>(kDebugGlyphFirst + glyphIndex);
-            const int column = glyphIndex % kDebugGlyphColumns;
-            const int row = glyphIndex / kDebugGlyphColumns;
-            const int x = column * kDebugGlyphCellWidth;
-            const int y = row * kDebugGlyphCellHeight;
-            SIZE glyphSize{};
-            GetTextExtentPoint32W(memoryDc, &character, 1, &glyphSize);
-
-            TextOutW(memoryDc, x + 2, y + 2, &character, 1);
-
-            DebugGlyph& glyph = debugGlyphs_[static_cast<std::size_t>(glyphIndex)];
-            const int glyphWidth = std::min(kDebugGlyphCellWidth, static_cast<int>(glyphSize.cx) + 4);
-            const int glyphHeight = std::min(kDebugGlyphCellHeight, static_cast<int>(textMetric.tmHeight) + 4);
-            glyph.u0 = static_cast<float>(x) / static_cast<float>(textureWidth);
-            glyph.v0 = static_cast<float>(y) / static_cast<float>(textureHeight);
-            glyph.u1 = static_cast<float>(x + glyphWidth) / static_cast<float>(textureWidth);
-            glyph.v1 = static_cast<float>(y + glyphHeight) / static_cast<float>(textureHeight);
-            glyph.advance = static_cast<float>(std::max(1L, static_cast<LONG>(glyphSize.cx)));
-            glyph.width = static_cast<float>(glyphWidth);
-            glyph.height = static_cast<float>(glyphHeight);
-        }
-
-        std::vector<std::uint8_t> rgba(static_cast<std::size_t>(textureWidth * textureHeight * 4));
-        for (int i = 0; i < textureWidth * textureHeight; ++i)
-        {
-            const std::uint8_t b = bgra[i * 4 + 0];
-            const std::uint8_t g = bgra[i * 4 + 1];
-            const std::uint8_t r = bgra[i * 4 + 2];
-            rgba[i * 4 + 0] = 255;
-            rgba[i * 4 + 1] = 255;
-            rgba[i * 4 + 2] = 255;
-            rgba[i * 4 + 3] = std::max({r, g, b});
-        }
-
-        SelectObject(memoryDc, oldFont);
-        SelectObject(memoryDc, oldBitmap);
-        if (ownsFont)
-        {
-            DeleteObject(font);
-        }
-        DeleteObject(bitmap);
-        DeleteDC(memoryDc);
-
-        return rgba;
+        return finalizeTextureUpload(textureManager_.createTextureFromPixels(pixels, width, height, format));
     }
 
     void createTextureSampler()
@@ -3893,21 +1372,21 @@ private:
 
     void createUniformBuffer()
     {
-        uniformBuffer_ = createBuffer(
+        uniformBuffer_ = resourceContext_.createBuffer(
             sizeof(SkyUniform),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(SkyUniform), 0, &uniformMappedMemory_);
 
-        blockUniformBuffer_ = createBuffer(
+        blockUniformBuffer_ = resourceContext_.createBuffer(
             sizeof(BlockUniform),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         vkMapMemory(device_, blockUniformBuffer_.memory, 0, sizeof(BlockUniform), 0, &blockUniformMappedMemory_);
 
-        debugTextVertexBuffer_ = createBuffer(
+        debugTextVertexBuffer_ = resourceContext_.createBuffer(
             sizeof(DebugTextVertex) * kMaxDebugTextVertices,
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -3919,159 +1398,141 @@ private:
             sizeof(DebugTextVertex) * kMaxDebugTextVertices,
             0,
             &debugTextVertexMappedMemory_);
+
+        crosshairVertexBuffer_ = resourceContext_.createBuffer(
+            sizeof(DebugTextVertex) * kCrosshairVertexCount,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        vkMapMemory(
+            device_,
+            crosshairVertexBuffer_.memory,
+            0,
+            sizeof(DebugTextVertex) * kCrosshairVertexCount,
+            0,
+            &crosshairVertexMappedMemory_);
+        updateCrosshairVertices();
+
+        if (playerModel_.isLoaded())
+        {
+            playerVertexBuffer_ = resourceContext_.createBuffer(
+                sizeof(BlockVertex) * playerModel_.vertexCount(),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+            vkMapMemory(
+                device_,
+                playerVertexBuffer_.memory,
+                0,
+                sizeof(BlockVertex) * playerModel_.vertexCount(),
+                0,
+                &playerVertexMappedMemory_);
+
+            createDeviceLocalBuffer(
+                playerModel_.indices().data(),
+                sizeof(std::uint32_t) * playerModel_.indices().size(),
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                playerIndexBuffer_);
+        }
     }
 
     void createDescriptorPool()
     {
-        std::array<VkDescriptorPoolSize, 2> poolSizes{};
-        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSizes[0].descriptorCount = 2;
-        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSizes[1].descriptorCount = 4;
-
-        VkDescriptorPoolCreateInfo poolInfo{};
-        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
-        poolInfo.pPoolSizes = poolSizes.data();
-        poolInfo.maxSets = 3;
-
-        if (vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan descriptor pool.");
-        }
+        const std::array<VkDescriptorPoolSize, 2> poolSizes = {{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6},
+        }};
+        descriptorPool_ = createVulkanDescriptorPool(
+            device_,
+            poolSizes,
+            5,
+            "Failed to create Vulkan descriptor pool.");
     }
 
     void createDescriptorSet()
     {
-        VkDescriptorSetAllocateInfo allocateInfo{};
-        allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocateInfo.descriptorPool = descriptorPool_;
-        allocateInfo.descriptorSetCount = 1;
-        allocateInfo.pSetLayouts = &descriptorSetLayout_;
-
-        if (vkAllocateDescriptorSets(device_, &allocateInfo, &descriptorSet_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to allocate Vulkan descriptor set.");
-        }
-
-        VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = uniformBuffer_.buffer;
-        bufferInfo.offset = 0;
-        bufferInfo.range = sizeof(SkyUniform);
-
-        VkDescriptorImageInfo sunImageInfo{};
-        sunImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        sunImageInfo.imageView = sunTexture_.view;
-        sunImageInfo.sampler = textureSampler_;
-
-        VkDescriptorImageInfo moonImageInfo{};
-        moonImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        moonImageInfo.imageView = moonTexture_.view;
-        moonImageInfo.sampler = textureSampler_;
-
-        std::array<VkWriteDescriptorSet, 3> descriptorWrites{};
-        descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[0].dstSet = descriptorSet_;
-        descriptorWrites[0].dstBinding = 0;
-        descriptorWrites[0].descriptorCount = 1;
-        descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        descriptorWrites[0].pBufferInfo = &bufferInfo;
-
-        descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[1].dstSet = descriptorSet_;
-        descriptorWrites[1].dstBinding = 1;
-        descriptorWrites[1].descriptorCount = 1;
-        descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        descriptorWrites[1].pImageInfo = &sunImageInfo;
-
-        descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[2].dstSet = descriptorSet_;
-        descriptorWrites[2].dstBinding = 2;
-        descriptorWrites[2].descriptorCount = 1;
-        descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        descriptorWrites[2].pImageInfo = &moonImageInfo;
-
-        vkUpdateDescriptorSets(
+        descriptorSet_ = allocateVulkanDescriptorSet(
             device_,
-            static_cast<std::uint32_t>(descriptorWrites.size()),
-            descriptorWrites.data(),
-            0,
-            nullptr);
+            descriptorPool_,
+            descriptorSetLayout_,
+            "Failed to allocate Vulkan descriptor set.");
+
+        const VkDescriptorBufferInfo bufferInfo = descriptorBufferInfo(uniformBuffer_.buffer, sizeof(SkyUniform));
+        const VkDescriptorImageInfo sunImageInfo = descriptorImageInfo(sunTexture_.view, textureSampler_);
+        const VkDescriptorImageInfo moonImageInfo = descriptorImageInfo(moonTexture_.view, textureSampler_);
+
+        const std::array<VkWriteDescriptorSet, 3> descriptorWrites = {
+            writeBufferDescriptor(descriptorSet_, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, bufferInfo),
+            writeImageDescriptor(descriptorSet_, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sunImageInfo),
+            writeImageDescriptor(descriptorSet_, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, moonImageInfo),
+        };
+        updateVulkanDescriptorSets(device_, descriptorWrites);
     }
 
     void createBlockDescriptorSet()
     {
-        VkDescriptorSetAllocateInfo allocateInfo{};
-        allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocateInfo.descriptorPool = descriptorPool_;
-        allocateInfo.descriptorSetCount = 1;
-        allocateInfo.pSetLayouts = &blockDescriptorSetLayout_;
-
-        if (vkAllocateDescriptorSets(device_, &allocateInfo, &blockDescriptorSet_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to allocate Vulkan block descriptor set.");
-        }
-
-        VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = blockUniformBuffer_.buffer;
-        bufferInfo.offset = 0;
-        bufferInfo.range = sizeof(BlockUniform);
-
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView = blockTextureArray_.view;
-        imageInfo.sampler = textureSampler_;
-
-        std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
-        descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[0].dstSet = blockDescriptorSet_;
-        descriptorWrites[0].dstBinding = 0;
-        descriptorWrites[0].descriptorCount = 1;
-        descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        descriptorWrites[0].pBufferInfo = &bufferInfo;
-
-        descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[1].dstSet = blockDescriptorSet_;
-        descriptorWrites[1].dstBinding = 1;
-        descriptorWrites[1].descriptorCount = 1;
-        descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        descriptorWrites[1].pImageInfo = &imageInfo;
-
-        vkUpdateDescriptorSets(
+        blockDescriptorSet_ = allocateVulkanDescriptorSet(
             device_,
-            static_cast<std::uint32_t>(descriptorWrites.size()),
-            descriptorWrites.data(),
-            0,
-            nullptr);
+            descriptorPool_,
+            blockDescriptorSetLayout_,
+            "Failed to allocate Vulkan block descriptor set.");
+
+        const VkDescriptorBufferInfo bufferInfo = descriptorBufferInfo(blockUniformBuffer_.buffer, sizeof(BlockUniform));
+        const VkDescriptorImageInfo imageInfo = descriptorImageInfo(blockTextureArray_.view, textureSampler_);
+
+        const std::array<VkWriteDescriptorSet, 2> descriptorWrites = {
+            writeBufferDescriptor(blockDescriptorSet_, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, bufferInfo),
+            writeImageDescriptor(blockDescriptorSet_, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, imageInfo),
+        };
+        updateVulkanDescriptorSets(device_, descriptorWrites);
+    }
+
+    void createPlayerDescriptorSet()
+    {
+        playerDescriptorSet_ = allocateVulkanDescriptorSet(
+            device_,
+            descriptorPool_,
+            blockDescriptorSetLayout_,
+            "Failed to allocate Vulkan player descriptor set.");
+
+        const VkDescriptorBufferInfo bufferInfo = descriptorBufferInfo(blockUniformBuffer_.buffer, sizeof(BlockUniform));
+        const VkDescriptorImageInfo imageInfo = descriptorImageInfo(playerTexture_.view, textureSampler_);
+
+        const std::array<VkWriteDescriptorSet, 2> descriptorWrites = {
+            writeBufferDescriptor(playerDescriptorSet_, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, bufferInfo),
+            writeImageDescriptor(playerDescriptorSet_, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, imageInfo),
+        };
+        updateVulkanDescriptorSets(device_, descriptorWrites);
+    }
+
+    void createCrosshairDescriptorSet()
+    {
+        crosshairDescriptorSet_ = allocateVulkanDescriptorSet(
+            device_,
+            descriptorPool_,
+            debugTextDescriptorSetLayout_,
+            "Failed to allocate Vulkan crosshair descriptor set.");
+
+        const VkDescriptorImageInfo imageInfo = descriptorImageInfo(crosshairTexture_.view, textureSampler_);
+        const std::array<VkWriteDescriptorSet, 1> descriptorWrites = {
+            writeImageDescriptor(crosshairDescriptorSet_, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, imageInfo),
+        };
+        updateVulkanDescriptorSets(device_, descriptorWrites);
     }
 
     void createDebugTextDescriptorSet()
     {
-        VkDescriptorSetAllocateInfo allocateInfo{};
-        allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocateInfo.descriptorPool = descriptorPool_;
-        allocateInfo.descriptorSetCount = 1;
-        allocateInfo.pSetLayouts = &debugTextDescriptorSetLayout_;
+        debugTextDescriptorSet_ = allocateVulkanDescriptorSet(
+            device_,
+            descriptorPool_,
+            debugTextDescriptorSetLayout_,
+            "Failed to allocate Vulkan debug text descriptor set.");
 
-        if (vkAllocateDescriptorSets(device_, &allocateInfo, &debugTextDescriptorSet_) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to allocate Vulkan debug text descriptor set.");
-        }
-
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView = debugFontAtlasTexture_.view;
-        imageInfo.sampler = textureSampler_;
-
-        VkWriteDescriptorSet descriptorWrite{};
-        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrite.dstSet = debugTextDescriptorSet_;
-        descriptorWrite.dstBinding = 0;
-        descriptorWrite.descriptorCount = 1;
-        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        descriptorWrite.pImageInfo = &imageInfo;
-
-        vkUpdateDescriptorSets(device_, 1, &descriptorWrite, 0, nullptr);
+        const VkDescriptorImageInfo imageInfo = descriptorImageInfo(debugFontAtlasTexture_.view, textureSampler_);
+        const std::array<VkWriteDescriptorSet, 1> descriptorWrites = {
+            writeImageDescriptor(debugTextDescriptorSet_, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, imageInfo),
+        };
+        updateVulkanDescriptorSets(device_, descriptorWrites);
     }
 
     void cacheStaticDebugText()
@@ -4123,148 +1584,8 @@ private:
         }
     }
 
-    Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties)
+    void deferUploadCommandBuffer(VkCommandBuffer commandBuffer)
     {
-        Buffer buffer{};
-
-        VkBufferCreateInfo bufferInfo{};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufferInfo.size = size;
-        bufferInfo.usage = usage;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        if (vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer.buffer) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan buffer.");
-        }
-
-        VkMemoryRequirements memoryRequirements{};
-        vkGetBufferMemoryRequirements(device_, buffer.buffer, &memoryRequirements);
-
-        VkMemoryAllocateInfo allocateInfo{};
-        allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocateInfo.allocationSize = memoryRequirements.size;
-        allocateInfo.memoryTypeIndex = findMemoryType(
-            physicalDevice_,
-            memoryRequirements.memoryTypeBits,
-            properties);
-
-        if (vkAllocateMemory(device_, &allocateInfo, nullptr, &buffer.memory) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to allocate Vulkan buffer memory.");
-        }
-
-        vkBindBufferMemory(device_, buffer.buffer, buffer.memory, 0);
-        return buffer;
-    }
-
-    void createDeviceLocalBuffer(
-        const void* sourceData,
-        VkDeviceSize size,
-        VkBufferUsageFlags usage,
-        Buffer& destinationBuffer)
-    {
-        Buffer stagingBuffer = createBuffer(
-            size,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        void* data = nullptr;
-        vkMapMemory(device_, stagingBuffer.memory, 0, size, 0, &data);
-        std::memcpy(data, sourceData, static_cast<std::size_t>(size));
-        vkUnmapMemory(device_, stagingBuffer.memory);
-
-        destinationBuffer = createBuffer(
-            size,
-            usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-        copyBuffer(stagingBuffer.buffer, destinationBuffer.buffer, size);
-        deferUploadStagingBuffer(stagingBuffer);
-    }
-
-    void createImage(
-        std::uint32_t width,
-        std::uint32_t height,
-        VkFormat format,
-        VkImageTiling tiling,
-        VkImageUsageFlags usage,
-        VkMemoryPropertyFlags properties,
-        VkImage& image,
-        VkDeviceMemory& imageMemory,
-        std::uint32_t arrayLayers = 1)
-    {
-        VkImageCreateInfo imageInfo{};
-        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.extent.width = width;
-        imageInfo.extent.height = height;
-        imageInfo.extent.depth = 1;
-        imageInfo.mipLevels = 1;
-        imageInfo.arrayLayers = arrayLayers;
-        imageInfo.format = format;
-        imageInfo.tiling = tiling;
-        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        imageInfo.usage = usage;
-        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        if (vkCreateImage(device_, &imageInfo, nullptr, &image) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to create Vulkan image.");
-        }
-
-        VkMemoryRequirements memoryRequirements{};
-        vkGetImageMemoryRequirements(device_, image, &memoryRequirements);
-
-        VkMemoryAllocateInfo allocateInfo{};
-        allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocateInfo.allocationSize = memoryRequirements.size;
-        allocateInfo.memoryTypeIndex = findMemoryType(
-            physicalDevice_,
-            memoryRequirements.memoryTypeBits,
-            properties);
-
-        if (vkAllocateMemory(device_, &allocateInfo, nullptr, &imageMemory) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to allocate Vulkan image memory.");
-        }
-
-        vkBindImageMemory(device_, image, imageMemory, 0);
-    }
-
-    VkCommandBuffer beginSingleTimeCommands()
-    {
-        VkCommandBufferAllocateInfo allocateInfo{};
-        allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocateInfo.commandPool = commandPool_;
-        allocateInfo.commandBufferCount = 1;
-
-        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(device_, &allocateInfo, &commandBuffer);
-
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(commandBuffer, &beginInfo);
-
-        return commandBuffer;
-    }
-
-    void endSingleTimeCommands(VkCommandBuffer commandBuffer)
-    {
-        vkEndCommandBuffer(commandBuffer);
-
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
-
-        if (vkQueueSubmit(graphicsQueue_, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to submit Vulkan upload command buffer.");
-        }
         deferredUploadCleanups_.push_back({
             {},
             commandBuffer,
@@ -4282,170 +1603,40 @@ private:
         stagingBuffer = {};
     }
 
-    void copyBuffer(VkBuffer sourceBuffer, VkBuffer destinationBuffer, VkDeviceSize size)
+    void createDeviceLocalBuffer(
+        const void* sourceData,
+        VkDeviceSize size,
+        VkBufferUsageFlags usage,
+        Buffer& destinationBuffer)
     {
-        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
-        VkBufferCopy copyRegion{};
-        copyRegion.size = size;
-        vkCmdCopyBuffer(commandBuffer, sourceBuffer, destinationBuffer, 1, &copyRegion);
-
-        endSingleTimeCommands(commandBuffer);
-    }
-
-    void transitionImageLayout(
-        VkImage image,
-        VkFormat,
-        VkImageLayout oldLayout,
-        VkImageLayout newLayout,
-        std::uint32_t layerCount = 1)
-    {
-        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
-        VkImageMemoryBarrier barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.oldLayout = oldLayout;
-        barrier.newLayout = newLayout;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = image;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.baseArrayLayer = 0;
-        barrier.subresourceRange.layerCount = layerCount;
-
-        VkPipelineStageFlags sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        VkPipelineStageFlags destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-
-        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
-            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-        {
-            barrier.srcAccessMask = 0;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
-        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-                 newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-        {
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        }
-        else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
-                 newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-        {
-            barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            sourceStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
-        else
-        {
-            throw std::runtime_error("Unsupported Vulkan image layout transition.");
-        }
-
-        vkCmdPipelineBarrier(
-            commandBuffer,
-            sourceStage,
-            destinationStage,
-            0,
-            0,
-            nullptr,
-            0,
-            nullptr,
-            1,
-            &barrier);
-
-        endSingleTimeCommands(commandBuffer);
-    }
-
-    void copyBufferToImage(VkBuffer buffer, VkImage image, std::uint32_t width, std::uint32_t height)
-    {
-        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
-        VkBufferImageCopy region{};
-        region.bufferOffset = 0;
-        region.bufferRowLength = 0;
-        region.bufferImageHeight = 0;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = 0;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-        region.imageOffset = {0, 0, 0};
-        region.imageExtent = {width, height, 1};
-
-        vkCmdCopyBufferToImage(
-            commandBuffer,
-            buffer,
-            image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &region);
-
-        endSingleTimeCommands(commandBuffer);
-    }
-
-    void copyBufferToImageArray(
-        VkBuffer buffer,
-        VkImage image,
-        std::uint32_t width,
-        std::uint32_t height,
-        std::uint32_t layerCount)
-    {
-        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
-        VkBufferImageCopy region{};
-        region.bufferOffset = 0;
-        region.bufferRowLength = 0;
-        region.bufferImageHeight = 0;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = 0;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = layerCount;
-        region.imageOffset = {0, 0, 0};
-        region.imageExtent = {width, height, 1};
-
-        vkCmdCopyBufferToImage(
-            commandBuffer,
-            buffer,
-            image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &region);
-
-        endSingleTimeCommands(commandBuffer);
-    }
-
-    void uploadTexturePixels(Texture& texture, const std::vector<std::uint8_t>& pixels)
-    {
-        const VkDeviceSize imageSize = static_cast<VkDeviceSize>(pixels.size());
-        Buffer stagingBuffer = createBuffer(
-            imageSize,
+        Buffer stagingBuffer = resourceContext_.createBuffer(
+            size,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         void* data = nullptr;
-        vkMapMemory(device_, stagingBuffer.memory, 0, imageSize, 0, &data);
-        std::memcpy(data, pixels.data(), static_cast<std::size_t>(imageSize));
+        vkMapMemory(device_, stagingBuffer.memory, 0, size, 0, &data);
+        std::memcpy(data, sourceData, static_cast<std::size_t>(size));
         vkUnmapMemory(device_, stagingBuffer.memory);
 
-        transitionImageLayout(
-            texture.image,
-            texture.format,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        copyBufferToImage(stagingBuffer.buffer, texture.image, texture.width, texture.height);
-        transitionImageLayout(
-            texture.image,
-            texture.format,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        destinationBuffer = resourceContext_.createBuffer(
+            size,
+            usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        deferUploadCommandBuffer(resourceContext_.copyBuffer(stagingBuffer.buffer, destinationBuffer.buffer, size));
         deferUploadStagingBuffer(stagingBuffer);
+    }
+
+    void uploadTexturePixels(Texture& texture, const std::vector<std::uint8_t>& pixels)
+    {
+        TextureUpload upload = textureManager_.uploadTexturePixels(texture, pixels);
+        for (VkCommandBuffer commandBuffer : upload.commandBuffers)
+        {
+            deferUploadCommandBuffer(commandBuffer);
+        }
+        deferUploadStagingBuffer(upload.stagingBuffer);
+        texture = upload.texture;
     }
 
     void drawFrame()
@@ -4494,6 +1685,7 @@ private:
         vkResetCommandBuffer(commandBuffers_[currentFrame_], 0);
 
         updateCameraMovement();
+        updatePlayerRenderMesh();
 
         sectionStart = mark();
         const ChunkLoadUpdateStats loadStats = updateLoadedChunks();
@@ -4574,44 +1766,99 @@ private:
     void updateCameraMovement()
     {
         const auto now = std::chrono::steady_clock::now();
-        const float deltaSeconds = static_cast<float>(std::chrono::duration<double>(now - lastFrameTime_).count());
+        const float rawDeltaSeconds = static_cast<float>(std::chrono::duration<double>(now - lastFrameTime_).count());
         lastFrameTime_ = now;
 
-        Vec3 movement{};
-        const Vec3 forward = cameraForward(camera_.yaw, 0.0f);
-        const Vec3 right = cameraRight(camera_.yaw);
+        PlayerInputState input{};
+        input.moveForward = glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS;
+        input.moveBackward = glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS;
+        input.moveRight = glfwGetKey(window_, GLFW_KEY_D) == GLFW_PRESS;
+        input.moveLeft = glfwGetKey(window_, GLFW_KEY_A) == GLFW_PRESS;
+        input.moveUp = glfwGetKey(window_, GLFW_KEY_SPACE) == GLFW_PRESS;
+        input.moveDown =
+            glfwGetKey(window_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+            glfwGetKey(window_, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
 
-        if (glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS)
+        playerController_.update(
+            camera_,
+            input,
+            rawDeltaSeconds,
+            [this](int x, int y, int z)
+            {
+                return isWorldBlockSolid(x, y, z);
+            });
+    }
+
+    bool isWorldBlockSolid(int x, int y, int z) const
+    {
+        if (y < 0 || y >= kChunkHeight)
         {
-            movement = movement + forward;
-        }
-        if (glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS)
-        {
-            movement = movement - forward;
-        }
-        if (glfwGetKey(window_, GLFW_KEY_D) == GLFW_PRESS)
-        {
-            movement = movement + right;
-        }
-        if (glfwGetKey(window_, GLFW_KEY_A) == GLFW_PRESS)
-        {
-            movement = movement - right;
-        }
-        if (glfwGetKey(window_, GLFW_KEY_SPACE) == GLFW_PRESS)
-        {
-            movement = movement + Vec3{0.0f, 1.0f, 0.0f};
-        }
-        if (glfwGetKey(window_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-            glfwGetKey(window_, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS)
-        {
-            movement = movement - Vec3{0.0f, 1.0f, 0.0f};
+            return true;
         }
 
-        if (dot(movement, movement) > 0.0f)
+        return blockRegistry_.isSolid(worldGenerator_.blockIdAt(x, y, z));
+    }
+
+    Vec3 playerFeetPosition() const
+    {
+        return playerController_.playerFeetPosition(camera_);
+    }
+
+    bool isThirdPersonView() const
+    {
+        return playerController_.isThirdPersonView();
+    }
+
+    Vec3 renderCameraForward() const
+    {
+        return playerController_.renderCameraForward(camera_);
+    }
+
+    Vec3 renderCameraPosition() const
+    {
+        return playerController_.renderCameraPosition(camera_);
+    }
+
+    void updatePlayerRenderMesh()
+    {
+        if (!playerModel_.isLoaded() || !isThirdPersonView() || playerVertexMappedMemory_ == nullptr)
         {
-            constexpr float flySpeed = 64.0f;
-            camera_.position = camera_.position + normalize(movement) * (flySpeed * deltaSeconds);
+            playerVertexCount_ = 0;
+            return;
         }
+
+        const std::vector<BlockVertex>& renderVertices =
+            playerModel_.updateRenderVertices(playerFeetPosition(), camera_.yaw, kPlayerHeight);
+
+        std::memcpy(
+            playerVertexMappedMemory_,
+            renderVertices.data(),
+            sizeof(BlockVertex) * renderVertices.size());
+        playerVertexCount_ = static_cast<std::uint32_t>(renderVertices.size());
+    }
+
+    void updateCrosshairVertices()
+    {
+        if (crosshairVertexMappedMemory_ == nullptr)
+        {
+            crosshairVertexCount_ = 0;
+            return;
+        }
+
+        const std::vector<DebugTextVertex> vertices = buildCrosshairVertices(
+            crosshairTexture_.width,
+            crosshairTexture_.height,
+            swapchainExtent_.width,
+            swapchainExtent_.height);
+
+        if (!vertices.empty())
+        {
+            std::memcpy(
+                crosshairVertexMappedMemory_,
+                vertices.data(),
+                sizeof(DebugTextVertex) * vertices.size());
+        }
+        crosshairVertexCount_ = static_cast<std::uint32_t>(vertices.size());
     }
 
     void updateDebugTextOverlay()
@@ -4697,32 +1944,12 @@ private:
 
     void rebuildDebugTextVertices()
     {
-        std::vector<DebugTextVertex> vertices;
-        vertices.reserve(6000);
-
-        appendDebugTextBlock(vertices, debugTextOverlay_.lines, 12.0f, 10.0f, false);
-        appendDebugTextBlock(
-            vertices,
+        std::vector<DebugTextVertex> vertices = debugTextRenderer_.buildVertices(
+            debugTextOverlay_.lines,
             debugTextOverlay_.rightLines,
-            static_cast<float>(swapchainExtent_.width) - 12.0f,
-            10.0f,
-            true);
-        const float bottomLeftY = std::max(
-            10.0f,
-            static_cast<float>(swapchainExtent_.height) -
-                10.0f -
-                57.0f * static_cast<float>(debugTextOverlay_.bottomLeftLines.size()));
-        appendDebugTextBlock(
-            vertices,
             debugTextOverlay_.bottomLeftLines,
-            12.0f,
-            bottomLeftY,
-            false);
-
-        if (vertices.size() > kMaxDebugTextVertices)
-        {
-            vertices.resize(kMaxDebugTextVertices);
-        }
+            swapchainExtent_.width,
+            swapchainExtent_.height);
 
         debugTextVertexCount_ = static_cast<std::uint32_t>(vertices.size());
         if (debugTextVertexCount_ > 0)
@@ -4732,88 +1959,6 @@ private:
                 vertices.data(),
                 sizeof(DebugTextVertex) * vertices.size());
         }
-    }
-
-    void appendDebugTextBlock(
-        std::vector<DebugTextVertex>& vertices,
-        const std::vector<std::wstring>& lines,
-        float x,
-        float y,
-        bool alignRight) const
-    {
-        for (const std::wstring& line : lines)
-        {
-            const float lineWidth = measureDebugTextLine(line);
-            const float lineX = alignRight ? x - lineWidth : x;
-
-            appendDebugTextLine(vertices, line, lineX - 1.0f, y, {0.0f, 0.0f, 0.0f, 1.0f});
-            appendDebugTextLine(vertices, line, lineX + 1.0f, y, {0.0f, 0.0f, 0.0f, 1.0f});
-            appendDebugTextLine(vertices, line, lineX, y - 1.0f, {0.0f, 0.0f, 0.0f, 1.0f});
-            appendDebugTextLine(vertices, line, lineX, y + 1.0f, {0.0f, 0.0f, 0.0f, 1.0f});
-            appendDebugTextLine(vertices, line, lineX, y, {1.0f, 1.0f, 1.0f, 1.0f});
-
-            y += 57.0f;
-        }
-    }
-
-    float measureDebugTextLine(const std::wstring& line) const
-    {
-        float width = 0.0f;
-        for (wchar_t character : line)
-        {
-            width += glyphForCharacter(character).advance;
-        }
-        return width;
-    }
-
-    const DebugGlyph& glyphForCharacter(wchar_t character) const
-    {
-        if (character < kDebugGlyphFirst || character > kDebugGlyphLast)
-        {
-            character = L'?';
-        }
-
-        return debugGlyphs_[static_cast<std::size_t>(character - kDebugGlyphFirst)];
-    }
-
-    void appendDebugTextLine(
-        std::vector<DebugTextVertex>& vertices,
-        const std::wstring& line,
-        float x,
-        float y,
-        std::array<float, 4> color) const
-    {
-        for (wchar_t character : line)
-        {
-            const DebugGlyph& glyph = glyphForCharacter(character);
-            appendDebugGlyphQuad(vertices, x, y, glyph, color);
-            x += glyph.advance;
-        }
-    }
-
-    void appendDebugGlyphQuad(
-        std::vector<DebugTextVertex>& vertices,
-        float x,
-        float y,
-        const DebugGlyph& glyph,
-        std::array<float, 4> color) const
-    {
-        const float x0 = -1.0f + (2.0f * x / static_cast<float>(swapchainExtent_.width));
-        const float y0 = 1.0f - (2.0f * y / static_cast<float>(swapchainExtent_.height));
-        const float x1 = -1.0f + (2.0f * (x + glyph.width) / static_cast<float>(swapchainExtent_.width));
-        const float y1 = 1.0f - (2.0f * (y + glyph.height) / static_cast<float>(swapchainExtent_.height));
-
-        const auto makeVertex = [&](float px, float py, float u, float v) -> DebugTextVertex
-        {
-            return {{px, py}, {u, v}, {color[0], color[1], color[2], color[3]}};
-        };
-
-        vertices.push_back(makeVertex(x0, y0, glyph.u0, glyph.v0));
-        vertices.push_back(makeVertex(x1, y0, glyph.u1, glyph.v0));
-        vertices.push_back(makeVertex(x1, y1, glyph.u1, glyph.v1));
-        vertices.push_back(makeVertex(x0, y0, glyph.u0, glyph.v0));
-        vertices.push_back(makeVertex(x1, y1, glyph.u1, glyph.v1));
-        vertices.push_back(makeVertex(x0, y1, glyph.u0, glyph.v1));
     }
 
     void updateRightDebugText()
@@ -4852,10 +1997,12 @@ private:
             blockDrawCalls += mesh.subchunks.size();
         }
         const std::size_t debugDrawCalls = debugTextVisible_ ? 1 : 0;
-        const std::size_t drawCalls = 1 + blockDrawCalls + debugDrawCalls;
-        const std::size_t totalVertices = 12 + meshVertexCount_ + debugTextVertexCount_;
-        const std::size_t totalIndices = meshIndexCount_;
-        const std::size_t triangles = meshIndexCount_ / 3 + 4 + debugTextVertexCount_ / 3;
+        const std::size_t playerDrawCalls = playerVertexCount_ > 0 && playerIndexCount_ > 0 ? 1 : 0;
+        const std::size_t crosshairDrawCalls = crosshairVertexCount_ > 0 ? 1 : 0;
+        const std::size_t drawCalls = 1 + blockDrawCalls + playerDrawCalls + crosshairDrawCalls + debugDrawCalls;
+        const std::size_t totalVertices = 12 + meshVertexCount_ + playerVertexCount_ + crosshairVertexCount_ + debugTextVertexCount_;
+        const std::size_t totalIndices = meshIndexCount_ + playerIndexCount_;
+        const std::size_t triangles = meshIndexCount_ / 3 + playerIndexCount_ / 3 + 4 + crosshairVertexCount_ / 3 + debugTextVertexCount_ / 3;
         const auto [pendingBuilds, completedBuilds] = chunkBuildQueueSizes();
 
         debugTextOverlay_.rightLines = {
@@ -4867,10 +2014,10 @@ private:
             apiDebugLine_,
             driverDebugLine_,
             L"DRAWS: " + std::to_wstring(drawCalls),
-            L"CHUNKS: " + std::to_wstring(loadedChunks_.size()),
-            L"LOAD RADIUS: " + std::to_wstring(chunkLoadRadius_),
+            L"CHUNKS: " + std::to_wstring(chunkStreaming_.loadedChunkCount()),
+            L"LOAD RADIUS: " + std::to_wstring(chunkStreaming_.loadRadius()),
             L"UPLOADS/FRAME: " + std::to_wstring(chunkUploadsPerFrame_),
-            L"BUILD THREADS: " + std::to_wstring(chunkBuildThreads_),
+            L"BUILD THREADS: " + std::to_wstring(chunkStreaming_.buildThreadCount()),
             L"BUILD JOBS: " + std::to_wstring(pendingBuilds),
             L"BUILD DONE: " + std::to_wstring(completedBuilds),
             L"DEFERRED DESTROYS: " + std::to_wstring(deferredChunkBufferDestroys_.size()),
@@ -4881,41 +2028,17 @@ private:
         };
     }
 
-    std::uint64_t getProcessRamUsageMb() const
-    {
-        PROCESS_MEMORY_COUNTERS_EX counters{};
-        counters.cb = sizeof(counters);
-        if (GetProcessMemoryInfo(
-                GetCurrentProcess(),
-                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                sizeof(counters)) == 0)
-        {
-            return 0;
-        }
-
-        return static_cast<std::uint64_t>(counters.WorkingSetSize / (1024ull * 1024ull));
-    }
-
-    std::uint64_t getTotalRamMb() const
-    {
-        MEMORYSTATUSEX memoryStatus{};
-        memoryStatus.dwLength = sizeof(memoryStatus);
-        if (GlobalMemoryStatusEx(&memoryStatus) == 0)
-        {
-            return 0;
-        }
-
-        return static_cast<std::uint64_t>(memoryStatus.ullTotalPhys / (1024ull * 1024ull));
-    }
-
     void updateUniformBuffer()
     {
         SkyUniform uniform{};
         const float aspect = static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height);
         const float fovY = 70.0f * kPi / 180.0f;
+        const Vec3 renderPosition = renderCameraPosition();
+        const Vec3 renderForward = renderCameraForward();
+        const auto [renderYaw, renderPitch] = yawPitchFromForward(renderForward);
 
-        uniform.camera[0] = camera_.yaw;
-        uniform.camera[1] = camera_.pitch;
+        uniform.camera[0] = renderYaw;
+        uniform.camera[1] = renderPitch;
         uniform.camera[2] = aspect;
         uniform.camera[3] = std::tan(fovY * 0.5f);
 
@@ -4943,7 +2066,7 @@ private:
         std::memcpy(uniformMappedMemory_, &uniform, sizeof(uniform));
 
         BlockUniform blockUniform{};
-        const Mat4 view = makeViewMatrix(camera_.position, camera_.yaw, camera_.pitch);
+        const Mat4 view = makeViewMatrixFromForward(renderPosition, renderForward);
         const Mat4 projection = makePerspectiveMatrix(fovY, aspect, 0.05f, 1200.0f);
         const Mat4 viewProjection = multiply(projection, view);
         std::memcpy(blockUniform.viewProjection, viewProjection.m, sizeof(blockUniform.viewProjection));
@@ -5010,8 +2133,45 @@ private:
                     1,
                     draw.range.firstIndex,
                     draw.range.vertexOffset,
-                    0);
+                0);
             }
+        }
+
+        if (playerVertexCount_ > 0 && playerIndexCount_ > 0)
+        {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, playerPipeline_);
+            vkCmdBindDescriptorSets(
+                commandBuffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                playerPipelineLayout_,
+                0,
+                1,
+                &playerDescriptorSet_,
+                0,
+                nullptr);
+            VkBuffer vertexBuffers[] = {playerVertexBuffer_.buffer};
+            VkDeviceSize offsets[] = {0};
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+            vkCmdBindIndexBuffer(commandBuffer, playerIndexBuffer_.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(commandBuffer, playerIndexCount_, 1, 0, 0, 0);
+        }
+
+        if (crosshairVertexCount_ > 0)
+        {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, debugTextPipeline_);
+            vkCmdBindDescriptorSets(
+                commandBuffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                debugTextPipelineLayout_,
+                0,
+                1,
+                &crosshairDescriptorSet_,
+                0,
+                nullptr);
+            VkBuffer vertexBuffers[] = {crosshairVertexBuffer_.buffer};
+            VkDeviceSize offsets[] = {0};
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+            vkCmdDraw(commandBuffer, crosshairVertexCount_, 1, 0, 0);
         }
 
         if (debugTextVisible_)
@@ -5055,13 +2215,14 @@ private:
         collectDeferredChunkBufferDestroys(true);
         cleanupSwapchain();
         createSwapchain();
-        createImageViews();
         createRenderPass();
         createDepthResources();
         createGraphicsPipeline();
         createBlockPipeline();
+        createPlayerPipeline();
         createDebugTextPipeline();
         createFramebuffers();
+        updateCrosshairVertices();
     }
 
     void cleanupSwapchain()
@@ -5082,6 +2243,11 @@ private:
             vkDestroyPipeline(device_, blockPipeline_, nullptr);
             blockPipeline_ = VK_NULL_HANDLE;
         }
+        if (playerPipeline_ != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(device_, playerPipeline_, nullptr);
+            playerPipeline_ = VK_NULL_HANDLE;
+        }
         if (debugTextPipeline_ != VK_NULL_HANDLE)
         {
             vkDestroyPipeline(device_, debugTextPipeline_, nullptr);
@@ -5098,6 +2264,11 @@ private:
             vkDestroyPipelineLayout(device_, blockPipelineLayout_, nullptr);
             blockPipelineLayout_ = VK_NULL_HANDLE;
         }
+        if (playerPipelineLayout_ != VK_NULL_HANDLE)
+        {
+            vkDestroyPipelineLayout(device_, playerPipelineLayout_, nullptr);
+            playerPipelineLayout_ = VK_NULL_HANDLE;
+        }
         if (debugTextPipelineLayout_ != VK_NULL_HANDLE)
         {
             vkDestroyPipelineLayout(device_, debugTextPipelineLayout_, nullptr);
@@ -5110,19 +2281,20 @@ private:
             renderPass_ = VK_NULL_HANDLE;
         }
 
-        for (VkImageView imageView : swapchainImageViews_)
-        {
-            vkDestroyImageView(device_, imageView, nullptr);
-        }
-        swapchainImageViews_.clear();
+        resourceContext_.destroyTexture(depthTexture_);
 
-        destroyTexture(depthTexture_);
-
-        if (swapchain_ != VK_NULL_HANDLE)
-        {
-            vkDestroySwapchainKHR(device_, swapchain_, nullptr);
-            swapchain_ = VK_NULL_HANDLE;
-        }
+        VulkanSwapchainResources resources{};
+        resources.swapchain = swapchain_;
+        resources.imageFormat = swapchainImageFormat_;
+        resources.extent = swapchainExtent_;
+        resources.images = std::move(swapchainImages_);
+        resources.imageViews = std::move(swapchainImageViews_);
+        destroyVulkanSwapchain(device_, resources);
+        swapchain_ = resources.swapchain;
+        swapchainImageFormat_ = resources.imageFormat;
+        swapchainExtent_ = resources.extent;
+        swapchainImages_ = std::move(resources.images);
+        swapchainImageViews_ = std::move(resources.imageViews);
     }
 
     void handleMouseMove(double xPos, double yPos)
@@ -5203,21 +2375,6 @@ private:
         camera_.firstMouse = true;
     }
 
-    void destroyBuffer(Buffer& buffer)
-    {
-        if (buffer.buffer != VK_NULL_HANDLE)
-        {
-            vkDestroyBuffer(device_, buffer.buffer, nullptr);
-            buffer.buffer = VK_NULL_HANDLE;
-        }
-
-        if (buffer.memory != VK_NULL_HANDLE)
-        {
-            vkFreeMemory(device_, buffer.memory, nullptr);
-            buffer.memory = VK_NULL_HANDLE;
-        }
-    }
-
     void collectDeferredChunkBufferDestroys(bool force)
     {
         for (auto it = deferredChunkBufferDestroys_.begin(); it != deferredChunkBufferDestroys_.end();)
@@ -5228,8 +2385,8 @@ private:
                 continue;
             }
 
-            destroyBuffer(it->vertexBuffer);
-            destroyBuffer(it->indexBuffer);
+            resourceContext_.destroyBuffer(it->vertexBuffer);
+            resourceContext_.destroyBuffer(it->indexBuffer);
             it = deferredChunkBufferDestroys_.erase(it);
         }
     }
@@ -5244,7 +2401,7 @@ private:
                 continue;
             }
 
-            destroyBuffer(it->stagingBuffer);
+            resourceContext_.destroyBuffer(it->stagingBuffer);
             if (it->commandBuffer != VK_NULL_HANDLE)
             {
                 vkFreeCommandBuffers(device_, commandPool_, 1, &it->commandBuffer);
@@ -5279,42 +2436,17 @@ private:
     {
         for (ChunkMesh& mesh : chunkMeshes_)
         {
-            destroyBuffer(mesh.vertexBuffer);
-            destroyBuffer(mesh.indexBuffer);
+            resourceContext_.destroyBuffer(mesh.vertexBuffer);
+            resourceContext_.destroyBuffer(mesh.indexBuffer);
         }
         chunkMeshes_.clear();
         collectDeferredChunkBufferDestroys(true);
-        loadedChunks_.clear();
-        queuedChunks_.clear();
-        desiredChunks_.clear();
-        queuedChunkGenerations_.clear();
-        pendingChunkMeshes_.clear();
-        loadedCenterChunkX_ = std::numeric_limits<int>::min();
-        loadedCenterChunkZ_ = std::numeric_limits<int>::min();
+        chunkStreaming_.reset();
         meshVertexCount_ = 0;
         meshIndexCount_ = 0;
     }
 
-    void destroyTexture(Texture& texture)
-    {
-        if (texture.view != VK_NULL_HANDLE)
-        {
-            vkDestroyImageView(device_, texture.view, nullptr);
-            texture.view = VK_NULL_HANDLE;
-        }
 
-        if (texture.image != VK_NULL_HANDLE)
-        {
-            vkDestroyImage(device_, texture.image, nullptr);
-            texture.image = VK_NULL_HANDLE;
-        }
-
-        if (texture.memory != VK_NULL_HANDLE)
-        {
-            vkFreeMemory(device_, texture.memory, nullptr);
-            texture.memory = VK_NULL_HANDLE;
-        }
-    }
 };
 }
 

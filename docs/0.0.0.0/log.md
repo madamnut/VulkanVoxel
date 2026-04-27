@@ -67,3 +67,23 @@
 - 증분 로딩 이후 기존 pending build job이 예전 중심 기준 거리 우선순위를 유지하던 문제를 줄이기 위해, worker가 job을 꺼낼 때 현재 중심 기준 거리로 lazy re-priority하도록 했다.
 - 청크 로딩을 다시 단순한 `desiredChunks_` set 방식으로 되돌렸다. 플레이어가 새 청크로 들어가면 `(2r + 1)^2` 정사각형 범위를 다시 만들고, 그 set 기준으로 unload/load queue를 한 번에 갱신한다.
 - 플레이어가 새 청크로 들어갈 때 기존 pending subchunk build job의 거리 우선순위를 현재 중심 청크 기준으로 즉시 재계산하고 heap을 재구성하도록 했다. 이 과정에서 취소된 generation의 stale job도 제거한다.
+- 플레이어 이동 모드를 추가했다. 시작은 fly 모드이며 `F`로 fly/ground를 토글한다. Fly는 기존 노클립 이동을 유지하고, ground는 60Hz fixed timestep에서 플레이어 AABB와 solid voxel 충돌을 축별로 처리한다.
+- 카메라 모드를 추가했다. 시작은 1인칭이며 `F5`로 3인칭 뒤통수, 3인칭 얼굴, 1인칭 순서로 순환한다. 3인칭 피벗은 플레이어 눈 위치를 사용한다.
+- `assets/textures/ui/Crosshair.png`를 화면 중앙 crosshair로 렌더링하고, `assets/textures/character/Character.glb`에서 추출한 `Character.mesh`/`Character.png`를 사용해 3인칭 플레이어 모델 렌더링을 추가했다.
+- 가독성 개선을 위해 수학 타입/함수(`Vec3`, `Mat4`, camera/view/projection helper)를 `src/core/Math.*`로 분리했다. 플레이어 이동/카메라 모드와 물리 상수는 `src/player/PlayerTypes.h`로 분리했다.
+- PNG 로딩의 WIC 세부 구현을 `src/assets/ImageLoader.*`로 분리해 `main.cpp`에서 이미지 디코딩 구현을 제거했다.
+- 플레이어 입력/이동/충돌/카메라 모드 로직을 `src/player/PlayerController.*`로 분리했다. `main.cpp`는 GLFW 입력 상태와 월드 solid block 판정 콜백만 전달한다.
+- 블럭 ID/정의 타입을 `src/world/Block.h`로 분리하고, 지형 높이/표면 후처리/블럭 ID 생성 규칙을 `src/world/WorldGenerator.*`로 분리했다.
+- 청크 공용 타입(`BlockVertex`, `ChunkCoord`, `SubchunkDraw` 등)을 `src/world/ChunkTypes.h`로 분리하고, 서브청크 CPU greedy meshing/AO 생성 로직을 `src/world/ChunkMesher.*`로 분리했다.
+- 블럭 정의 JSON 로딩, ID 인덱스, solid 판정을 `src/world/BlockRegistry.*`로 분리했다. `main.cpp`는 블럭 텍스처 레이어 할당과 Vulkan texture array 생성만 담당한다.
+- Vulkan 공용 리소스 타입(`Texture`, `Buffer`)과 SPIR-V 파일 로딩, shader module 생성, memory type 선택 헬퍼를 `src/render/VulkanHelpers.*`로 분리했다.
+- Vulkan buffer/image 생성, 단발성 upload command 제출, 리소스 destroy 로직을 `src/render/VulkanResourceContext.*`로 분리했다. `main.cpp`는 upload command/staging buffer의 deferred cleanup 큐 관리만 유지한다.
+- PNG/픽셀 기반 Vulkan texture 생성, texture array 생성, texture pixel 재업로드 로직을 `src/render/TextureManager.*`로 분리했다. `main.cpp`는 texture upload 결과를 deferred cleanup 큐에 등록하는 역할만 유지한다.
+- debug text glyph atlas 생성과 문자열을 quad vertex로 변환하는 로직을 `src/render/DebugTextRenderer.*`로 분리했다. `main.cpp`는 표시할 debug 문자열 갱신과 vertex buffer 업로드만 담당한다.
+- 플레이어 mesh 파일 로딩, index/base vertex 보관, bounds 계산, 3인칭 렌더 vertex 갱신 로직을 `src/render/PlayerModel.*`로 분리했다. `main.cpp`는 플레이어 GPU buffer 생성과 draw 호출만 담당한다.
+- 경로 헬퍼, 월드 설정 JSON 로딩, CPU/RAM/문자열 변환 같은 시스템 보조 로직을 `src/core/FileSystem.*`, `src/core/GameConfig.*`, `src/core/SystemInfo.*`로 분리했다. `main.cpp`는 설정값 적용과 debug text 조립만 담당한다.
+- crosshair quad vertex 생성 로직을 `src/render/CrosshairRenderer.*`로 분리했다. `main.cpp`는 crosshair texture 크기와 swapchain 크기를 넘겨 vertex buffer만 갱신한다.
+- 청크 스트리밍 상태, worker thread, pending/completed subchunk queue, 청크 로딩 반경 갱신과 CPU mesh 조립 로직을 `src/world/ChunkStreamingManager.*`로 분리했다. `main.cpp`는 청크 GPU buffer 업로드와 draw mesh 보관만 담당한다.
+- Vulkan graphics pipeline의 공통 생성 절차(shader module 생성/해제, viewport/scissor, rasterizer, depth, blend, pipeline layout/pipeline 생성)를 `src/render/VulkanPipelineBuilder.*`로 분리했다. `main.cpp`는 pipeline별 shader, vertex input, depth/blend/cull 설정만 넘긴다.
+- Vulkan descriptor set layout, descriptor pool, descriptor set allocation, buffer/image descriptor write helper를 `src/render/VulkanDescriptors.*`로 분리했다. `main.cpp`는 각 descriptor set에 연결할 buffer/texture만 지정한다.
+- Vulkan swapchain 지원 정보 조회, surface format/present mode/extent 선택, swapchain/image view 생성과 swapchain image view 파괴 로직을 `src/render/VulkanSwapchain.*`로 분리했다. `main.cpp`는 framebuffer 크기와 queue family만 넘기고, render pass/depth/framebuffer 수명 관리는 기존처럼 담당한다.

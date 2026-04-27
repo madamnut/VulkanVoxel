@@ -31,6 +31,8 @@ set(SHADER_SOURCES
     shaders/sky.frag
     shaders/block.vert
     shaders/block.frag
+    shaders/player.vert
+    shaders/player.frag
     shaders/debug_text.vert
     shaders/debug_text.frag
 )
@@ -52,6 +54,25 @@ endforeach()
 add_custom_target(VulkanVoxelShaders DEPENDS ${SHADER_BINARIES})
 
 add_executable(VulkanVoxel
+    src/assets/ImageLoader.cpp
+    src/core/FileSystem.cpp
+    src/core/GameConfig.cpp
+    src/core/Math.cpp
+    src/core/SystemInfo.cpp
+    src/player/PlayerController.cpp
+    src/render/CrosshairRenderer.cpp
+    src/render/DebugTextRenderer.cpp
+    src/render/PlayerModel.cpp
+    src/render/VulkanDescriptors.cpp
+    src/render/VulkanHelpers.cpp
+    src/render/VulkanPipelineBuilder.cpp
+    src/render/VulkanResourceContext.cpp
+    src/render/VulkanSwapchain.cpp
+    src/render/TextureManager.cpp
+    src/world/BlockRegistry.cpp
+    src/world/ChunkMesher.cpp
+    src/world/ChunkStreamingManager.cpp
+    src/world/WorldGenerator.cpp
     src/main.cpp
 )
 add_dependencies(VulkanVoxel VulkanVoxelShaders)
