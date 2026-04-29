@@ -28,3 +28,29 @@ private:
 
     std::array<std::uint8_t, kPermutationSize * 2> permutation_{};
 };
+
+class SimplexNoise4D
+{
+public:
+    struct Vec4
+    {
+        float value[4]{};
+    };
+
+    static constexpr int kGradientCount = 32;
+
+    explicit SimplexNoise4D(std::uint64_t seed = 0);
+
+    void setSeed(std::uint64_t seed);
+    float sample(float x, float y, float z, float w) const;
+
+private:
+    static constexpr int kPermutationSize = 256;
+    static constexpr int kPermutationMask = kPermutationSize - 1;
+
+    static std::uint64_t nextRandom(std::uint64_t& state);
+    static float dot(const Vec4& gradient, const std::array<float, 4>& offset);
+    int hash(int i, int j, int k, int l) const;
+
+    std::array<std::uint8_t, kPermutationSize * 2> permutation_{};
+};

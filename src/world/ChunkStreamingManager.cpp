@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
+#include <string>
 
 namespace
 {
@@ -49,6 +51,11 @@ void ChunkStreamingManager::setBuildThreadCount(int buildThreadCount)
 void ChunkStreamingManager::setChunkBuildCallback(std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> callback)
 {
     chunkBuildCallback_ = std::move(callback);
+}
+
+void ChunkStreamingManager::setBuildErrorCallback(std::function<void(ChunkCoord, const std::string&)> callback)
+{
+    buildErrorCallback_ = std::move(callback);
 }
 
 int ChunkStreamingManager::loadRadius() const
@@ -375,17 +382,59 @@ void ChunkStreamingManager::workerLoop()
             continue;
         }
 
-        ChunkBuildResult result = chunkBuildCallback_
-            ? chunkBuildCallback_(request.coord, request.generation)
-            : chunkMesher_.buildChunkMesh(request.coord, request.generation);
-
+        ChunkBuildResult result{};
+        try
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const auto generationIt = queuedGenerations_.find(request.coord);
-            if (generationIt != queuedGenerations_.end() &&
-                generationIt->second == request.generation)
+            result = chunkBuildCallback_
+                ? chunkBuildCallback_(request.coord, request.generation)
+                : chunkMesher_.buildChunkMesh(request.coord, request.generation);
+
             {
-                completedChunks_.push_back(std::move(result));
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto generationIt = queuedGenerations_.find(request.coord);
+                if (generationIt != queuedGenerations_.end() &&
+                    generationIt->second == request.generation)
+                {
+                    completedChunks_.push_back(std::move(result));
+                }
+            }
+        }
+        catch (const std::exception& exception)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto generationIt = queuedGenerations_.find(request.coord);
+                if (generationIt != queuedGenerations_.end() &&
+                    generationIt->second == request.generation)
+                {
+                    queuedChunks_.erase(request.coord);
+                    queuedGenerations_.erase(request.coord);
+                    pendingChunkMeshes_.erase(request.coord);
+                    rebuildingChunks_.erase(request.coord);
+                }
+            }
+            if (buildErrorCallback_)
+            {
+                buildErrorCallback_(request.coord, exception.what());
+            }
+        }
+        catch (...)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto generationIt = queuedGenerations_.find(request.coord);
+                if (generationIt != queuedGenerations_.end() &&
+                    generationIt->second == request.generation)
+                {
+                    queuedChunks_.erase(request.coord);
+                    queuedGenerations_.erase(request.coord);
+                    pendingChunkMeshes_.erase(request.coord);
+                    rebuildingChunks_.erase(request.coord);
+                }
+            }
+            if (buildErrorCallback_)
+            {
+                buildErrorCallback_(request.coord, "Unknown chunk build exception.");
             }
         }
     }

@@ -27,8 +27,8 @@ public:
     std::optional<WorldSaveState> loadWorldState();
     void saveWorldState(const WorldSaveState& state);
 
-    std::optional<std::vector<std::uint16_t>> loadChunk(ChunkCoord coord);
-    void saveChunk(ChunkCoord coord, const std::vector<std::uint16_t>& blockIds);
+    std::optional<ChunkVoxelData> loadChunk(ChunkCoord coord);
+    void saveChunk(ChunkCoord coord, const ChunkVoxelData& voxels);
 
 private:
     struct ChunkEntry
@@ -62,8 +62,8 @@ private:
     static void appendU32(std::vector<std::uint8_t>& bytes, std::uint32_t value);
     static std::uint16_t readU16(const std::vector<std::uint8_t>& bytes, std::size_t& offset);
     static std::uint32_t readU32(const std::vector<std::uint8_t>& bytes, std::size_t& offset);
-    static std::vector<std::uint8_t> encodeRle(const std::vector<std::uint16_t>& blockIds);
-    static std::vector<std::uint16_t> decodeRle(const std::vector<std::uint8_t>& bytes);
+    static std::vector<std::uint8_t> encodeRle(const ChunkVoxelData& voxels);
+    static ChunkVoxelData decodeRle(const std::vector<std::uint8_t>& bytes);
     static std::vector<std::uint8_t> compressLz4(const std::vector<std::uint8_t>& bytes);
     static std::vector<std::uint8_t> decompressLz4(const std::vector<std::uint8_t>& bytes);
 

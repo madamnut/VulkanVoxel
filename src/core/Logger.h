@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -19,4 +20,5 @@ private:
 
     std::wstring logPath_;
     std::ofstream stream_;
+    std::mutex mutex_;
 };

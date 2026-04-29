@@ -1,7 +1,35 @@
 # Version 0.0.0.0 Development Log
 
+## 2026-04-30
+
+- 유체 데이터를 `fluidId + fluidAmount` 구조로 분리했다. `fluidId == 0`은 유체 없음, `fluidId == 1`은 water이며, 청크 저장 RLE 단위는 `blockId + fluidId + fluidAmount + count`로 확장했다.
+- 청크 build worker에서 발생한 예외를 잡아 청크 좌표와 함께 로그에 남기도록 했다. worker thread에서 동시에 로그를 기록할 수 있으므로 `Logger` 쓰기 경로를 mutex로 보호했다.
+
+- 정적 물 유체를 추가했다. 각 청크 셀은 `blockId`와 별도 `fluidAmount`를 함께 가지며, 현재 단계에서는 `fluidAmount > 0`을 water로 해석한다.
+- 유체 최대량은 100으로 유지했다. 저장 타입은 `uint8_t`를 사용하고, 렌더 높이는 amount 10당 0.09씩 변하는 `amount / 100 * 0.9` 규칙을 따른다.
+- 초기 월드 생성 시 `Y <= 205`의 air 셀에 물 amount 100을 채운다. 솔리드 블럭 셀에는 유체를 넣지 않고, 블럭 편집으로 솔리드 블럭을 배치하면 해당 셀의 유체량을 0으로 지운다.
+- 물 생성은 별도 후처리가 아니라 base terrain 생성 중 air/rock 결정과 동시에 수행하도록 변경했다. 표면 재질 후처리는 바로 위 셀에 물이 있으면 최상단 solid를 grass가 아니라 dirt로 바꾼다.
+- 물 메시는 블럭과 같은 X/Z 1x1 크기를 사용하고, 최상단 full water는 높이 0.9로 렌더링한다. 위에 full water가 이어지는 아래쪽 물 셀은 빈틈이 생기지 않도록 1.0 높이까지 채운다.
+- 청크 저장 페이로드 RLE 단위를 `blockId + fluidId + fluidAmount + count`로 확장했다. 새로 생성된 청크와 저장된 청크 모두 블럭 배열, 유체 id 배열, 유체량 배열을 함께 저장/로드한다.
+- `assets/textures/fluid/water.png`를 block texture array에 함께 등록하고, 물 메시는 해당 texture layer를 사용하도록 했다.
+- 물 배열 추가로 워커 스레드 스택에서 `GeneratedChunkColumn`이 너무 커지는 문제를 막기 위해, 컬럼 내부 `blockIds`/`fluidAmounts` 저장소를 고정 스택 배열에서 heap 기반 `std::vector`로 변경했다.
+- `GeneratedChunkColumn`의 쓰기 접근자에 좌표/저장소 크기 검사를 추가했다. 잘못된 local 좌표가 들어오면 힙을 훼손하지 않고 즉시 예외로 드러나도록 했다.
+- density/landform float lookup 접근에 초기화/범위 검사를 추가하고, `WorldGenerator` 설정 갱신과 워커 스레드 읽기 사이를 `shared_mutex`로 보호했다.
+- 워커 스레드 청크 로드 경로의 `WorldSave::regionPath()`에서 임시 `std::filesystem::path` 조립을 제거하고 단순 `std::wstring` 경로 결합으로 변경했다.
+
 ## 2026-04-29
 
+- landform 적용 방식을 density bias 더하기에서 gradient center offset으로 변경했다. 최종 density는 `effectiveCenter = gradient.center + landformCenterOffset`을 사용해 계산한다.
+- landform curve를 baked spline lookup table로만 사용하도록 변경했다. `assets/worldgen/landform_curve.bin`은 `uint32 pairCount` 뒤에 `float32 raw, float32 centerOffset` 1000쌍이 이어지는 구조이며, 파일이 없거나 1000쌍이 아니면 로그를 남기고 즉시 종료한다.
+- `assets/worldgen/landform_curve.pyw`를 추가했다. X축은 `-1..1` raw landform noise, Y축은 `-0.5..0.5` gradient center offset이며 monotone cubic curve를 `landform_curve.bin`으로 bake할 수 있다.
+- `config/world.json`의 `terrainDensity.landform.bands` 설정을 제거했다. landform 설정은 `enabled`와 `frequency`만 남기고, 실제 raw-to-offset 변환은 `landform_curve.bin`이 담당한다.
+- `Landform:` debug text가 lattice 정점값이 아니라 현재 블럭 중심에서 실제 density 보간에 대응되는 bilinear 보간 raw/centerOffset 값을 표시하도록 변경했다.
+- 좌상단 `Landform:` debug text를 raw landform noise와 최종 center offset을 함께 표시하는 `Landform: raw [offset]` 형식으로 변경했다.
+- 지상 고저 전반을 담당하는 2D landform 명칭을 mountain에서 landform으로 변경했다. config 키는 `terrainDensity.landform`, 디버그 표시는 `Landform:`을 사용한다.
+- 좌하단 frame/profile debug text 출력을 제거했다.
+- 좌상단 debug text에 현재 플레이어 X/Z 위치의 최종 landform center offset을 `Landform:` 라인으로 추가했다. 표시값은 raw landform noise가 아니라 curve LUT 적용 후 gradient center에 더해지는 값이다.
+- landform 전용 노이즈를 기존 5D density 노이즈 재사용에서 별도 4D simplex noise로 분리했다. landform 노이즈는 X/Z를 cos/sin 토러스 입력으로 변환해 65536 블럭 X/Z 타일링을 유지하고, world seed에 별도 상수를 섞은 seed를 사용한다.
+- density 생성에 `terrainDensity.landform` 설정을 추가했다. X/Z 토러스 노이즈를 curve LUT로 center offset으로 변환한 뒤 같은 X/Z 컬럼의 gradient center를 올리거나 내려 `density == 0` 표면을 이동시킨다.
 - 플레이어 위치 기준을 눈 위치에서 발밑 중앙으로 변경했다. 저장 좌표, 디버그 POS, 청크 로딩 중심은 발밑 중앙을 사용하고, 렌더 카메라와 블록 레이캐스트는 발밑 중앙에 eye height를 더한 눈 위치에서 처리한다.
 - density octave 설정을 개별 octave 배열에서 `noise.octaves`, `baseFrequency`, `frequencyMultiplier`, `baseAmplitude`, `amplitudeMultiplier`, `verticalFrequencyScale` 방식으로 변경했다. 각 octave의 X/Z 주파수는 기본 주파수에서 배율로 내부 생성하고, Y 주파수는 X/Z 주파수에 vertical scale과 기존 128배 높이 보정을 적용한다.
 - 청크 저장 block id 배열 순서를 컬럼 단위 `localZ -> localX -> y`로 조정했다. y가 가장 빠르게 변하므로 같은 X/Z 컬럼 안에서는 다음 원소가 바로 위 블록이며, RLE가 수직 지형 구간을 더 잘 압축한다.

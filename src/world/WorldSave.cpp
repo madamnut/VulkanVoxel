@@ -1,6 +1,7 @@
 #include "world/WorldSave.h"
 
 #include "core/Logger.h"
+#include "world/Block.h"
 #include "lz4.h"
 
 #include <algorithm>
@@ -11,7 +12,7 @@
 
 namespace
 {
-constexpr std::size_t kMaxRleBytes = 4 + kChunkBlockCount * 6;
+constexpr std::size_t kMaxRleBytes = 4 + kChunkBlockCount * 8;
 
 template <typename T>
 void writePod(std::ostream& stream, const T& value)
@@ -136,7 +137,7 @@ void WorldSave::saveWorldState(const WorldSaveState& state)
     }
 }
 
-std::optional<std::vector<std::uint16_t>> WorldSave::loadChunk(ChunkCoord coord)
+std::optional<ChunkVoxelData> WorldSave::loadChunk(ChunkCoord coord)
 {
     const int wrappedChunkX = floorMod(coord.x, kWorldChunkSide);
     const int wrappedChunkZ = floorMod(coord.z, kWorldChunkSide);
@@ -215,11 +216,11 @@ std::optional<std::vector<std::uint16_t>> WorldSave::loadChunk(ChunkCoord coord)
     }
 }
 
-void WorldSave::saveChunk(ChunkCoord coord, const std::vector<std::uint16_t>& blockIds)
+void WorldSave::saveChunk(ChunkCoord coord, const ChunkVoxelData& voxels)
 {
-    if (blockIds.size() != kChunkBlockCount)
+    if (!voxels.valid())
     {
-        throw std::runtime_error("Cannot save chunk with an invalid block count.");
+        throw std::runtime_error("Cannot save chunk with invalid voxel data.");
     }
 
     const int wrappedChunkX = floorMod(coord.x, kWorldChunkSide);
@@ -234,7 +235,7 @@ void WorldSave::saveChunk(ChunkCoord coord, const std::vector<std::uint16_t>& bl
     std::vector<ChunkEntry> entries = readChunkTable(path);
     ChunkEntry& entry = entries[static_cast<std::size_t>(chunkTableIndex(localChunkX, localChunkZ))];
 
-    const std::vector<std::uint8_t> payload = compressLz4(encodeRle(blockIds));
+    const std::vector<std::uint8_t> payload = compressLz4(encodeRle(voxels));
     const std::uint32_t byteSize = static_cast<std::uint32_t>(payload.size());
     const std::uint32_t requiredSectors = sectorsForBytes(byteSize);
     std::uint32_t writeSector = entry.offsetSector;
@@ -321,8 +322,10 @@ std::uint32_t WorldSave::sectorsForBytes(std::uint32_t byteSize)
 
 std::wstring WorldSave::regionPath(int regionX, int regionZ) const
 {
-    return (std::filesystem::path(regionsDirectory_) /
-        (L"r." + std::to_wstring(regionX) + L"." + std::to_wstring(regionZ) + L".vvr")).wstring();
+    return regionsDirectory_ +
+        L"\\r." + std::to_wstring(regionX) +
+        L"." + std::to_wstring(regionZ) +
+        L".vvr";
 }
 
 std::vector<WorldSave::ChunkEntry> WorldSave::readChunkTable(const std::wstring& path)
@@ -436,57 +439,100 @@ std::uint32_t WorldSave::readU32(const std::vector<std::uint8_t>& bytes, std::si
     return value;
 }
 
-std::vector<std::uint8_t> WorldSave::encodeRle(const std::vector<std::uint16_t>& blockIds)
+std::vector<std::uint8_t> WorldSave::encodeRle(const ChunkVoxelData& voxels)
 {
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(blockIds.size());
+    bytes.reserve(voxels.blockIds.size());
 
-    std::vector<std::pair<std::uint16_t, std::uint32_t>> runs;
-    runs.reserve(1024);
-    for (std::uint16_t blockId : blockIds)
+    struct Run
     {
-        if (!runs.empty() && runs.back().first == blockId)
+        std::uint16_t blockId = kAirBlockId;
+        std::uint8_t fluidId = kNoFluidId;
+        std::uint8_t fluidAmount = 0;
+        std::uint32_t count = 0;
+    };
+
+    std::vector<Run> runs;
+    runs.reserve(1024);
+    for (std::size_t i = 0; i < voxels.blockIds.size(); ++i)
+    {
+        const std::uint16_t blockId = voxels.blockIds[i];
+        std::uint8_t fluidId = voxels.fluidIds[i];
+        std::uint8_t fluidAmount = std::min(voxels.fluidAmounts[i], kMaxFluidAmount);
+        if (fluidId == kNoFluidId || fluidAmount == 0)
         {
-            ++runs.back().second;
+            fluidId = kNoFluidId;
+            fluidAmount = 0;
+        }
+
+        if (!runs.empty() &&
+            runs.back().blockId == blockId &&
+            runs.back().fluidId == fluidId &&
+            runs.back().fluidAmount == fluidAmount)
+        {
+            ++runs.back().count;
         }
         else
         {
-            runs.push_back({blockId, 1});
+            runs.push_back({blockId, fluidId, fluidAmount, 1});
         }
     }
 
     appendU32(bytes, static_cast<std::uint32_t>(runs.size()));
-    for (const auto& [blockId, count] : runs)
+    for (const Run& run : runs)
     {
-        appendU16(bytes, blockId);
-        appendU32(bytes, count);
+        appendU16(bytes, run.blockId);
+        bytes.push_back(run.fluidId);
+        bytes.push_back(run.fluidAmount);
+        appendU32(bytes, run.count);
     }
     return bytes;
 }
 
-std::vector<std::uint16_t> WorldSave::decodeRle(const std::vector<std::uint8_t>& bytes)
+ChunkVoxelData WorldSave::decodeRle(const std::vector<std::uint8_t>& bytes)
 {
     std::size_t offset = 0;
     const std::uint32_t runCount = readU32(bytes, offset);
-    std::vector<std::uint16_t> blockIds;
-    blockIds.reserve(kChunkBlockCount);
+    ChunkVoxelData voxels{};
+    voxels.blockIds.reserve(kChunkBlockCount);
+    voxels.fluidIds.reserve(kChunkBlockCount);
+    voxels.fluidAmounts.reserve(kChunkBlockCount);
 
     for (std::uint32_t i = 0; i < runCount; ++i)
     {
         const std::uint16_t blockId = readU16(bytes, offset);
+        if (offset >= bytes.size())
+        {
+            throw std::runtime_error("RLE stream is truncated.");
+        }
+        std::uint8_t fluidId = bytes[offset++];
+        if (offset >= bytes.size())
+        {
+            throw std::runtime_error("RLE stream is truncated.");
+        }
+        const std::uint8_t fluidAmount = bytes[offset++];
         const std::uint32_t count = readU32(bytes, offset);
-        if (blockIds.size() + count > kChunkBlockCount)
+        if (voxels.blockIds.size() + count > kChunkBlockCount)
         {
             throw std::runtime_error("RLE stream expands past chunk size.");
         }
-        blockIds.insert(blockIds.end(), count, blockId);
+        if (fluidId == kNoFluidId || fluidAmount == 0)
+        {
+            fluidId = kNoFluidId;
+        }
+        voxels.blockIds.insert(voxels.blockIds.end(), count, blockId);
+        voxels.fluidIds.insert(voxels.fluidIds.end(), count, fluidId);
+        voxels.fluidAmounts.insert(
+            voxels.fluidAmounts.end(),
+            count,
+            fluidId == kNoFluidId ? 0 : std::min(fluidAmount, kMaxFluidAmount));
     }
 
-    if (blockIds.size() != kChunkBlockCount)
+    if (!voxels.valid())
     {
         throw std::runtime_error("RLE stream did not fill a chunk.");
     }
-    return blockIds;
+    return voxels;
 }
 
 std::vector<std::uint8_t> WorldSave::compressLz4(const std::vector<std::uint8_t>& bytes)

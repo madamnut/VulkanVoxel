@@ -127,6 +127,7 @@ struct DebugTextOverlay
     std::vector<std::wstring> lines = {
         L"FPS: 0000 [00.000MS]",
         L"POS: X:0000.000 [0000.000] / Y:0000.000 [0000.000] / Z:0000.000 [0000.000]",
+        L"Landform: 0.000 [0.000]",
         L"CAM: YAW +000.000 PIT +00.000",
         L"TIME: 000 DAY 00 H 00 M",
         L"SEED: 0",
@@ -152,17 +153,7 @@ struct DebugTextOverlay
         L"INDICES: 0000000",
         L"TRIS: 0000000",
     };
-    std::vector<std::wstring> bottomLeftLines = {
-        L"CPU FRAME: 00.000MS",
-        L"FENCE WAIT: 00.000MS",
-        L"ACQUIRE: 00.000MS",
-        L"LOAD UPDATE: 00.000MS",
-        L"SUBCHUNK DONE: 00.000MS",
-        L"CHUNK UPLOAD: 00.000MS",
-        L"DEBUG TEXT: 00.000MS",
-        L"RECORD: 00.000MS",
-        L"SUBMIT+PRESENT: 00.000MS",
-    };
+    std::vector<std::wstring> bottomLeftLines;
 };
 
 struct FrameProfiler
@@ -580,6 +571,17 @@ private:
             [this](ChunkCoord coord, std::uint64_t generation)
             {
                 return buildChunkForStreaming(coord, generation);
+            });
+        chunkStreaming_.setBuildErrorCallback(
+            [this](ChunkCoord coord, const std::string& message)
+            {
+                logger_.error(
+                    "Chunk build failed at (" +
+                    std::to_string(coord.x) +
+                    ", " +
+                    std::to_string(coord.z) +
+                    "): " +
+                    message);
             });
         startChunkBuildWorkers();
         createChunkMesh();
@@ -1377,6 +1379,12 @@ private:
             definition.textureLayers[static_cast<std::size_t>(BlockFace::Bottom)] =
                 resolveBlockTextureLayer(definition.name, L"_bottom");
         }
+        const std::wstring waterTexturePath = L"/assets/textures/fluid/water.png";
+        if (!fileExists(sourcePathWide(waterTexturePath)))
+        {
+            throw std::runtime_error("Missing water fluid texture.");
+        }
+        chunkMesher_.setWaterTextureLayer(addBlockTextureLayer(waterTexturePath));
 
         std::vector<std::wstring> texturePaths;
         texturePaths.reserve(blockTextureLayerNames_.size());
@@ -1399,10 +1407,12 @@ private:
         const TerrainDensityConfig minTerrainDensity{
             {0.0f, 0.0f},
             {0, 0, 1.0f, 0.0f, 0.0f, 0.0f},
+            {false, 0},
         };
         const TerrainDensityConfig maxTerrainDensity{
             {1.0f, static_cast<float>(kChunkHeight) * 4.0f},
             {kMaxTerrainDensityOctaves, 1024, 8.0f, 256.0f, 1.0f, 4.0f},
+            {true, 1024},
         };
         const WorldConfig config = loadWorldConfigFile(
             sourcePath("/config/world.json"),
@@ -1414,6 +1424,12 @@ private:
         chunkStreaming_.setLoadRadius(config.chunkLoadRadius);
         chunkStreaming_.setBuildThreadCount(config.chunkBuildThreads);
         worldGenerator_.setTerrainDensityConfig(config.terrainDensity);
+        const std::string landformCurvePath = sourcePath("/assets/worldgen/landform_curve.bin");
+        if (!worldGenerator_.loadLandformCurveFile(landformCurvePath))
+        {
+            logger_.error("Failed to load landform curve binary: " + landformCurvePath);
+            throw std::runtime_error("Failed to load landform curve binary.");
+        }
     }
 
     void createChunkMesh()
@@ -1434,31 +1450,33 @@ private:
 
     ChunkBuildResult buildChunkForStreaming(ChunkCoord coord, std::uint64_t generation)
     {
-        std::vector<std::uint16_t> blockIds;
+        ChunkVoxelData voxels;
         {
             std::lock_guard<std::mutex> lock(loadedChunksMutex_);
             const auto loadedIt = loadedChunks_.find(coord);
             if (loadedIt != loadedChunks_.end())
             {
-                blockIds = loadedIt->second.blockIds;
+                voxels.blockIds = loadedIt->second.blockIds;
+                voxels.fluidIds = loadedIt->second.fluidIds;
+                voxels.fluidAmounts = loadedIt->second.fluidAmounts;
             }
         }
 
-        if (blockIds.empty())
+        if (!voxels.valid())
         {
-            if (std::optional<std::vector<std::uint16_t>> savedBlockIds = loadChunkFromDisk(coord))
+            if (std::optional<ChunkVoxelData> savedVoxels = loadChunkFromDisk(coord))
             {
-                blockIds = std::move(*savedBlockIds);
+                voxels = std::move(*savedVoxels);
             }
 
-            if (blockIds.empty())
+            if (!voxels.valid())
             {
-                blockIds = worldGenerator_.generateChunkBlocks(coord);
-                saveChunkToDisk(coord, blockIds);
+                voxels = worldGenerator_.generateChunkVoxels(coord);
+                saveChunkToDisk(coord, voxels);
             }
         }
 
-        return chunkMesher_.buildChunkMesh(coord, generation, blockIds);
+        return chunkMesher_.buildChunkMesh(coord, generation, voxels.blockIds, voxels.fluidIds, voxels.fluidAmounts);
     }
 
     ChunkLoadUpdateStats updateLoadedChunks()
@@ -1538,7 +1556,11 @@ private:
                 result.vertices,
                 result.indices,
                 result.subchunks);
-            registerLoadedChunkData(result.coord, std::move(result.blockIds));
+            registerLoadedChunkData(
+                result.coord,
+                std::move(result.blockIds),
+                std::move(result.fluidIds),
+                std::move(result.fluidAmounts));
             chunkStreaming_.markChunkLoaded(result.coord);
             ++uploadedCount;
         }
@@ -1551,11 +1573,17 @@ private:
         processCompletedChunkUploads();
     }
 
-    void registerLoadedChunkData(ChunkCoord coord, std::vector<std::uint16_t> blockIds)
+    void registerLoadedChunkData(
+        ChunkCoord coord,
+        std::vector<std::uint16_t> blockIds,
+        std::vector<std::uint8_t> fluidIds,
+        std::vector<std::uint8_t> fluidAmounts)
     {
-        if (blockIds.size() != kChunkBlockCount)
+        if (blockIds.size() != kChunkBlockCount ||
+            fluidIds.size() != kChunkBlockCount ||
+            fluidAmounts.size() != kChunkBlockCount)
         {
-            logger_.warn("Skipping loaded chunk registration with invalid block count");
+            logger_.warn("Skipping loaded chunk registration with invalid voxel data");
             return;
         }
 
@@ -1566,7 +1594,13 @@ private:
         {
             dirty = loadedIt->second.dirty;
         }
-        loadedChunks_[coord] = {coord, std::move(blockIds), dirty};
+        loadedChunks_[coord] = {
+            coord,
+            std::move(blockIds),
+            std::move(fluidIds),
+            std::move(fluidAmounts),
+            dirty,
+        };
     }
 
     void unloadLoadedChunkData(ChunkCoord coord)
@@ -1585,7 +1619,7 @@ private:
 
         if (chunkData->dirty)
         {
-            saveChunkToDisk(coord, chunkData->blockIds);
+            saveChunkToDisk(coord, {chunkData->blockIds, chunkData->fluidIds, chunkData->fluidAmounts});
         }
     }
 
@@ -1606,7 +1640,7 @@ private:
 
         for (const LoadedChunkData& chunkData : chunksToSave)
         {
-            saveChunkToDisk(chunkData.coord, chunkData.blockIds);
+            saveChunkToDisk(chunkData.coord, {chunkData.blockIds, chunkData.fluidIds, chunkData.fluidAmounts});
         }
     }
 
@@ -1632,7 +1666,7 @@ private:
         }
     }
 
-    std::optional<std::vector<std::uint16_t>> loadChunkFromDisk(ChunkCoord coord)
+    std::optional<ChunkVoxelData> loadChunkFromDisk(ChunkCoord coord)
     {
         try
         {
@@ -1646,12 +1680,12 @@ private:
         }
     }
 
-    bool saveChunkToDisk(ChunkCoord coord, const std::vector<std::uint16_t>& blockIds)
+    bool saveChunkToDisk(ChunkCoord coord, const ChunkVoxelData& voxels)
     {
         try
         {
             std::lock_guard<std::mutex> lock(saveMutex_);
-            worldSave_.saveChunk(coord, blockIds);
+            worldSave_.saveChunk(coord, voxels);
             return true;
         }
         catch (const std::exception& exception)
@@ -2247,7 +2281,15 @@ private:
             return false;
         }
 
-        loadedIt->second.blockIds[chunkBlockIndex(localX, y, localZ)] = blockId;
+        const std::size_t voxelIndex = chunkBlockIndex(localX, y, localZ);
+        loadedIt->second.blockIds[voxelIndex] = blockId;
+        if (blockRegistry_.isSolid(blockId) &&
+            loadedIt->second.fluidIds.size() == kChunkBlockCount &&
+            loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+        {
+            loadedIt->second.fluidIds[voxelIndex] = kNoFluidId;
+            loadedIt->second.fluidAmounts[voxelIndex] = 0;
+        }
         loadedIt->second.dirty = true;
         return true;
     }
@@ -2509,6 +2551,13 @@ private:
                      << formatCoordinateValue(camera_.position.z)
                      << L" [" << formatCoordinateValue(wrapWorldPosition(camera_.position.z)) << L"]";
 
+        std::wostringstream landformText;
+        const int playerBlockX = static_cast<int>(std::floor(camera_.position.x));
+        const int playerBlockZ = static_cast<int>(std::floor(camera_.position.z));
+        landformText << std::fixed << std::setprecision(3)
+                     << L"Landform: " << worldGenerator_.landformRawAt(playerBlockX, playerBlockZ)
+                     << L" [" << worldGenerator_.landformCenterOffsetAt(playerBlockX, playerBlockZ) << L"]";
+
         const double yawDegrees = static_cast<double>(camera_.yaw) * 180.0 / static_cast<double>(kPi);
         const double pitchDegrees = static_cast<double>(camera_.pitch) * 180.0 / static_cast<double>(kPi);
         std::wostringstream cameraText;
@@ -2520,40 +2569,10 @@ private:
         debugTextOverlay_.lines = {
             fpsText.str(),
             positionText.str(),
+            landformText.str(),
             cameraText.str(),
             timeText.str(),
             L"SEED: " + std::to_wstring(worldSeed_),
-        };
-
-        auto msLine = [](const wchar_t* label, double value)
-        {
-            std::wostringstream line;
-            line << label << L": " << std::fixed << std::setprecision(3)
-                 << std::setw(7) << std::setfill(L'0') << value << L"MS";
-            return line.str();
-        };
-        auto countLine = [](const wchar_t* label, std::size_t value)
-        {
-            std::wostringstream line;
-            line << label << L": " << value;
-            return line.str();
-        };
-
-        debugTextOverlay_.bottomLeftLines = {
-            msLine(L"CPU FRAME", frameProfiler_.frameCpuMs),
-            msLine(L"FENCE WAIT", frameProfiler_.fenceWaitMs),
-            msLine(L"ACQUIRE", frameProfiler_.acquireMs),
-            msLine(L"LOAD UPDATE", frameProfiler_.loadUpdateMs),
-            countLine(L"LOAD Q/UNLD/UP", frameProfiler_.chunksQueued) +
-                L"/" + std::to_wstring(frameProfiler_.chunksUnloaded) +
-                L"/" + std::to_wstring(frameProfiler_.chunksLoaded),
-            msLine(L"SUBCHUNK DONE", frameProfiler_.subchunkDoneMs),
-            countLine(L"SUBCHUNK COUNT", frameProfiler_.subchunkResultsProcessed),
-            msLine(L"CHUNK UPLOAD", frameProfiler_.chunkUploadMs),
-            msLine(L"UNIFORM", frameProfiler_.uniformMs),
-            msLine(L"DEBUG TEXT", frameProfiler_.debugTextMs),
-            msLine(L"RECORD", frameProfiler_.recordMs),
-            msLine(L"SUBMIT+PRESENT", frameProfiler_.submitPresentMs),
         };
 
         const bool shouldUpdateRightText =

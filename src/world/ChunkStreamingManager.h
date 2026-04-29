@@ -11,6 +11,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +34,7 @@ public:
     void setLoadRadius(int loadRadius);
     void setBuildThreadCount(int buildThreadCount);
     void setChunkBuildCallback(std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> callback);
+    void setBuildErrorCallback(std::function<void(ChunkCoord, const std::string&)> callback);
     int loadRadius() const;
     int buildThreadCount() const;
 
@@ -67,6 +69,7 @@ private:
 
     ChunkMesher& chunkMesher_;
     std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> chunkBuildCallback_;
+    std::function<void(ChunkCoord, const std::string&)> buildErrorCallback_;
     int loadRadius_ = 5;
     int buildThreadCount_ = 4;
 

@@ -47,6 +47,11 @@ ChunkMesher::ChunkMesher(
 {
 }
 
+void ChunkMesher::setWaterTextureLayer(std::uint32_t textureLayer)
+{
+    waterTextureLayer_ = textureLayer;
+}
+
 const BlockDefinition* ChunkMesher::blockDefinitionForId(std::uint16_t blockId) const
 {
     return blockRegistry_.definitionForId(blockId);
@@ -75,17 +80,24 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) co
 
 ChunkBuildResult ChunkMesher::buildChunkMesh(ChunkCoord coord, std::uint64_t generation) const
 {
-    std::vector<std::uint16_t> blockIds = worldGenerator_.generateChunkBlocks(coord);
-    return buildChunkMesh(coord, generation, blockIds);
+    ChunkVoxelData voxels = worldGenerator_.generateChunkVoxels(coord);
+    return buildChunkMesh(coord, generation, voxels.blockIds, voxels.fluidIds, voxels.fluidAmounts);
 }
 
 ChunkBuildResult ChunkMesher::buildChunkMesh(
     ChunkCoord coord,
     std::uint64_t generation,
-    const std::vector<std::uint16_t>& blockIds) const
+    const std::vector<std::uint16_t>& blockIds,
+    const std::vector<std::uint8_t>& fluidIds,
+    const std::vector<std::uint8_t>& fluidAmounts) const
 {
-    ChunkBuildResult result = buildChunkMesh(coord, generation, worldGenerator_.generateChunkColumn(coord, blockIds));
+    ChunkBuildResult result = buildChunkMesh(
+        coord,
+        generation,
+        worldGenerator_.generateChunkColumn(coord, blockIds, fluidIds, fluidAmounts));
     result.blockIds = blockIds;
+    result.fluidIds = fluidIds;
+    result.fluidAmounts = fluidAmounts;
     return result;
 }
 
@@ -157,7 +169,9 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 for (int localY = 0; localY < kSubchunkSize; ++localY)
                 {
                     const int y = subchunkMinY + localY;
-                    if (column.blockAt(localPaddedX, y, localPaddedZ) != kAirBlockId)
+                    if (column.blockAt(localPaddedX, y, localPaddedZ) != kAirBlockId ||
+                        (column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId &&
+                            column.fluidAt(localPaddedX, y, localPaddedZ) > 0))
                     {
                         ++nonAirBlockCount;
                     }
@@ -188,6 +202,20 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             const int localPaddedX = x - chunkBaseX + 1;
             const int localPaddedZ = z - chunkBaseZ + 1;
             return column.blockAt(localPaddedX, y, localPaddedZ);
+        };
+
+        auto fluidAmountAt = [&](int x, int y, int z) -> std::uint8_t
+        {
+            const int localPaddedX = x - chunkBaseX + 1;
+            const int localPaddedZ = z - chunkBaseZ + 1;
+            return column.fluidAt(localPaddedX, y, localPaddedZ);
+        };
+
+        auto fluidIdAt = [&](int x, int y, int z) -> std::uint8_t
+        {
+            const int localPaddedX = x - chunkBaseX + 1;
+            const int localPaddedZ = z - chunkBaseZ + 1;
+            return column.fluidIdAt(localPaddedX, y, localPaddedZ);
         };
 
         auto emitGreedyRectangles = [](
@@ -275,6 +303,25 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             indices.push_back(baseIndex + 0);
             indices.push_back(baseIndex + 2);
             indices.push_back(baseIndex + 3);
+        };
+
+        auto addFluidFace = [&](
+            int subchunkLocalY,
+            std::array<Vec3, 4> corners,
+            float width,
+            float height)
+        {
+            addFace(
+                subchunkLocalY,
+                corners,
+                {{
+                    {{width, height}},
+                    {{width, 0.0f}},
+                    {{0.0f, 0.0f}},
+                    {{0.0f, height}},
+                }},
+                waterTextureLayer_,
+                {{3, 3, 3, 3}});
         };
 
         auto computeAo = [&](
@@ -672,6 +719,140 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                         cell.textureLayer,
                         cell.ao);
                     });
+            }
+
+            auto fluidTop = [&](int x, int y, int z, std::uint8_t fluidId, std::uint8_t amount) -> float
+            {
+                if (amount == kMaxFluidAmount &&
+                    fluidIdAt(x, y + 1, z) == fluidId &&
+                    fluidAmountAt(x, y + 1, z) == kMaxFluidAmount)
+                {
+                    return static_cast<float>(y + 1);
+                }
+                return static_cast<float>(y) + 0.9f *
+                    (static_cast<float>(amount) / static_cast<float>(kMaxFluidAmount));
+            };
+
+            for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
+            {
+                const int z = chunkBaseZ + localZ;
+                for (int localX = 0; localX < kChunkSizeX; ++localX)
+                {
+                    const int x = chunkBaseX + localX;
+                    for (int localY = 0; localY < kSubchunkSize; ++localY)
+                    {
+                        const int y = subchunkMinY + localY;
+                        const std::uint8_t fluidId = fluidIdAt(x, y, z);
+                        const std::uint8_t amount = fluidAmountAt(x, y, z);
+                        if (fluidId != kWaterFluidId || amount == 0 || isSolid(x, y, z))
+                        {
+                            continue;
+                        }
+
+                        const float bottom = static_cast<float>(y);
+                        const float top = fluidTop(x, y, z, fluidId, amount);
+                        const float fx = static_cast<float>(x);
+                        const float fz = static_cast<float>(z);
+                        const float xEnd = static_cast<float>(x + 1);
+                        const float zEnd = static_cast<float>(z + 1);
+
+                        if ((fluidIdAt(x, y + 1, z) != fluidId || fluidAmountAt(x, y + 1, z) == 0) &&
+                            !isSolid(x, y + 1, z))
+                        {
+                            addFluidFace(
+                                localY,
+                                {{
+                                    {fx, top, fz},
+                                    {fx, top, zEnd},
+                                    {xEnd, top, zEnd},
+                                    {xEnd, top, fz},
+                                }},
+                                1.0f,
+                                1.0f);
+                        }
+
+                        if ((fluidIdAt(x, y - 1, z) != fluidId || fluidAmountAt(x, y - 1, z) == 0) &&
+                            !isSolid(x, y - 1, z))
+                        {
+                            addFluidFace(
+                                localY,
+                                {{
+                                    {fx, bottom, zEnd},
+                                    {fx, bottom, fz},
+                                    {xEnd, bottom, fz},
+                                    {xEnd, bottom, zEnd},
+                                }},
+                                1.0f,
+                                1.0f);
+                        }
+
+                        auto addFluidSideIfVisible = [&](
+                            int neighborX,
+                            int neighborZ,
+                            std::array<Vec3, 4> fullCorners)
+                        {
+                            if (isSolid(neighborX, y, neighborZ))
+                            {
+                                return;
+                            }
+
+                            float sideBottom = bottom;
+                            const std::uint8_t neighborFluidId = fluidIdAt(neighborX, y, neighborZ);
+                            const std::uint8_t neighborAmount = fluidAmountAt(neighborX, y, neighborZ);
+                            if (neighborFluidId == fluidId && neighborAmount > 0)
+                            {
+                                sideBottom = fluidTop(neighborX, y, neighborZ, neighborFluidId, neighborAmount);
+                                if (sideBottom >= top)
+                                {
+                                    return;
+                                }
+                            }
+
+                            fullCorners[0].y = sideBottom;
+                            fullCorners[1].y = top;
+                            fullCorners[2].y = top;
+                            fullCorners[3].y = sideBottom;
+                            addFluidFace(localY, fullCorners, 1.0f, top - sideBottom);
+                        };
+
+                        addFluidSideIfVisible(
+                            x + 1,
+                            z,
+                            {{
+                                {xEnd, bottom, fz},
+                                {xEnd, top, fz},
+                                {xEnd, top, zEnd},
+                                {xEnd, bottom, zEnd},
+                            }});
+                        addFluidSideIfVisible(
+                            x - 1,
+                            z,
+                            {{
+                                {fx, bottom, zEnd},
+                                {fx, top, zEnd},
+                                {fx, top, fz},
+                                {fx, bottom, fz},
+                            }});
+                        addFluidSideIfVisible(
+                            x,
+                            z + 1,
+                            {{
+                                {xEnd, bottom, zEnd},
+                                {xEnd, top, zEnd},
+                                {fx, top, zEnd},
+                                {fx, bottom, zEnd},
+                            }});
+                        addFluidSideIfVisible(
+                            x,
+                            z - 1,
+                            {{
+                                {fx, bottom, fz},
+                                {fx, top, fz},
+                                {xEnd, top, fz},
+                                {xEnd, bottom, fz},
+                            }});
+                    }
+                }
             }
 
         appendSubchunkMesh(

@@ -16,6 +16,10 @@ constexpr int kDensityCellSize = 4;
 constexpr int kWorldDensityCellsXZ = kWorldSizeXZ / kDensityCellSize;
 constexpr int kWorldDensityCellsY = kChunkHeight / kDensityCellSize;
 constexpr int kWorldDensityVerticesY = kWorldDensityCellsY + 1;
+constexpr std::uint8_t kMaxFluidAmount = 100;
+constexpr std::uint8_t kNoFluidId = 0;
+constexpr std::uint8_t kWaterFluidId = 1;
+constexpr int kInitialWaterLevel = 205;
 constexpr std::size_t kChunkBlockCount =
     static_cast<std::size_t>(kChunkSizeX) * kChunkHeight * kChunkSizeZ;
 
@@ -93,11 +97,29 @@ struct ChunkBuildResult
     std::vector<std::uint32_t> indices;
     std::vector<SubchunkDraw> subchunks;
     std::vector<std::uint16_t> blockIds;
+    std::vector<std::uint8_t> fluidIds;
+    std::vector<std::uint8_t> fluidAmounts;
 };
 
 struct LoadedChunkData
 {
     ChunkCoord coord{};
     std::vector<std::uint16_t> blockIds;
+    std::vector<std::uint8_t> fluidIds;
+    std::vector<std::uint8_t> fluidAmounts;
     bool dirty = false;
+};
+
+struct ChunkVoxelData
+{
+    std::vector<std::uint16_t> blockIds;
+    std::vector<std::uint8_t> fluidIds;
+    std::vector<std::uint8_t> fluidAmounts;
+
+    bool valid() const
+    {
+        return blockIds.size() == kChunkBlockCount &&
+            fluidIds.size() == kChunkBlockCount &&
+            fluidAmounts.size() == kChunkBlockCount;
+    }
 };

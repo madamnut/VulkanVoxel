@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -30,10 +31,17 @@ struct DensityNoiseConfig
     float verticalFrequencyScale = 1.0f;
 };
 
+struct DensityLandformConfig
+{
+    bool enabled = true;
+    int frequency = 8;
+};
+
 struct TerrainDensityConfig
 {
     DensityGradientConfig gradient{};
     DensityNoiseConfig noise{};
+    DensityLandformConfig landform{};
 };
 
 struct GeneratedChunkColumn
@@ -42,12 +50,21 @@ struct GeneratedChunkColumn
     static constexpr int kWidth = kChunkSizeX + kPadding * 2;
     static constexpr int kDepth = kChunkSizeZ + kPadding * 2;
     static constexpr int kHeight = kChunkHeight;
+    static constexpr std::size_t kCellCount =
+        static_cast<std::size_t>(kWidth) * kHeight * kDepth;
 
-    std::array<std::uint16_t, kWidth * kHeight * kDepth> blockIds{};
+    std::vector<std::uint16_t> blockIds;
+    std::vector<std::uint8_t> fluidIds;
+    std::vector<std::uint8_t> fluidAmounts;
 
+    GeneratedChunkColumn();
     static std::size_t index(int localPaddedX, int y, int localPaddedZ);
     std::uint16_t blockAt(int localPaddedX, int y, int localPaddedZ) const;
     std::uint16_t& blockAt(int localPaddedX, int y, int localPaddedZ);
+    std::uint8_t fluidIdAt(int localPaddedX, int y, int localPaddedZ) const;
+    std::uint8_t& fluidIdAt(int localPaddedX, int y, int localPaddedZ);
+    std::uint8_t fluidAt(int localPaddedX, int y, int localPaddedZ) const;
+    std::uint8_t& fluidAt(int localPaddedX, int y, int localPaddedZ);
 };
 
 class WorldGenerator
@@ -58,6 +75,7 @@ public:
     void setSeed(std::uint64_t seed);
     std::uint64_t seed() const;
     void setTerrainDensityConfig(const TerrainDensityConfig& config);
+    bool loadLandformCurveFile(const std::string& path);
 
     int terrainHeightAt(int x, int z) const;
     int highestSolidYAt(int x, int z) const;
@@ -65,9 +83,17 @@ public:
     std::uint16_t applyTerrainPostProcess(std::uint16_t blockId, int y, int highestSolidY) const;
     std::uint16_t blockIdFromColumn(int y, int highestSolidY) const;
     std::uint16_t blockIdAt(int x, int y, int z) const;
+    float landformRawAt(int x, int z) const;
+    float landformCenterOffsetAt(int x, int z) const;
     GeneratedChunkColumn generateChunkColumn(ChunkCoord coord) const;
-    GeneratedChunkColumn generateChunkColumn(ChunkCoord coord, const std::vector<std::uint16_t>& blockIds) const;
+    GeneratedChunkColumn generateChunkColumn(
+        ChunkCoord coord,
+        const std::vector<std::uint16_t>& blockIds,
+        const std::vector<std::uint8_t>& fluidIds,
+        const std::vector<std::uint8_t>& fluidAmounts) const;
     std::vector<std::uint16_t> generateChunkBlocks(ChunkCoord coord) const;
+    std::vector<std::uint8_t> generateChunkFluids(ChunkCoord coord) const;
+    ChunkVoxelData generateChunkVoxels(ChunkCoord coord) const;
     void setBlockIdAt(int x, int y, int z, std::uint16_t blockId);
 
 private:
@@ -94,6 +120,18 @@ private:
         float valueAt(int localCellX, int cellY, int localCellZ) const;
     };
 
+    struct LandformLookup
+    {
+        bool enabled = true;
+        int frequency = 1;
+        std::vector<float> rawSamples;
+        std::vector<float> centerOffsetSamples;
+        std::vector<float> cosX;
+        std::vector<float> sinX;
+        std::vector<float> cosZ;
+        std::vector<float> sinZ;
+    };
+
     struct BlockOverride
     {
         int x = 0;
@@ -107,6 +145,8 @@ private:
     static int floorMod(int value, int divisor);
     static float lerp(float a, float b, float t);
     void rebuildNoiseLookups();
+    float sampleLandformRaw(int cellX, int cellZ) const;
+    float sampleLandformCenterOffset(int cellX, int cellZ) const;
     float sampleDensityLattice(int cellX, int cellY, int cellZ) const;
     DensityGrid buildDensityGrid(int minBlockX, int maxBlockX, int minBlockZ, int maxBlockZ) const;
     float interpolatedDensityAt(const DensityGrid& densityGrid, int x, int y, int z) const;
@@ -116,8 +156,11 @@ private:
 
     std::uint64_t seed_ = 0;
     SimplexNoise5D noise_{};
+    SimplexNoise4D landformNoise_{};
     TerrainDensityConfig terrainDensityConfig_{};
     std::vector<DensityOctave> densityOctaves_;
+    LandformLookup landformLookup_{};
+    mutable std::shared_mutex generatorMutex_;
     mutable std::shared_mutex overrideMutex_;
     std::unordered_map<std::int64_t, BlockOverride> blockOverrides_;
 };

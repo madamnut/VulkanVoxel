@@ -4,8 +4,12 @@
   "chunkBuildThreads": 4,
   "terrainDensity": {
     "gradient": {
-      "center": 0.3,
-      "strength": 256.0
+      "center": 0.4, //0.4 기본 높이 205
+      "strength": 512.0
+    },
+    "landform": {
+      "enabled": true,
+      "frequency": 8
     },
     "noise": {
       "octaves": 3,

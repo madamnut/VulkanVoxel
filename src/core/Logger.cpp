@@ -97,6 +97,7 @@ const std::wstring& Logger::logPath() const
 
 void Logger::write(std::string_view level, std::string_view message)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!stream_)
     {
         return;

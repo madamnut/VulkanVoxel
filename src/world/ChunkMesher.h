@@ -16,11 +16,14 @@ public:
         const WorldGenerator& worldGenerator,
         const BlockRegistry& blockRegistry);
 
+    void setWaterTextureLayer(std::uint32_t textureLayer);
     ChunkBuildResult buildChunkMesh(ChunkCoord coord, std::uint64_t generation) const;
     ChunkBuildResult buildChunkMesh(
         ChunkCoord coord,
         std::uint64_t generation,
-        const std::vector<std::uint16_t>& blockIds) const;
+        const std::vector<std::uint16_t>& blockIds,
+        const std::vector<std::uint8_t>& fluidIds,
+        const std::vector<std::uint8_t>& fluidAmounts) const;
     SubchunkBuildResult buildSubchunkMesh(ChunkBuildRequest request) const;
 
 private:
@@ -47,4 +50,5 @@ private:
 
     const WorldGenerator& worldGenerator_;
     const BlockRegistry& blockRegistry_;
+    std::uint32_t waterTextureLayer_ = 0;
 };
