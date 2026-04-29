@@ -121,7 +121,12 @@ CameraViewMode PlayerController::cameraViewMode() const
 
 Vec3 PlayerController::playerFeetPosition(const CameraState& camera) const
 {
-    return {camera.position.x, camera.position.y - kPlayerEyeHeight, camera.position.z};
+    return camera.position;
+}
+
+Vec3 PlayerController::playerEyePosition(const CameraState& camera) const
+{
+    return {camera.position.x, camera.position.y + kPlayerEyeHeight, camera.position.z};
 }
 
 bool PlayerController::isThirdPersonView() const
@@ -138,15 +143,16 @@ Vec3 PlayerController::renderCameraForward(const CameraState& camera) const
 Vec3 PlayerController::renderCameraPosition(const CameraState& camera) const
 {
     const Vec3 forward = cameraForward(camera.yaw, camera.pitch);
+    const Vec3 eyePosition = playerEyePosition(camera);
     if (cameraViewMode_ == CameraViewMode::ThirdPersonRear)
     {
-        return camera.position - forward * kThirdPersonDistance;
+        return eyePosition - forward * kThirdPersonDistance;
     }
     if (cameraViewMode_ == CameraViewMode::ThirdPersonFront)
     {
-        return camera.position + forward * kThirdPersonDistance;
+        return eyePosition + forward * kThirdPersonDistance;
     }
-    return camera.position;
+    return eyePosition;
 }
 
 void PlayerController::stepGroundPhysics(
@@ -257,14 +263,14 @@ Vec3 PlayerController::movePlayerAxis(
     return position;
 }
 
-bool PlayerController::isPlayerCollidingAt(Vec3 eyePosition, const SolidBlockQuery& isSolidBlock) const
+bool PlayerController::isPlayerCollidingAt(Vec3 feetPosition, const SolidBlockQuery& isSolidBlock) const
 {
-    const float minX = eyePosition.x - kPlayerHalfWidth;
-    const float maxX = eyePosition.x + kPlayerHalfWidth;
-    const float minY = eyePosition.y - kPlayerEyeHeight;
+    const float minX = feetPosition.x - kPlayerHalfWidth;
+    const float maxX = feetPosition.x + kPlayerHalfWidth;
+    const float minY = feetPosition.y;
     const float maxY = minY + kPlayerHeight;
-    const float minZ = eyePosition.z - kPlayerHalfWidth;
-    const float maxZ = eyePosition.z + kPlayerHalfWidth;
+    const float minZ = feetPosition.z - kPlayerHalfWidth;
+    const float maxZ = feetPosition.z + kPlayerHalfWidth;
 
     const int blockMinX = static_cast<int>(std::floor(minX));
     const int blockMaxX = static_cast<int>(std::floor(maxX - 0.0001f));

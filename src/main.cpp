@@ -2265,6 +2265,11 @@ private:
         return playerController_.playerFeetPosition(camera_);
     }
 
+    Vec3 playerEyePosition() const
+    {
+        return playerController_.playerEyePosition(camera_);
+    }
+
     bool isThirdPersonView() const
     {
         return playerController_.isThirdPersonView();
@@ -2290,7 +2295,7 @@ private:
         lastInteractionRaycastTime_ = now;
 
         selectedBlock_ = raycastBlocks(
-            camera_.position,
+            playerEyePosition(),
             cameraForward(camera_.yaw, camera_.pitch),
             interactionDistance_,
             [this](int x, int y, int z)

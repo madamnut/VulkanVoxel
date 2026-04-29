@@ -2,6 +2,7 @@
 
 ## 2026-04-29
 
+- 플레이어 위치 기준을 눈 위치에서 발밑 중앙으로 변경했다. 저장 좌표, 디버그 POS, 청크 로딩 중심은 발밑 중앙을 사용하고, 렌더 카메라와 블록 레이캐스트는 발밑 중앙에 eye height를 더한 눈 위치에서 처리한다.
 - density octave 설정을 개별 octave 배열에서 `noise.octaves`, `baseFrequency`, `frequencyMultiplier`, `baseAmplitude`, `amplitudeMultiplier`, `verticalFrequencyScale` 방식으로 변경했다. 각 octave의 X/Z 주파수는 기본 주파수에서 배율로 내부 생성하고, Y 주파수는 X/Z 주파수에 vertical scale과 기존 128배 높이 보정을 적용한다.
 - 청크 저장 block id 배열 순서를 컬럼 단위 `localZ -> localX -> y`로 조정했다. y가 가장 빠르게 변하므로 같은 X/Z 컬럼 안에서는 다음 원소가 바로 위 블록이며, RLE가 수직 지형 구간을 더 잘 압축한다.
 - 월드 시간을 tick 기반으로 추가했다. 1분은 20틱, 하루는 28800틱이며 새 월드는 `0 DAY 06 H 00 M`인 7200틱에서 시작한다. `world.bin`에 현재 월드 tick을 저장하고, 시간에 따라 태양/달 방향과 하늘 clear color가 변한다.

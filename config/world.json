@@ -4,8 +4,8 @@
   "chunkBuildThreads": 4,
   "terrainDensity": {
     "gradient": {
-      "center": 0.4,
-      "strength": 512.0
+      "center": 0.3,
+      "strength": 256.0
     },
     "noise": {
       "octaves": 3,

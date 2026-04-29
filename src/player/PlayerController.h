@@ -28,6 +28,7 @@ public:
     CameraViewMode cameraViewMode() const;
 
     Vec3 playerFeetPosition(const CameraState& camera) const;
+    Vec3 playerEyePosition(const CameraState& camera) const;
     bool isThirdPersonView() const;
     Vec3 renderCameraForward(const CameraState& camera) const;
     Vec3 renderCameraPosition(const CameraState& camera) const;
@@ -43,7 +44,7 @@ private:
         Vec3 axisDelta,
         bool& hitGround,
         const SolidBlockQuery& isSolidBlock) const;
-    bool isPlayerCollidingAt(Vec3 eyePosition, const SolidBlockQuery& isSolidBlock) const;
+    bool isPlayerCollidingAt(Vec3 feetPosition, const SolidBlockQuery& isSolidBlock) const;
 
     MovementMode movementMode_ = MovementMode::Fly;
     CameraViewMode cameraViewMode_ = CameraViewMode::FirstPerson;
