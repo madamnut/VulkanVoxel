@@ -10,6 +10,13 @@ constexpr int kChunkSizeZ = 16;
 constexpr int kSubchunkSize = 16;
 constexpr int kChunkHeight = 512;
 constexpr int kSubchunksPerChunk = kChunkHeight / kSubchunkSize;
+constexpr std::size_t kChunkBlockCount =
+    static_cast<std::size_t>(kChunkSizeX) * kChunkHeight * kChunkSizeZ;
+
+inline std::size_t chunkBlockIndex(int localX, int y, int localZ)
+{
+    return static_cast<std::size_t>((localZ * kChunkSizeX + localX) * kChunkHeight + y);
+}
 
 struct BlockVertex
 {
@@ -71,4 +78,20 @@ struct SubchunkBuildResult
     std::uint64_t generation = 0;
     std::vector<BlockVertex> vertices;
     std::vector<std::uint32_t> indices;
+};
+
+struct ChunkBuildResult
+{
+    ChunkCoord coord{};
+    std::vector<BlockVertex> vertices;
+    std::vector<std::uint32_t> indices;
+    std::vector<SubchunkDraw> subchunks;
+    std::vector<std::uint16_t> blockIds;
+};
+
+struct LoadedChunkData
+{
+    ChunkCoord coord{};
+    std::vector<std::uint16_t> blockIds;
+    bool dirty = false;
 };

@@ -1,5 +1,12 @@
 # Version 0.0.0.0 Development Log
 
+## 2026-04-29
+
+- 청크 저장 block id 배열 순서를 컬럼 단위 `localZ -> localX -> y`로 조정했다. y가 가장 빠르게 변하므로 같은 X/Z 컬럼 안에서는 다음 원소가 바로 위 블록이며, RLE가 수직 지형 구간을 더 잘 압축한다.
+- 월드 시간을 tick 기반으로 추가했다. 1분은 20틱, 하루는 28800틱이며 새 월드는 `0 DAY 06 H 00 M`인 7200틱에서 시작한다. `world.bin`에 현재 월드 tick을 저장하고, 시간에 따라 태양/달 방향과 하늘 clear color가 변한다.
+- 좌상단 debug text의 월드 시간 표시를 FPS/POS/CAM 아래쪽 맨 하단 라인으로 옮겼다.
+- sky sprite 크기를 태양과 달 모두 `0.10`으로 통일했다.
+
 ## 2026-04-24
 
 - 프로젝트 시작 버전을 `0.0.0.0`으로 정했다.
@@ -91,3 +98,9 @@
 - raycast 대상과 지상 충돌 판정은 로딩 완료된 청크에만 적용되도록 했다. 로딩되지 않은 청크는 raycast hit 대상에서 제외되고, ground collision에서는 solid로 취급해 접근을 막는다.
 - 선택된 블럭을 검정색 line-list outline으로 표시하는 `selection.vert/frag` shader와 selection pipeline/vertex buffer를 추가했다.
 - `WorldGenerator`에 block override map을 추가해 좌클릭은 선택 블럭을 air로 파괴하고, 우클릭은 선택 면의 바깥 칸에 rock을 설치하도록 했다. 편집된 블럭의 청크와 경계 인접 청크는 기존 mesh를 제거하고 worker queue에 재메싱 요청한다.
+- 청크 로딩 속도 저하를 줄이기 위해 월드 생성 입력을 `GeneratedChunkColumn` 단위로 분리했다. 청크 X/Z 한 칸 패딩과 전체 Y 높이 512의 block id 배열을 한 번 생성하고, 32개 서브청크 메싱은 이 배열을 공유한다.
+- 월드 생성 단계를 base terrain 생성, surface material 후처리, block override overlay로 분리했다. base terrain은 air/rock만 만들고, 후처리에서 최상단 solid를 grass, 그 아래 solid 4개를 air를 건너뛰며 dirt, y=0 solid를 bedrock으로 치환한다.
+- 청크 build queue의 작업 단위를 다시 청크 단위로 바꿔 worker가 청크 컬럼을 한 번 생성한 뒤 내부 32개 서브청크 메쉬를 조립하도록 했다. 플레이어 편집 리메시는 단기적으로 기존 청크 단위 재메싱을 유지한다.
+- 세이브 파일 구조를 추가했다. `saves/world/world.bin`에는 플레이어 위치/시선/이동 모드/카메라 모드만 저장하고, `saves/world/regions/r.<x>.<z>.vvr` region 파일은 16x16 청크 table과 4KB sector-aligned payload 영역으로 구성한다.
+- 청크 payload는 전체 16x512x16 block id 배열을 컬럼 단위 `localZ -> localX -> y` 순서로 만들고 RLE 인코딩 후 LZ4로 압축해 저장한다. 새로 생성된 청크는 생성 직후 저장하고, 이후 편집된 dirty 청크만 언로드/종료 시 다시 저장한다.
+- 실행마다 `logs/YYYYMMDD-HHMMSS.log` 파일을 생성해 세이브/로드 경로와 오류를 기록하도록 했다. LZ4는 `third_party/lz4`에 소스를 포함해 빌드 환경 차이를 줄인다.

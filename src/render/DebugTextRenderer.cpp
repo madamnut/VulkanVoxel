@@ -42,7 +42,7 @@ std::vector<std::uint8_t> DebugTextRenderer::renderGlyphAtlas()
     std::memset(bitmapBits, 0, static_cast<std::size_t>(textureWidth * textureHeight * 4));
     HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
     HFONT font = CreateFontW(
-        -42,
+        -kDebugFontPixelHeight,
         0,
         0,
         0,
@@ -142,7 +142,7 @@ std::vector<DebugTextVertex> DebugTextRenderer::buildVertices(
         10.0f,
         static_cast<float>(viewportHeight) -
             10.0f -
-            57.0f * static_cast<float>(bottomLeftLines.size()));
+            kDebugTextLineHeight * static_cast<float>(bottomLeftLines.size()));
     appendTextBlock(vertices, bottomLeftLines, 12.0f, bottomLeftY, false, viewportWidth, viewportHeight);
 
     if (vertices.size() > kMaxDebugTextVertices)
@@ -172,7 +172,7 @@ void DebugTextRenderer::appendTextBlock(
         appendTextLine(vertices, line, lineX, y + 1.0f, {0.0f, 0.0f, 0.0f, 1.0f}, viewportWidth, viewportHeight);
         appendTextLine(vertices, line, lineX, y, {1.0f, 1.0f, 1.0f, 1.0f}, viewportWidth, viewportHeight);
 
-        y += 57.0f;
+        y += kDebugTextLineHeight;
     }
 }
 

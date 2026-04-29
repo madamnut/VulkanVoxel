@@ -16,12 +16,24 @@ public:
         const WorldGenerator& worldGenerator,
         const BlockRegistry& blockRegistry);
 
+    ChunkBuildResult buildChunkMesh(ChunkCoord coord, std::uint64_t generation) const;
+    ChunkBuildResult buildChunkMesh(
+        ChunkCoord coord,
+        std::uint64_t generation,
+        const std::vector<std::uint16_t>& blockIds) const;
     SubchunkBuildResult buildSubchunkMesh(ChunkBuildRequest request) const;
 
 private:
     const BlockDefinition* blockDefinitionForId(std::uint16_t blockId) const;
     bool isSolidBlock(std::uint16_t blockId) const;
     std::uint32_t textureLayerForBlockFace(std::uint16_t blockId, BlockFace face) const;
+    ChunkBuildResult buildChunkMesh(
+        ChunkCoord coord,
+        std::uint64_t generation,
+        const GeneratedChunkColumn& column) const;
+    SubchunkBuildResult buildSubchunkMesh(
+        ChunkBuildRequest request,
+        const GeneratedChunkColumn& column) const;
 
     void appendSubchunkMesh(
         int chunkX,

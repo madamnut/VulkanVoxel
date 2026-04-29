@@ -3,6 +3,28 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <stdexcept>
+
+std::size_t GeneratedChunkColumn::index(int localPaddedX, int y, int localPaddedZ)
+{
+    return static_cast<std::size_t>((y * kDepth + localPaddedZ) * kWidth + localPaddedX);
+}
+
+std::uint16_t GeneratedChunkColumn::blockAt(int localPaddedX, int y, int localPaddedZ) const
+{
+    if (localPaddedX < 0 || localPaddedX >= kWidth ||
+        y < 0 || y >= kHeight ||
+        localPaddedZ < 0 || localPaddedZ >= kDepth)
+    {
+        return kAirBlockId;
+    }
+    return blockIds[index(localPaddedX, y, localPaddedZ)];
+}
+
+std::uint16_t& GeneratedChunkColumn::blockAt(int localPaddedX, int y, int localPaddedZ)
+{
+    return blockIds[index(localPaddedX, y, localPaddedZ)];
+}
 
 std::int64_t WorldGenerator::blockKey(int x, int y, int z)
 {
@@ -70,11 +92,146 @@ std::uint16_t WorldGenerator::blockIdAt(int x, int y, int z) const
         const auto overrideIt = blockOverrides_.find(blockKey(x, y, z));
         if (overrideIt != blockOverrides_.end())
         {
-            return overrideIt->second;
+            return overrideIt->second.blockId;
         }
     }
 
     return blockIdFromColumn(y, highestSolidYAt(x, z));
+}
+
+GeneratedChunkColumn WorldGenerator::generateChunkColumn(ChunkCoord coord) const
+{
+    GeneratedChunkColumn column{};
+    generateBaseTerrain(coord, column);
+    applySurfaceMaterials(column);
+    applyBlockOverrides(coord, column);
+    return column;
+}
+
+GeneratedChunkColumn WorldGenerator::generateChunkColumn(
+    ChunkCoord coord,
+    const std::vector<std::uint16_t>& blockIds) const
+{
+    if (blockIds.size() != kChunkBlockCount)
+    {
+        throw std::runtime_error("Cannot build chunk column from an invalid block count.");
+    }
+
+    GeneratedChunkColumn column = generateChunkColumn(coord);
+    for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
+    {
+        for (int localX = 0; localX < kChunkSizeX; ++localX)
+        {
+            for (int y = 0; y < kChunkHeight; ++y)
+            {
+                column.blockAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding) =
+                    blockIds[chunkBlockIndex(localX, y, localZ)];
+            }
+        }
+    }
+    return column;
+}
+
+std::vector<std::uint16_t> WorldGenerator::generateChunkBlocks(ChunkCoord coord) const
+{
+    const GeneratedChunkColumn column = generateChunkColumn(coord);
+    std::vector<std::uint16_t> blockIds(kChunkBlockCount);
+    for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
+    {
+        for (int localX = 0; localX < kChunkSizeX; ++localX)
+        {
+            for (int y = 0; y < kChunkHeight; ++y)
+            {
+                blockIds[chunkBlockIndex(localX, y, localZ)] =
+                    column.blockAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding);
+            }
+        }
+    }
+    return blockIds;
+}
+
+void WorldGenerator::generateBaseTerrain(ChunkCoord coord, GeneratedChunkColumn& column) const
+{
+    const int chunkBaseX = coord.x * kChunkSizeX;
+    const int chunkBaseZ = coord.z * kChunkSizeZ;
+
+    for (int localPaddedZ = 0; localPaddedZ < GeneratedChunkColumn::kDepth; ++localPaddedZ)
+    {
+        const int z = chunkBaseZ + localPaddedZ - GeneratedChunkColumn::kPadding;
+        for (int localPaddedX = 0; localPaddedX < GeneratedChunkColumn::kWidth; ++localPaddedX)
+        {
+            const int x = chunkBaseX + localPaddedX - GeneratedChunkColumn::kPadding;
+            const int highestSolidY = highestSolidYAt(x, z);
+            const int clampedHighestSolidY = std::clamp(highestSolidY, -1, kChunkHeight - 1);
+            for (int y = 0; y <= clampedHighestSolidY; ++y)
+            {
+                column.blockAt(localPaddedX, y, localPaddedZ) = kRockBlockId;
+            }
+        }
+    }
+}
+
+void WorldGenerator::applySurfaceMaterials(GeneratedChunkColumn& column) const
+{
+    for (int localPaddedZ = 0; localPaddedZ < GeneratedChunkColumn::kDepth; ++localPaddedZ)
+    {
+        for (int localPaddedX = 0; localPaddedX < GeneratedChunkColumn::kWidth; ++localPaddedX)
+        {
+            bool foundHighestSolid = false;
+            int dirtRemaining = kTerrainDirtDepth;
+            for (int y = kChunkHeight - 1; y >= 0; --y)
+            {
+                std::uint16_t& blockId = column.blockAt(localPaddedX, y, localPaddedZ);
+                if (blockId == kAirBlockId)
+                {
+                    continue;
+                }
+
+                if (!foundHighestSolid)
+                {
+                    blockId = kGrassBlockId;
+                    foundHighestSolid = true;
+                    continue;
+                }
+
+                if (dirtRemaining > 0)
+                {
+                    blockId = kDirtBlockId;
+                    --dirtRemaining;
+                }
+            }
+
+            std::uint16_t& bottomBlockId = column.blockAt(localPaddedX, 0, localPaddedZ);
+            if (bottomBlockId != kAirBlockId)
+            {
+                bottomBlockId = kBedrockBlockId;
+            }
+        }
+    }
+}
+
+void WorldGenerator::applyBlockOverrides(ChunkCoord coord, GeneratedChunkColumn& column) const
+{
+    const int minX = coord.x * kChunkSizeX - GeneratedChunkColumn::kPadding;
+    const int maxX = coord.x * kChunkSizeX + kChunkSizeX - 1 + GeneratedChunkColumn::kPadding;
+    const int minZ = coord.z * kChunkSizeZ - GeneratedChunkColumn::kPadding;
+    const int maxZ = coord.z * kChunkSizeZ + kChunkSizeZ - 1 + GeneratedChunkColumn::kPadding;
+
+    std::shared_lock lock(overrideMutex_);
+    for (const auto& entry : blockOverrides_)
+    {
+        const BlockOverride& blockOverride = entry.second;
+        if (blockOverride.x < minX || blockOverride.x > maxX ||
+            blockOverride.y < 0 || blockOverride.y >= kChunkHeight ||
+            blockOverride.z < minZ || blockOverride.z > maxZ)
+        {
+            continue;
+        }
+
+        const int localPaddedX = blockOverride.x - minX;
+        const int localPaddedZ = blockOverride.z - minZ;
+        column.blockAt(localPaddedX, blockOverride.y, localPaddedZ) = blockOverride.blockId;
+    }
 }
 
 void WorldGenerator::setBlockIdAt(int x, int y, int z, std::uint16_t blockId)
@@ -88,5 +245,5 @@ void WorldGenerator::setBlockIdAt(int x, int y, int z, std::uint16_t blockId)
         return;
     }
 
-    blockOverrides_[key] = blockId;
+    blockOverrides_[key] = {x, y, z, blockId};
 }

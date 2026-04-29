@@ -6,6 +6,7 @@
 
 #include "core/FileSystem.h"
 #include "core/GameConfig.h"
+#include "core/Logger.h"
 #include "core/Math.h"
 #include "core/SystemInfo.h"
 #include "player/PlayerController.h"
@@ -24,6 +25,8 @@
 #include "world/BlockRaycast.h"
 #include "world/ChunkMesher.h"
 #include "world/ChunkStreamingManager.h"
+#include "world/WorldSave.h"
+#include "world/WorldTime.h"
 #include "world/WorldGenerator.h"
 
 #include <algorithm>
@@ -38,10 +41,12 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -122,6 +127,7 @@ struct DebugTextOverlay
         L"FPS: 0000 [00.000MS]",
         L"POS: 0000.00 / 0000.00 / 0000.00",
         L"CAM: YAW +000.000 PIT +00.000",
+        L"TIME: 000 DAY 00 H 00 M",
     };
     std::vector<std::wstring> rightLines = {
         L"VULKANVOXEL 0.0.0.0",
@@ -192,6 +198,16 @@ int floorDiv(int value, int divisor)
     return quotient;
 }
 
+int floorMod(int value, int divisor)
+{
+    int result = value % divisor;
+    if (result < 0)
+    {
+        result += divisor;
+    }
+    return result;
+}
+
 int chunkCoordForWorldPosition(float position, int chunkSize)
 {
     return floorDiv(static_cast<int>(std::floor(position)), chunkSize);
@@ -202,6 +218,9 @@ class VulkanVoxelApp
 public:
     void run()
     {
+        initLogging();
+        initSaveSystem();
+        loadSavedWorldState();
         initWindow();
         initVulkan();
         mainLoop();
@@ -292,6 +311,8 @@ private:
     CameraState camera_{};
     PlayerController playerController_{};
     WorldGenerator worldGenerator_{};
+    Logger logger_{};
+    WorldSave worldSave_{};
     DebugTextOverlay debugTextOverlay_{};
     FrameProfiler frameProfiler_{};
     bool debugTextVisible_ = true;
@@ -303,10 +324,15 @@ private:
     std::vector<std::wstring> blockTextureLayerNames_;
     ChunkMesher chunkMesher_{worldGenerator_, blockRegistry_};
     ChunkStreamingManager chunkStreaming_{chunkMesher_};
+    std::unordered_map<ChunkCoord, LoadedChunkData, ChunkCoordHash> loadedChunks_;
+    mutable std::mutex loadedChunksMutex_;
+    std::mutex saveMutex_;
     std::vector<DeferredChunkBufferDestroy> deferredChunkBufferDestroys_;
     std::vector<DeferredUploadCleanup> deferredUploadCleanups_;
     std::size_t meshVertexCount_ = 0;
     std::size_t meshIndexCount_ = 0;
+    std::uint64_t worldTimeTicks_ = kDefaultWorldTimeTicks;
+    double worldTickAccumulator_ = 0.0;
     std::chrono::steady_clock::time_point lastFrameTime_ = std::chrono::steady_clock::now();
     bool cursorCaptured_ = true;
     bool fullscreen_ = false;
@@ -383,6 +409,28 @@ private:
         }
     }
 
+    void initLogging()
+    {
+        logger_.initialize(sourcePathWide(L"/logs"));
+    }
+
+    void initSaveSystem()
+    {
+        worldSave_.initialize(sourcePathWide(L"/saves/world"), &logger_);
+    }
+
+    void loadSavedWorldState()
+    {
+        if (const std::optional<WorldSaveState> state = worldSave_.loadWorldState())
+        {
+            camera_ = state->camera;
+            camera_.firstMouse = true;
+            playerController_.setMovementMode(state->movementMode);
+            playerController_.setCameraViewMode(state->cameraViewMode);
+            worldTimeTicks_ = state->worldTimeTicks;
+        }
+    }
+
     void initWindow()
     {
         glfwSetErrorCallback(glfwErrorCallback);
@@ -449,6 +497,11 @@ private:
         loadBlockDefinitions();
         createBlockTextureArray();
         loadWorldConfig();
+        chunkStreaming_.setChunkBuildCallback(
+            [this](ChunkCoord coord, std::uint64_t generation)
+            {
+                return buildChunkForStreaming(coord, generation);
+            });
         startChunkBuildWorkers();
         createChunkMesh();
         cacheStaticDebugText();
@@ -480,6 +533,8 @@ private:
     void cleanup()
     {
         stopChunkBuildWorkers();
+        saveLoadedChunks(true);
+        saveWorldState();
         if (device_ != VK_NULL_HANDLE)
         {
             vkDeviceWaitIdle(device_);
@@ -1288,6 +1343,35 @@ private:
         chunkStreaming_.stopWorkers();
     }
 
+    ChunkBuildResult buildChunkForStreaming(ChunkCoord coord, std::uint64_t generation)
+    {
+        std::vector<std::uint16_t> blockIds;
+        {
+            std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+            const auto loadedIt = loadedChunks_.find(coord);
+            if (loadedIt != loadedChunks_.end())
+            {
+                blockIds = loadedIt->second.blockIds;
+            }
+        }
+
+        if (blockIds.empty())
+        {
+            if (std::optional<std::vector<std::uint16_t>> savedBlockIds = loadChunkFromDisk(coord))
+            {
+                blockIds = std::move(*savedBlockIds);
+            }
+
+            if (blockIds.empty())
+            {
+                blockIds = worldGenerator_.generateChunkBlocks(coord);
+                saveChunkToDisk(coord, blockIds);
+            }
+        }
+
+        return chunkMesher_.buildChunkMesh(coord, generation, blockIds);
+    }
+
     ChunkLoadUpdateStats updateLoadedChunks()
     {
         const int centerChunkX = chunkCoordForWorldPosition(camera_.position.x, kChunkSizeX);
@@ -1297,6 +1381,7 @@ private:
             centerChunkZ,
             [this](ChunkCoord coord)
             {
+                unloadLoadedChunkData(coord);
                 destroyChunkMeshes(coord);
             });
     }
@@ -1364,6 +1449,7 @@ private:
                 result.vertices,
                 result.indices,
                 result.subchunks);
+            registerLoadedChunkData(result.coord, std::move(result.blockIds));
             chunkStreaming_.markChunkLoaded(result.coord);
             ++uploadedCount;
         }
@@ -1374,6 +1460,113 @@ private:
     {
         processCompletedSubchunkBuilds();
         processCompletedChunkUploads();
+    }
+
+    void registerLoadedChunkData(ChunkCoord coord, std::vector<std::uint16_t> blockIds)
+    {
+        if (blockIds.size() != kChunkBlockCount)
+        {
+            logger_.warn("Skipping loaded chunk registration with invalid block count");
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+        bool dirty = false;
+        const auto loadedIt = loadedChunks_.find(coord);
+        if (loadedIt != loadedChunks_.end())
+        {
+            dirty = loadedIt->second.dirty;
+        }
+        loadedChunks_[coord] = {coord, std::move(blockIds), dirty};
+    }
+
+    void unloadLoadedChunkData(ChunkCoord coord)
+    {
+        std::optional<LoadedChunkData> chunkData;
+        {
+            std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+            auto loadedIt = loadedChunks_.find(coord);
+            if (loadedIt == loadedChunks_.end())
+            {
+                return;
+            }
+            chunkData = std::move(loadedIt->second);
+            loadedChunks_.erase(loadedIt);
+        }
+
+        if (chunkData->dirty)
+        {
+            saveChunkToDisk(coord, chunkData->blockIds);
+        }
+    }
+
+    void saveLoadedChunks(bool onlyDirty)
+    {
+        std::vector<LoadedChunkData> chunksToSave;
+        {
+            std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+            chunksToSave.reserve(loadedChunks_.size());
+            for (auto& [_, chunkData] : loadedChunks_)
+            {
+                if (!onlyDirty || chunkData.dirty)
+                {
+                    chunksToSave.push_back(chunkData);
+                }
+            }
+        }
+
+        for (const LoadedChunkData& chunkData : chunksToSave)
+        {
+            saveChunkToDisk(chunkData.coord, chunkData.blockIds);
+        }
+    }
+
+    void saveWorldState()
+    {
+        WorldSaveState state{};
+        state.camera = camera_;
+        state.movementMode = playerController_.movementMode();
+        state.cameraViewMode = playerController_.cameraViewMode();
+        state.worldTimeTicks = worldTimeTicks_;
+
+        try
+        {
+            std::lock_guard<std::mutex> lock(saveMutex_);
+            worldSave_.saveWorldState(state);
+        }
+        catch (const std::exception& exception)
+        {
+            logger_.error(std::string("Failed to save world state: ") + exception.what());
+        }
+    }
+
+    std::optional<std::vector<std::uint16_t>> loadChunkFromDisk(ChunkCoord coord)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock(saveMutex_);
+            return worldSave_.loadChunk(coord);
+        }
+        catch (const std::exception& exception)
+        {
+            logger_.error(std::string("Failed to load chunk from disk: ") + exception.what());
+            return std::nullopt;
+        }
+    }
+
+    bool saveChunkToDisk(ChunkCoord coord, const std::vector<std::uint16_t>& blockIds)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock(saveMutex_);
+            worldSave_.saveChunk(coord, blockIds);
+            return true;
+        }
+        catch (const std::exception& exception)
+        {
+            logger_.error(std::string("Failed to save chunk to disk: ") + exception.what());
+            return false;
+        }
     }
 
     std::pair<std::size_t, std::size_t> chunkBuildQueueSizes()
@@ -1853,6 +2046,7 @@ private:
         const auto now = std::chrono::steady_clock::now();
         const float rawDeltaSeconds = static_cast<float>(std::chrono::duration<double>(now - lastFrameTime_).count());
         lastFrameTime_ = now;
+        advanceWorldTime(rawDeltaSeconds);
 
         PlayerInputState input{};
         input.moveForward = glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS;
@@ -1874,18 +2068,33 @@ private:
             });
     }
 
+    void advanceWorldTime(float deltaSeconds)
+    {
+        const float clampedDeltaSeconds = std::clamp(deltaSeconds, 0.0f, 0.25f);
+        worldTickAccumulator_ += static_cast<double>(clampedDeltaSeconds) * kWorldTicksPerRealSecond;
+        const auto elapsedTicks = static_cast<std::uint64_t>(worldTickAccumulator_);
+        if (elapsedTicks == 0)
+        {
+            return;
+        }
+
+        worldTimeTicks_ += elapsedTicks;
+        worldTickAccumulator_ -= static_cast<double>(elapsedTicks);
+    }
+
     bool isWorldBlockSolid(int x, int y, int z) const
     {
         if (y < 0 || y >= kChunkHeight)
         {
-            return true;
+            return false;
         }
         if (!isChunkLoadedForBlock(x, z))
         {
             return true;
         }
 
-        return blockRegistry_.isSolid(worldGenerator_.blockIdAt(x, y, z));
+        const std::optional<std::uint16_t> blockId = loadedBlockIdAt(x, y, z);
+        return blockId.has_value() && blockRegistry_.isSolid(*blockId);
     }
 
     bool isRaycastBlockSolid(int x, int y, int z) const
@@ -1895,12 +2104,60 @@ private:
             return false;
         }
 
-        return blockRegistry_.isSolid(worldGenerator_.blockIdAt(x, y, z));
+        const std::optional<std::uint16_t> blockId = loadedBlockIdAt(x, y, z);
+        return blockId.has_value() && blockRegistry_.isSolid(*blockId);
     }
 
     bool isChunkLoadedForBlock(int x, int z) const
     {
-        return chunkStreaming_.isChunkLoaded(chunkCoordForBlock(x, z));
+        std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+        return loadedChunks_.contains(chunkCoordForBlock(x, z));
+    }
+
+    std::optional<std::uint16_t> loadedBlockIdAt(int x, int y, int z) const
+    {
+        if (y < 0 || y >= kChunkHeight)
+        {
+            return std::nullopt;
+        }
+
+        const ChunkCoord coord = chunkCoordForBlock(x, z);
+        const int localX = floorMod(x, kChunkSizeX);
+        const int localZ = floorMod(z, kChunkSizeZ);
+
+        std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+        const auto loadedIt = loadedChunks_.find(coord);
+        if (loadedIt == loadedChunks_.end() ||
+            loadedIt->second.blockIds.size() != kChunkBlockCount)
+        {
+            return std::nullopt;
+        }
+
+        return loadedIt->second.blockIds[chunkBlockIndex(localX, y, localZ)];
+    }
+
+    bool setLoadedBlockIdAt(int x, int y, int z, std::uint16_t blockId)
+    {
+        if (y < 0 || y >= kChunkHeight)
+        {
+            return false;
+        }
+
+        const ChunkCoord coord = chunkCoordForBlock(x, z);
+        const int localX = floorMod(x, kChunkSizeX);
+        const int localZ = floorMod(z, kChunkSizeZ);
+
+        std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+        auto loadedIt = loadedChunks_.find(coord);
+        if (loadedIt == loadedChunks_.end() ||
+            loadedIt->second.blockIds.size() != kChunkBlockCount)
+        {
+            return false;
+        }
+
+        loadedIt->second.blockIds[chunkBlockIndex(localX, y, localZ)] = blockId;
+        loadedIt->second.dirty = true;
+        return true;
     }
 
     ChunkCoord chunkCoordForBlock(int x, int z) const
@@ -1988,7 +2245,10 @@ private:
             return;
         }
 
-        worldGenerator_.setBlockIdAt(x, y, z, blockId);
+        if (!setLoadedBlockIdAt(x, y, z, blockId))
+        {
+            return;
+        }
         remeshEditedBlock(x, y, z);
         updateBlockSelection(true);
     }
@@ -2137,6 +2397,13 @@ private:
                 << L" [" << std::setw(6) << std::setfill(L'0') << std::fixed << std::setprecision(3)
                 << frameMs << L"MS]";
 
+        const WorldTimeParts timeParts = splitWorldTime(worldTimeTicks_);
+        std::wostringstream timeText;
+        timeText << L"TIME: " << timeParts.day
+                 << L" DAY " << std::setw(2) << std::setfill(L'0') << timeParts.hour
+                 << L" H " << std::setw(2) << std::setfill(L'0') << timeParts.minute
+                 << L" M";
+
         std::wostringstream positionText;
         positionText << L"POS: "
                      << formatFixedWidth(camera_.position.x, 7, 2) << L" / "
@@ -2150,7 +2417,7 @@ private:
                    << L"CAM: YAW " << std::setw(8) << yawDegrees
                    << L" PIT " << std::setw(7) << pitchDegrees;
 
-        debugTextOverlay_.lines = {fpsText.str(), positionText.str(), cameraText.str()};
+        debugTextOverlay_.lines = {fpsText.str(), positionText.str(), cameraText.str(), timeText.str()};
 
         auto msLine = [](const wchar_t* label, double value)
         {
@@ -2297,24 +2564,19 @@ private:
         uniform.camera[2] = aspect;
         uniform.camera[3] = std::tan(fovY * 0.5f);
 
-        uniform.sunDirection[0] = 1.0f;
-        uniform.sunDirection[1] = 0.0f;
-        uniform.sunDirection[2] = 0.0f;
+        const Vec3 sunDirection = sunDirectionFromWorldTime(worldTimeTicks_);
+        uniform.sunDirection[0] = sunDirection.x;
+        uniform.sunDirection[1] = sunDirection.y;
+        uniform.sunDirection[2] = sunDirection.z;
         uniform.sunDirection[3] = 0.0f;
-
-        const float invLength = 1.0f / std::sqrt(
-            uniform.sunDirection[0] * uniform.sunDirection[0] +
-            uniform.sunDirection[1] * uniform.sunDirection[1]);
-        uniform.sunDirection[0] *= invLength;
-        uniform.sunDirection[1] *= invLength;
 
         uniform.moonDirection[0] = -uniform.sunDirection[0];
         uniform.moonDirection[1] = -uniform.sunDirection[1];
         uniform.moonDirection[2] = -uniform.sunDirection[2];
         uniform.moonDirection[3] = 0.0f;
 
-        uniform.spriteScale[0] = 0.16f;
-        uniform.spriteScale[1] = 0.14f;
+        uniform.spriteScale[0] = 0.10f;
+        uniform.spriteScale[1] = 0.10f;
         uniform.spriteScale[2] = 0.0f;
         uniform.spriteScale[3] = 0.0f;
 
@@ -2328,6 +2590,27 @@ private:
         std::memcpy(blockUniformMappedMemory_, &blockUniform, sizeof(blockUniform));
     }
 
+    Vec3 skyClearColor() const
+    {
+        const float sunAltitude = sunDirectionFromWorldTime(worldTimeTicks_).y;
+        const Vec3 nightColor{0.025f, 0.035f, 0.08f};
+        const Vec3 dawnColor{0.78f, 0.43f, 0.24f};
+        const Vec3 dayColor{0.46f, 0.72f, 1.0f};
+
+        if (sunAltitude <= -0.08f)
+        {
+            return nightColor;
+        }
+        if (sunAltitude < 0.16f)
+        {
+            const float blend = (sunAltitude + 0.08f) / 0.24f;
+            return nightColor * (1.0f - blend) + dawnColor * blend;
+        }
+
+        const float blend = std::clamp((sunAltitude - 0.16f) / 0.34f, 0.0f, 1.0f);
+        return dawnColor * (1.0f - blend) + dayColor * blend;
+    }
+
     void recordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex)
     {
         VkCommandBufferBeginInfo beginInfo{};
@@ -2339,7 +2622,8 @@ private:
         }
 
         std::array<VkClearValue, 2> clearValues{};
-        clearValues[0].color = {{0.46f, 0.72f, 1.0f, 1.0f}};
+        const Vec3 clearColor = skyClearColor();
+        clearValues[0].color = {{clearColor.x, clearColor.y, clearColor.z, 1.0f}};
         clearValues[1].depthStencil = {1.0f, 0};
 
         VkRenderPassBeginInfo renderPassInfo{};

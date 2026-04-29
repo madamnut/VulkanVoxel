@@ -10,12 +10,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Vulkan REQUIRED)
-find_program(GLSLC_EXECUTABLE
-    NAMES glslc glslc.exe
-    HINTS "$ENV{VULKAN_SDK}/Bin"
-    REQUIRED
-)
+find_package(Vulkan REQUIRED COMPONENTS glslc)
+
+if(DEFINED Vulkan_GLSLC_EXECUTABLE AND EXISTS "${Vulkan_GLSLC_EXECUTABLE}")
+    set(GLSLC_EXECUTABLE "${Vulkan_GLSLC_EXECUTABLE}")
+else()
+    find_program(GLSLC_EXECUTABLE
+        NAMES glslc glslc.exe
+        HINTS "$ENV{VULKAN_SDK}/Bin"
+        REQUIRED
+    )
+endif()
 
 file(TO_CMAKE_PATH "${PROJECT_SOURCE_DIR}" VULKAN_VOXEL_SOURCE_DIR)
 file(TO_CMAKE_PATH "${PROJECT_BINARY_DIR}" VULKAN_VOXEL_BINARY_DIR)
@@ -59,6 +64,7 @@ add_executable(VulkanVoxel
     src/assets/ImageLoader.cpp
     src/core/FileSystem.cpp
     src/core/GameConfig.cpp
+    src/core/Logger.cpp
     src/core/Math.cpp
     src/core/SystemInfo.cpp
     src/player/PlayerController.cpp
@@ -75,8 +81,10 @@ add_executable(VulkanVoxel
     src/world/BlockRaycast.cpp
     src/world/ChunkMesher.cpp
     src/world/ChunkStreamingManager.cpp
+    src/world/WorldSave.cpp
     src/world/WorldGenerator.cpp
     src/main.cpp
+    third_party/lz4/lz4.c
 )
 add_dependencies(VulkanVoxel VulkanVoxelShaders)
 
@@ -102,6 +110,7 @@ target_link_libraries(VulkanVoxel PRIVATE
 
 target_include_directories(VulkanVoxel PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/third_party/lz4"
 )
 
 set_target_properties(VulkanVoxel PROPERTIES

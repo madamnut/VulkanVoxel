@@ -22,6 +22,10 @@ public:
     void update(CameraState& camera, const PlayerInputState& input, float deltaSeconds, const SolidBlockQuery& isSolidBlock);
     void toggleMovementMode();
     void cycleCameraViewMode();
+    void setMovementMode(MovementMode movementMode);
+    void setCameraViewMode(CameraViewMode cameraViewMode);
+    MovementMode movementMode() const;
+    CameraViewMode cameraViewMode() const;
 
     Vec3 playerFeetPosition(const CameraState& camera) const;
     bool isThirdPersonView() const;

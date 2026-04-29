@@ -17,14 +17,6 @@
 #include <utility>
 #include <vector>
 
-struct ChunkBuildResult
-{
-    ChunkCoord coord{};
-    std::vector<BlockVertex> vertices;
-    std::vector<std::uint32_t> indices;
-    std::vector<SubchunkDraw> subchunks;
-};
-
 struct ChunkLoadUpdateStats
 {
     std::size_t loaded = 0;
@@ -40,6 +32,7 @@ public:
 
     void setLoadRadius(int loadRadius);
     void setBuildThreadCount(int buildThreadCount);
+    void setChunkBuildCallback(std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> callback);
     int loadRadius() const;
     int buildThreadCount() const;
 
@@ -73,6 +66,7 @@ private:
     };
 
     ChunkMesher& chunkMesher_;
+    std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> chunkBuildCallback_;
     int loadRadius_ = 5;
     int buildThreadCount_ = 4;
 

@@ -1,7 +1,11 @@
 build/
+build-test/
 .vs/
 .vscode/
 out/
+CMakeUserPresets.json
+logs/
+saves/
 *.user
 *.suo
 *.ninja_deps

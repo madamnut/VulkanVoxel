@@ -69,6 +69,71 @@ std::uint32_t ChunkMesher::textureLayerForBlockFace(std::uint16_t blockId, Block
 
 SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) const
 {
+    const GeneratedChunkColumn column = worldGenerator_.generateChunkColumn(request.coord);
+    return buildSubchunkMesh(request, column);
+}
+
+ChunkBuildResult ChunkMesher::buildChunkMesh(ChunkCoord coord, std::uint64_t generation) const
+{
+    std::vector<std::uint16_t> blockIds = worldGenerator_.generateChunkBlocks(coord);
+    return buildChunkMesh(coord, generation, blockIds);
+}
+
+ChunkBuildResult ChunkMesher::buildChunkMesh(
+    ChunkCoord coord,
+    std::uint64_t generation,
+    const std::vector<std::uint16_t>& blockIds) const
+{
+    ChunkBuildResult result = buildChunkMesh(coord, generation, worldGenerator_.generateChunkColumn(coord, blockIds));
+    result.blockIds = blockIds;
+    return result;
+}
+
+ChunkBuildResult ChunkMesher::buildChunkMesh(
+    ChunkCoord coord,
+    std::uint64_t generation,
+    const GeneratedChunkColumn& column) const
+{
+    ChunkBuildResult result{};
+    result.coord = coord;
+    result.subchunks.reserve(kSubchunksPerChunk);
+
+    for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
+    {
+        SubchunkBuildResult subchunk = buildSubchunkMesh(
+            {
+                coord,
+                subchunkY,
+                0,
+                generation,
+            },
+            column);
+        if (subchunk.indices.empty())
+        {
+            continue;
+        }
+
+        SubchunkDraw draw{};
+        draw.chunkX = coord.x;
+        draw.chunkZ = coord.z;
+        draw.subchunkY = subchunkY;
+        draw.range.vertexCount = static_cast<std::uint32_t>(subchunk.vertices.size());
+        draw.range.firstIndex = static_cast<std::uint32_t>(result.indices.size());
+        draw.range.indexCount = static_cast<std::uint32_t>(subchunk.indices.size());
+        draw.range.vertexOffset = static_cast<std::int32_t>(result.vertices.size());
+
+        result.vertices.insert(result.vertices.end(), subchunk.vertices.begin(), subchunk.vertices.end());
+        result.indices.insert(result.indices.end(), subchunk.indices.begin(), subchunk.indices.end());
+        result.subchunks.push_back(draw);
+    }
+
+    return result;
+}
+
+SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
+    ChunkBuildRequest request,
+    const GeneratedChunkColumn& column) const
+{
         const ChunkCoord chunk = request.coord;
         std::array<std::vector<BlockVertex>, kSubchunkSize> verticesByLocalY;
         std::array<std::vector<std::uint32_t>, kSubchunkSize> indicesByLocalY;
@@ -84,33 +149,15 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) co
         const int chunkBaseZ = chunkZ * kChunkSizeZ;
         const int subchunkMinY = subchunkY * kSubchunkSize;
 
-        constexpr int kPaddedSubchunkSize = kSubchunkSize + 2;
-        constexpr int kPaddedSubchunkArea = kPaddedSubchunkSize * kPaddedSubchunkSize;
-        constexpr int kPaddedSubchunkVolume = kPaddedSubchunkArea * kPaddedSubchunkSize;
-        std::array<std::uint16_t, kPaddedSubchunkVolume> blockIds{};
-
-        auto paddedBlockIndex = [&](int localX, int localY, int localZ) -> std::size_t
-        {
-            return static_cast<std::size_t>(
-                (localY * kPaddedSubchunkSize + localZ) * kPaddedSubchunkSize + localX);
-        };
-
         int nonAirBlockCount = 0;
-        for (int localZ = 0; localZ < kPaddedSubchunkSize; ++localZ)
+        for (int localPaddedZ = 1; localPaddedZ <= kChunkSizeZ; ++localPaddedZ)
         {
-            const int z = chunkBaseZ + localZ - 1;
-            for (int localX = 0; localX < kPaddedSubchunkSize; ++localX)
+            for (int localPaddedX = 1; localPaddedX <= kChunkSizeX; ++localPaddedX)
             {
-                const int x = chunkBaseX + localX - 1;
-                for (int localY = 0; localY < kPaddedSubchunkSize; ++localY)
+                for (int localY = 0; localY < kSubchunkSize; ++localY)
                 {
-                    const int y = subchunkMinY + localY - 1;
-                    const std::uint16_t blockId = worldGenerator_.blockIdAt(x, y, z);
-                    blockIds[paddedBlockIndex(localX, localY, localZ)] = blockId;
-                    if (localX > 0 && localX <= kSubchunkSize &&
-                        localY > 0 && localY <= kSubchunkSize &&
-                        localZ > 0 && localZ <= kSubchunkSize &&
-                        blockId != kAirBlockId)
+                    const int y = subchunkMinY + localY;
+                    if (column.blockAt(localPaddedX, y, localPaddedZ) != kAirBlockId)
                     {
                         ++nonAirBlockCount;
                     }
@@ -131,30 +178,16 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) co
 
         auto isSolid = [&](int x, int y, int z) -> bool
         {
-            const int localX = x - chunkBaseX + 1;
-            const int localY = y - subchunkMinY + 1;
-            const int localZ = z - chunkBaseZ + 1;
-            if (localX < 0 || localX >= kPaddedSubchunkSize ||
-                localY < 0 || localY >= kPaddedSubchunkSize ||
-                localZ < 0 || localZ >= kPaddedSubchunkSize)
-            {
-                return false;
-            }
-            return isSolidBlock(blockIds[paddedBlockIndex(localX, localY, localZ)]);
+            const int localPaddedX = x - chunkBaseX + 1;
+            const int localPaddedZ = z - chunkBaseZ + 1;
+            return isSolidBlock(column.blockAt(localPaddedX, y, localPaddedZ));
         };
 
         auto blockIdAt = [&](int x, int y, int z) -> std::uint16_t
         {
-            const int localX = x - chunkBaseX + 1;
-            const int localY = y - subchunkMinY + 1;
-            const int localZ = z - chunkBaseZ + 1;
-            if (localX < 0 || localX >= kPaddedSubchunkSize ||
-                localY < 0 || localY >= kPaddedSubchunkSize ||
-                localZ < 0 || localZ >= kPaddedSubchunkSize)
-            {
-                return kAirBlockId;
-            }
-            return blockIds[paddedBlockIndex(localX, localY, localZ)];
+            const int localPaddedX = x - chunkBaseX + 1;
+            const int localPaddedZ = z - chunkBaseZ + 1;
+            return column.blockAt(localPaddedX, y, localPaddedZ);
         };
 
         auto emitGreedyRectangles = [](

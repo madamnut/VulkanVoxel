@@ -46,6 +46,11 @@ void ChunkStreamingManager::setBuildThreadCount(int buildThreadCount)
     buildThreadCount_ = buildThreadCount;
 }
 
+void ChunkStreamingManager::setChunkBuildCallback(std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> callback)
+{
+    chunkBuildCallback_ = std::move(callback);
+}
+
 int ChunkStreamingManager::loadRadius() const
 {
     return loadRadius_;
@@ -370,11 +375,18 @@ void ChunkStreamingManager::workerLoop()
             continue;
         }
 
-        SubchunkBuildResult result = chunkMesher_.buildSubchunkMesh(request);
+        ChunkBuildResult result = chunkBuildCallback_
+            ? chunkBuildCallback_(request.coord, request.generation)
+            : chunkMesher_.buildChunkMesh(request.coord, request.generation);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            completedSubchunks_.push_back(std::move(result));
+            const auto generationIt = queuedGenerations_.find(request.coord);
+            if (generationIt != queuedGenerations_.end() &&
+                generationIt->second == request.generation)
+            {
+                completedChunks_.push_back(std::move(result));
+            }
         }
     }
 }
@@ -385,19 +397,16 @@ void ChunkStreamingManager::queueChunkBuildLocked(ChunkCoord coord, int centerCh
     const std::uint64_t generation = ++buildGeneration_;
     queuedGenerations_[coord] = generation;
     const std::int64_t priorityDistanceSq = chunkDistanceSq(coord, centerChunkX, centerChunkZ);
-    for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
-    {
-        pendingBuilds_.push_back({
-            coord,
-            subchunkY,
-            priorityDistanceSq,
-            generation,
-        });
-        std::push_heap(
-            pendingBuilds_.begin(),
-            pendingBuilds_.end(),
-            ChunkBuildRequestPriority{});
-    }
+    pendingBuilds_.push_back({
+        coord,
+        -1,
+        priorityDistanceSq,
+        generation,
+    });
+    std::push_heap(
+        pendingBuilds_.begin(),
+        pendingBuilds_.end(),
+        ChunkBuildRequestPriority{});
 }
 
 void ChunkStreamingManager::reprioritizePendingChunkBuildsLocked(int centerChunkX, int centerChunkZ)

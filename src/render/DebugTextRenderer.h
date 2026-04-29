@@ -12,6 +12,8 @@ constexpr int kDebugGlyphCount = kDebugGlyphLast - kDebugGlyphFirst + 1;
 constexpr int kDebugGlyphColumns = 16;
 constexpr int kDebugGlyphCellWidth = 64;
 constexpr int kDebugGlyphCellHeight = 64;
+constexpr int kDebugFontPixelHeight = 21;
+constexpr float kDebugTextLineHeight = 28.5f;
 constexpr std::uint32_t kDebugFontAtlasWidth = kDebugGlyphColumns * kDebugGlyphCellWidth;
 constexpr std::uint32_t kDebugFontAtlasHeight =
     ((kDebugGlyphCount + kDebugGlyphColumns - 1) / kDebugGlyphColumns) * kDebugGlyphCellHeight;

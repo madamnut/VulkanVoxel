@@ -96,6 +96,29 @@ void PlayerController::cycleCameraViewMode()
     }
 }
 
+void PlayerController::setMovementMode(MovementMode movementMode)
+{
+    movementMode_ = movementMode;
+    verticalVelocity_ = 0.0f;
+    playerGrounded_ = false;
+    physicsAccumulatorSeconds_ = 0.0f;
+}
+
+void PlayerController::setCameraViewMode(CameraViewMode cameraViewMode)
+{
+    cameraViewMode_ = cameraViewMode;
+}
+
+MovementMode PlayerController::movementMode() const
+{
+    return movementMode_;
+}
+
+CameraViewMode PlayerController::cameraViewMode() const
+{
+    return cameraViewMode_;
+}
+
 Vec3 PlayerController::playerFeetPosition(const CameraState& camera) const
 {
     return {camera.position.x, camera.position.y - kPlayerEyeHeight, camera.position.z};
