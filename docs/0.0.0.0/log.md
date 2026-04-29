@@ -2,10 +2,20 @@
 
 ## 2026-04-29
 
+- density octave 설정을 개별 octave 배열에서 `noise.octaves`, `baseFrequency`, `frequencyMultiplier`, `baseAmplitude`, `amplitudeMultiplier`, `verticalFrequencyScale` 방식으로 변경했다. 각 octave의 X/Z 주파수는 기본 주파수에서 배율로 내부 생성하고, Y 주파수는 X/Z 주파수에 vertical scale과 기존 128배 높이 보정을 적용한다.
 - 청크 저장 block id 배열 순서를 컬럼 단위 `localZ -> localX -> y`로 조정했다. y가 가장 빠르게 변하므로 같은 X/Z 컬럼 안에서는 다음 원소가 바로 위 블록이며, RLE가 수직 지형 구간을 더 잘 압축한다.
 - 월드 시간을 tick 기반으로 추가했다. 1분은 20틱, 하루는 28800틱이며 새 월드는 `0 DAY 06 H 00 M`인 7200틱에서 시작한다. `world.bin`에 현재 월드 tick을 저장하고, 시간에 따라 태양/달 방향과 하늘 clear color가 변한다.
 - 좌상단 debug text의 월드 시간 표시를 FPS/POS/CAM 아래쪽 맨 하단 라인으로 옮겼다.
 - sky sprite 크기를 태양과 달 모두 `0.10`으로 통일했다.
+- 좌상단 debug text의 시야 방향 라인 뒤에 `[EAST]` 형식의 4방위 표시를 추가했다. 현재 좌표계 기준 `+X = EAST`, `+Z = SOUTH`로 계산한다.
+- 새 월드 생성 시 random `uint64_t` world seed를 생성하고 즉시 `world.bin`에 저장하도록 했다. 기존 세이브가 있으면 저장된 seed를 사용한다.
+- 플레이어 위치 저장은 X/Z를 `0..65536` 범위의 wrapped 인게임 좌표로 저장하도록 했다.
+- 좌상단 debug text의 위치 표시를 `POS: X:0000.000 [wrapped] / Y:0000.000 [same] / Z:0000.000 [wrapped]` 형식으로 바꾸고, 마지막 줄에 `SEED: <worldSeed>`를 표시하도록 했다.
+- 월드 생성기를 heightmap 방식에서 density 방식으로 바꿨다. 지형 shape는 `cellSize=4` 전역 density lattice vertex에서만 5D torus simplex noise를 샘플링하고, block center에서는 삼중선형보간한 density가 `0` 이상이면 기본 rock으로 생성한다.
+- 5D torus simplex noise는 X/Z density lattice index를 sin/cos lookup table로 변환해 `65536 x 65536` 토러스 타일링을 보장한다. Y는 타일링하지 않고 octave별 사전 계산된 Y 입력값을 사용한다.
+- density octave는 `noise.octaves` 개수만큼 내부 생성한다. 각 octave의 주파수는 `baseFrequency * frequencyMultiplier^n`, 진폭은 `baseAmplitude * amplitudeMultiplier^n`으로 계산하며, density는 terrain shape만 결정하고 grass/dirt/bedrock 후처리는 기존 분리 단계에서 적용한다.
+- region save/load는 raw display chunk coord를 받더라도 내부적으로 `0..4095` wrapped chunk coord로 변환해 같은 토러스 위치의 편집 데이터가 한 바퀴 뒤에도 동일하게 보이도록 했다.
+- `config/world.json`에 `terrainDensity.gradient.center`, `terrainDensity.gradient.strength`, `terrainDensity.noise` 설정을 추가해 vertical gradient와 5D torus simplex octave를 실행 전 조정할 수 있게 했다. gradient는 `density = (center - normalizedY) * strength`로 계산하며, 기본 `center=0.5`는 월드 높이 중앙을 기준으로 아래는 density를 더하고 위는 density를 뺀다. `baseFrequency`는 X/Z 월드 한 바퀴 기준 반복 횟수이며, Y 입력은 같은 숫자일 때 X/Z와 같은 블럭 스케일이 되도록 내부에서 128배 보정한다.
 
 ## 2026-04-24
 

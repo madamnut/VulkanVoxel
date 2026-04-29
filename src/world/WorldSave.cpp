@@ -68,7 +68,8 @@ std::optional<WorldSaveState> WorldSave::loadWorldState()
         !readPod(stream, state.camera.pitch) ||
         !readPod(stream, movementMode) ||
         !readPod(stream, cameraViewMode) ||
-        !readPod(stream, state.worldTimeTicks))
+        !readPod(stream, state.worldTimeTicks) ||
+        !readPod(stream, state.worldSeed))
     {
         if (logger_ != nullptr)
         {
@@ -127,6 +128,7 @@ void WorldSave::saveWorldState(const WorldSaveState& state)
     writePod(stream, movementMode);
     writePod(stream, cameraViewMode);
     writePod(stream, state.worldTimeTicks);
+    writePod(stream, state.worldSeed);
 
     if (logger_ != nullptr)
     {
@@ -136,10 +138,12 @@ void WorldSave::saveWorldState(const WorldSaveState& state)
 
 std::optional<std::vector<std::uint16_t>> WorldSave::loadChunk(ChunkCoord coord)
 {
-    const int regionX = regionCoordForChunk(coord.x);
-    const int regionZ = regionCoordForChunk(coord.z);
-    const int localChunkX = localCoordForChunk(coord.x);
-    const int localChunkZ = localCoordForChunk(coord.z);
+    const int wrappedChunkX = floorMod(coord.x, kWorldChunkSide);
+    const int wrappedChunkZ = floorMod(coord.z, kWorldChunkSide);
+    const int regionX = regionCoordForChunk(wrappedChunkX);
+    const int regionZ = regionCoordForChunk(wrappedChunkZ);
+    const int localChunkX = localCoordForChunk(wrappedChunkX);
+    const int localChunkZ = localCoordForChunk(wrappedChunkZ);
     const std::wstring path = regionPath(regionX, regionZ);
     if (!std::filesystem::exists(std::filesystem::path(path)))
     {
@@ -218,10 +222,12 @@ void WorldSave::saveChunk(ChunkCoord coord, const std::vector<std::uint16_t>& bl
         throw std::runtime_error("Cannot save chunk with an invalid block count.");
     }
 
-    const int regionX = regionCoordForChunk(coord.x);
-    const int regionZ = regionCoordForChunk(coord.z);
-    const int localChunkX = localCoordForChunk(coord.x);
-    const int localChunkZ = localCoordForChunk(coord.z);
+    const int wrappedChunkX = floorMod(coord.x, kWorldChunkSide);
+    const int wrappedChunkZ = floorMod(coord.z, kWorldChunkSide);
+    const int regionX = regionCoordForChunk(wrappedChunkX);
+    const int regionZ = regionCoordForChunk(wrappedChunkZ);
+    const int localChunkX = localCoordForChunk(wrappedChunkX);
+    const int localChunkZ = localCoordForChunk(wrappedChunkZ);
     const std::wstring path = regionPath(regionX, regionZ);
     ensureRegionFile(path);
 

@@ -1,5 +1,19 @@
 {
   "chunkLoadRadius": 30,
   "chunkUploadsPerFrame": 64,
-  "chunkBuildThreads": 4
+  "chunkBuildThreads": 4,
+  "terrainDensity": {
+    "gradient": {
+      "center": 0.4,
+      "strength": 512.0
+    },
+    "noise": {
+      "octaves": 3,
+      "baseFrequency": 64,
+      "frequencyMultiplier": 4.0,
+      "baseAmplitude": 24.0,
+      "amplitudeMultiplier": 0.45,
+      "verticalFrequencyScale": 0.0005
+    }
+  }
 }

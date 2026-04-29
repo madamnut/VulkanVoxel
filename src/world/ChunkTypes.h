@@ -10,6 +10,12 @@ constexpr int kChunkSizeZ = 16;
 constexpr int kSubchunkSize = 16;
 constexpr int kChunkHeight = 512;
 constexpr int kSubchunksPerChunk = kChunkHeight / kSubchunkSize;
+constexpr int kWorldSizeXZ = 65536;
+constexpr int kWorldChunkSide = kWorldSizeXZ / kChunkSizeX;
+constexpr int kDensityCellSize = 4;
+constexpr int kWorldDensityCellsXZ = kWorldSizeXZ / kDensityCellSize;
+constexpr int kWorldDensityCellsY = kChunkHeight / kDensityCellSize;
+constexpr int kWorldDensityVerticesY = kWorldDensityCellsY + 1;
 constexpr std::size_t kChunkBlockCount =
     static_cast<std::size_t>(kChunkSizeX) * kChunkHeight * kChunkSizeZ;
 

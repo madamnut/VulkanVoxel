@@ -43,6 +43,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -125,9 +126,10 @@ struct DebugTextOverlay
     std::uint32_t framesSinceUpdate = 0;
     std::vector<std::wstring> lines = {
         L"FPS: 0000 [00.000MS]",
-        L"POS: 0000.00 / 0000.00 / 0000.00",
+        L"POS: X:0000.000 [0000.000] / Y:0000.000 [0000.000] / Z:0000.000 [0000.000]",
         L"CAM: YAW +000.000 PIT +00.000",
         L"TIME: 000 DAY 00 H 00 M",
+        L"SEED: 0",
     };
     std::vector<std::wstring> rightLines = {
         L"VULKANVOXEL 0.0.0.0",
@@ -208,9 +210,78 @@ int floorMod(int value, int divisor)
     return result;
 }
 
+float wrapWorldPosition(float position)
+{
+    float result = std::fmod(position, static_cast<float>(kWorldSizeXZ));
+    if (result < 0.0f)
+    {
+        result += static_cast<float>(kWorldSizeXZ);
+    }
+    return result;
+}
+
 int chunkCoordForWorldPosition(float position, int chunkSize)
 {
     return floorDiv(static_cast<int>(std::floor(position)), chunkSize);
+}
+
+std::uint64_t mixSeed(std::uint64_t value)
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    value ^= value >> 31;
+    return value;
+}
+
+std::uint64_t generateRandomWorldSeed()
+{
+    std::uint64_t seed = static_cast<std::uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    try
+    {
+        std::random_device randomDevice;
+        seed ^= static_cast<std::uint64_t>(randomDevice()) << 32;
+        seed ^= static_cast<std::uint64_t>(randomDevice());
+    }
+    catch (...)
+    {
+    }
+    return mixSeed(seed);
+}
+
+std::wstring formatCoordinateValue(double value)
+{
+    const bool negative = value < 0.0;
+    const double absoluteValue = std::abs(value);
+    std::wostringstream stream;
+    if (negative)
+    {
+        stream << L'-';
+    }
+    stream << std::fixed << std::setprecision(3)
+           << std::setw(8) << std::setfill(L'0') << absoluteValue;
+    return stream.str();
+}
+
+const wchar_t* directionNameForYaw(float yaw)
+{
+    constexpr std::array<const wchar_t*, 4> directionNames = {
+        L"EAST",
+        L"SOUTH",
+        L"WEST",
+        L"NORTH",
+    };
+    float normalizedYaw = std::remainder(yaw, 2.0f * kPi);
+    if (normalizedYaw < 0.0f)
+    {
+        normalizedYaw += 2.0f * kPi;
+    }
+
+    const int directionIndex = static_cast<int>(std::floor(
+        (normalizedYaw + kPi / 4.0f) / (kPi / 2.0f))) % static_cast<int>(directionNames.size());
+    return directionNames[static_cast<std::size_t>(directionIndex)];
 }
 
 class VulkanVoxelApp
@@ -331,6 +402,7 @@ private:
     std::vector<DeferredUploadCleanup> deferredUploadCleanups_;
     std::size_t meshVertexCount_ = 0;
     std::size_t meshIndexCount_ = 0;
+    std::uint64_t worldSeed_ = 0;
     std::uint64_t worldTimeTicks_ = kDefaultWorldTimeTicks;
     double worldTickAccumulator_ = 0.0;
     std::chrono::steady_clock::time_point lastFrameTime_ = std::chrono::steady_clock::now();
@@ -428,7 +500,14 @@ private:
             playerController_.setMovementMode(state->movementMode);
             playerController_.setCameraViewMode(state->cameraViewMode);
             worldTimeTicks_ = state->worldTimeTicks;
+            worldSeed_ = state->worldSeed;
+            worldGenerator_.setSeed(worldSeed_);
+            return;
         }
+
+        worldSeed_ = generateRandomWorldSeed();
+        worldGenerator_.setSeed(worldSeed_);
+        saveWorldState();
     }
 
     void initWindow()
@@ -1316,15 +1395,25 @@ private:
 
     void loadWorldConfig()
     {
+        const TerrainDensityConfig defaultTerrainDensity{};
+        const TerrainDensityConfig minTerrainDensity{
+            {0.0f, 0.0f},
+            {0, 0, 1.0f, 0.0f, 0.0f, 0.0f},
+        };
+        const TerrainDensityConfig maxTerrainDensity{
+            {1.0f, static_cast<float>(kChunkHeight) * 4.0f},
+            {kMaxTerrainDensityOctaves, 1024, 8.0f, 256.0f, 1.0f, 4.0f},
+        };
         const WorldConfig config = loadWorldConfigFile(
             sourcePath("/config/world.json"),
-            {kDefaultChunkLoadRadius, kDefaultChunkUploadsPerFrame, kDefaultChunkBuildThreads},
-            {0, 1, 1},
-            {kMaxChunkLoadRadius, kMaxChunkUploadsPerFrame, kMaxChunkBuildThreads});
+            {kDefaultChunkLoadRadius, kDefaultChunkUploadsPerFrame, kDefaultChunkBuildThreads, defaultTerrainDensity},
+            {0, 1, 1, minTerrainDensity},
+            {kMaxChunkLoadRadius, kMaxChunkUploadsPerFrame, kMaxChunkBuildThreads, maxTerrainDensity});
 
         chunkUploadsPerFrame_ = config.chunkUploadsPerFrame;
         chunkStreaming_.setLoadRadius(config.chunkLoadRadius);
         chunkStreaming_.setBuildThreadCount(config.chunkBuildThreads);
+        worldGenerator_.setTerrainDensityConfig(config.terrainDensity);
     }
 
     void createChunkMesh()
@@ -1525,9 +1614,12 @@ private:
     {
         WorldSaveState state{};
         state.camera = camera_;
+        state.camera.position.x = wrapWorldPosition(state.camera.position.x);
+        state.camera.position.z = wrapWorldPosition(state.camera.position.z);
         state.movementMode = playerController_.movementMode();
         state.cameraViewMode = playerController_.cameraViewMode();
         state.worldTimeTicks = worldTimeTicks_;
+        state.worldSeed = worldSeed_;
 
         try
         {
@@ -2405,19 +2497,28 @@ private:
                  << L" M";
 
         std::wostringstream positionText;
-        positionText << L"POS: "
-                     << formatFixedWidth(camera_.position.x, 7, 2) << L" / "
-                     << formatFixedWidth(camera_.position.y, 7, 2) << L" / "
-                     << formatFixedWidth(camera_.position.z, 7, 2);
+        positionText << L"POS: X:" << formatCoordinateValue(camera_.position.x)
+                     << L" [" << formatCoordinateValue(wrapWorldPosition(camera_.position.x)) << L"] / Y:"
+                     << formatCoordinateValue(camera_.position.y)
+                     << L" [" << formatCoordinateValue(camera_.position.y) << L"] / Z:"
+                     << formatCoordinateValue(camera_.position.z)
+                     << L" [" << formatCoordinateValue(wrapWorldPosition(camera_.position.z)) << L"]";
 
         const double yawDegrees = static_cast<double>(camera_.yaw) * 180.0 / static_cast<double>(kPi);
         const double pitchDegrees = static_cast<double>(camera_.pitch) * 180.0 / static_cast<double>(kPi);
         std::wostringstream cameraText;
         cameraText << std::showpos << std::fixed << std::setprecision(3)
                    << L"CAM: YAW " << std::setw(8) << yawDegrees
-                   << L" PIT " << std::setw(7) << pitchDegrees;
+                   << L" PIT " << std::setw(7) << pitchDegrees
+                   << std::noshowpos << L" [" << directionNameForYaw(camera_.yaw) << L"]";
 
-        debugTextOverlay_.lines = {fpsText.str(), positionText.str(), cameraText.str(), timeText.str()};
+        debugTextOverlay_.lines = {
+            fpsText.str(),
+            positionText.str(),
+            cameraText.str(),
+            timeText.str(),
+            L"SEED: " + std::to_wstring(worldSeed_),
+        };
 
         auto msLine = [](const wchar_t* label, double value)
         {

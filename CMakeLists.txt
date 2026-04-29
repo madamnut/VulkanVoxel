@@ -81,6 +81,7 @@ add_executable(VulkanVoxel
     src/world/BlockRaycast.cpp
     src/world/ChunkMesher.cpp
     src/world/ChunkStreamingManager.cpp
+    src/world/SimplexNoise.cpp
     src/world/WorldSave.cpp
     src/world/WorldGenerator.cpp
     src/main.cpp

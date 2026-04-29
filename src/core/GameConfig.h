@@ -1,5 +1,7 @@
 #pragma once
 
+#include "world/WorldGenerator.h"
+
 #include <string>
 
 struct WorldConfig
@@ -7,6 +9,7 @@ struct WorldConfig
     int chunkLoadRadius = 5;
     int chunkUploadsPerFrame = 1;
     int chunkBuildThreads = 4;
+    TerrainDensityConfig terrainDensity{};
 };
 
 WorldConfig loadWorldConfigFile(

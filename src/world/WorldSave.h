@@ -16,6 +16,7 @@ struct WorldSaveState
     MovementMode movementMode = MovementMode::Fly;
     CameraViewMode cameraViewMode = CameraViewMode::FirstPerson;
     std::uint64_t worldTimeTicks = 0;
+    std::uint64_t worldSeed = 0;
 };
 
 class WorldSave
