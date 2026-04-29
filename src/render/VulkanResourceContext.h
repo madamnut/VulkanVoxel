@@ -24,7 +24,8 @@ public:
         VkMemoryPropertyFlags properties,
         VkImage& image,
         VkDeviceMemory& imageMemory,
-        std::uint32_t arrayLayers = 1) const;
+        std::uint32_t arrayLayers = 1,
+        std::uint32_t mipLevels = 1) const;
 
     VkCommandBuffer copyBuffer(VkBuffer sourceBuffer, VkBuffer destinationBuffer, VkDeviceSize size) const;
 
@@ -32,7 +33,8 @@ public:
         VkImage image,
         VkImageLayout oldLayout,
         VkImageLayout newLayout,
-        std::uint32_t layerCount = 1) const;
+        std::uint32_t layerCount = 1,
+        std::uint32_t mipLevels = 1) const;
 
     VkCommandBuffer copyBufferToImage(
         VkBuffer buffer,
@@ -46,6 +48,14 @@ public:
         std::uint32_t width,
         std::uint32_t height,
         std::uint32_t layerCount) const;
+
+    VkCommandBuffer generateMipmaps(
+        VkImage image,
+        VkFormat format,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t layerCount,
+        std::uint32_t mipLevels) const;
 
     void destroyBuffer(Buffer& buffer) const;
     void destroyTexture(Texture& texture) const;

@@ -65,6 +65,8 @@ private:
         std::array<bool, kSubchunksPerChunk> received{};
         std::array<std::vector<BlockVertex>, kSubchunksPerChunk> vertices;
         std::array<std::vector<std::uint32_t>, kSubchunksPerChunk> indices;
+        std::array<std::vector<BlockVertex>, kSubchunksPerChunk> fluidVertices;
+        std::array<std::vector<std::uint32_t>, kSubchunksPerChunk> fluidIndices;
     };
 
     ChunkMesher& chunkMesher_;

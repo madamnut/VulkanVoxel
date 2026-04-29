@@ -1,5 +1,6 @@
 #include "render/VulkanResourceContext.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 void VulkanResourceContext::setDevice(VkPhysicalDevice physicalDevice, VkDevice device)
@@ -61,7 +62,8 @@ void VulkanResourceContext::createImage(
     VkMemoryPropertyFlags properties,
     VkImage& image,
     VkDeviceMemory& imageMemory,
-    std::uint32_t arrayLayers) const
+    std::uint32_t arrayLayers,
+    std::uint32_t mipLevels) const
 {
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -69,7 +71,7 @@ void VulkanResourceContext::createImage(
     imageInfo.extent.width = width;
     imageInfo.extent.height = height;
     imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = 1;
+    imageInfo.mipLevels = mipLevels;
     imageInfo.arrayLayers = arrayLayers;
     imageInfo.format = format;
     imageInfo.tiling = tiling;
@@ -155,7 +157,8 @@ VkCommandBuffer VulkanResourceContext::transitionImageLayout(
     VkImage image,
     VkImageLayout oldLayout,
     VkImageLayout newLayout,
-    std::uint32_t layerCount) const
+    std::uint32_t layerCount,
+    std::uint32_t mipLevels) const
 {
     VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
@@ -168,7 +171,7 @@ VkCommandBuffer VulkanResourceContext::transitionImageLayout(
     barrier.image = image;
     barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.levelCount = mipLevels;
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = layerCount;
 
@@ -208,6 +211,141 @@ VkCommandBuffer VulkanResourceContext::transitionImageLayout(
         commandBuffer,
         sourceStage,
         destinationStage,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &barrier);
+
+    return submitSingleTimeCommands(commandBuffer);
+}
+
+VkCommandBuffer VulkanResourceContext::generateMipmaps(
+    VkImage image,
+    VkFormat format,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t layerCount,
+    std::uint32_t mipLevels) const
+{
+    VkFormatProperties formatProperties{};
+    vkGetPhysicalDeviceFormatProperties(physicalDevice_, format, &formatProperties);
+    if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0 ||
+        (formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0)
+    {
+        throw std::runtime_error("Texture format does not support Vulkan mipmap blitting.");
+    }
+
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    std::uint32_t mipWidth = width;
+    std::uint32_t mipHeight = height;
+    for (std::uint32_t mipLevel = 1; mipLevel < mipLevels; ++mipLevel)
+    {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.image = image;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = layerCount;
+        barrier.subresourceRange.baseMipLevel = mipLevel - 1;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &barrier);
+
+        const std::uint32_t nextMipWidth = std::max(1u, mipWidth / 2u);
+        const std::uint32_t nextMipHeight = std::max(1u, mipHeight / 2u);
+
+        VkImageBlit blit{};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {
+            static_cast<std::int32_t>(mipWidth),
+            static_cast<std::int32_t>(mipHeight),
+            1,
+        };
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = mipLevel - 1;
+        blit.srcSubresource.baseArrayLayer = 0;
+        blit.srcSubresource.layerCount = layerCount;
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {
+            static_cast<std::int32_t>(nextMipWidth),
+            static_cast<std::int32_t>(nextMipHeight),
+            1,
+        };
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.mipLevel = mipLevel;
+        blit.dstSubresource.baseArrayLayer = 0;
+        blit.dstSubresource.layerCount = layerCount;
+
+        vkCmdBlitImage(
+            commandBuffer,
+            image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &blit,
+            VK_FILTER_NEAREST);
+
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &barrier);
+
+        mipWidth = nextMipWidth;
+        mipHeight = nextMipHeight;
+    }
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.image = image;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = layerCount;
+    barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         0,
         0,
         nullptr,

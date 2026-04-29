@@ -35,7 +35,8 @@ private:
         VkFormat format,
         VkImageAspectFlags aspectFlags = VK_IMAGE_ASPECT_COLOR_BIT,
         VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D,
-        std::uint32_t layerCount = 1) const;
+        std::uint32_t layerCount = 1,
+        std::uint32_t mipLevels = 1) const;
 
     VkDevice device_ = VK_NULL_HANDLE;
     VulkanResourceContext* resourceContext_ = nullptr;

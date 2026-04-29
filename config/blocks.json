@@ -3,22 +3,112 @@
     {
       "id": 1,
       "name": "rock",
-      "solid": true
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
     },
     {
       "id": 2,
       "name": "dirt",
-      "solid": true
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
     },
     {
       "id": 3,
       "name": "grass",
-      "solid": true
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
+    },
+    {
+      "id": 4,
+      "name": "trunk",
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
+    },
+    {
+      "id": 5,
+      "name": "leaves",
+      "renderShape": "cube",
+      "renderLayer": "cutout",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": false,
+      "aoOccluder": false
+    },
+    {
+      "id": 6,
+      "name": "clay",
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
+    },
+    {
+      "id": 7,
+      "name": "mud",
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
+    },
+    {
+      "id": 8,
+      "name": "sand",
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
+    },
+    {
+      "id": 9,
+      "name": "sandstone",
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
+    },
+    {
+      "id": 10000,
+      "name": "plant",
+      "renderShape": "cross",
+      "renderLayer": "cutout",
+      "collision": false,
+      "raycast": true,
+      "faceOccluder": false,
+      "aoOccluder": false
     },
     {
       "id": 65535,
       "name": "bedrock",
-      "solid": true
+      "renderShape": "cube",
+      "renderLayer": "opaque",
+      "collision": true,
+      "raycast": true,
+      "faceOccluder": true,
+      "aoOccluder": true
     }
   ]
 }

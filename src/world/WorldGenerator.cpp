@@ -12,6 +12,11 @@
 namespace
 {
 constexpr std::uint32_t kLandformCurvePairCount = 1000;
+constexpr int kPlantSpawnChancePercent = 40;
+constexpr int kTreeDecorationReach = 2;
+constexpr int kTreeSpawnChancePercent = 2;
+constexpr int kTreeMinTrunkHeight = 4;
+constexpr int kTreeTrunkHeightRange = 3;
 
 std::size_t checkedColumnIndex(
     int localPaddedX,
@@ -210,6 +215,24 @@ std::int64_t WorldGenerator::blockKey(int x, int y, int z)
            (static_cast<std::int64_t>(y) & ((1ll << 22) - 1ll));
 }
 
+std::uint64_t WorldGenerator::mixHash(std::uint64_t value)
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    value ^= value >> 31;
+    return value;
+}
+
+std::uint64_t WorldGenerator::treeHash(std::uint64_t seed, int x, int z, std::uint64_t salt)
+{
+    std::uint64_t value = seed ^ salt;
+    value ^= mixHash(static_cast<std::uint32_t>(x));
+    value ^= mixHash(static_cast<std::uint32_t>(z)) + 0x9e3779b97f4a7c15ull + (value << 6) + (value >> 2);
+    return mixHash(value);
+}
+
 int WorldGenerator::terrainHeightAt(int x, int z) const
 {
     std::shared_lock lock(generatorMutex_);
@@ -326,6 +349,8 @@ GeneratedChunkColumn WorldGenerator::generateChunkColumn(ChunkCoord coord) const
     GeneratedChunkColumn column{};
     generateBaseTerrain(coord, column);
     applySurfaceMaterials(column);
+    applyPlantDecorations(coord, column);
+    applyTreeDecorations(coord, column);
     applyBlockOverrides(coord, column);
     return column;
 }
@@ -351,12 +376,22 @@ GeneratedChunkColumn WorldGenerator::generateChunkColumn(
             for (int y = 0; y < kChunkHeight; ++y)
             {
                 const std::size_t sourceIndex = chunkBlockIndex(localX, y, localZ);
+                const std::uint16_t blockId = blockIds[sourceIndex];
+                std::uint8_t fluidId = fluidIds[sourceIndex];
+                std::uint8_t fluidAmount = std::min(fluidAmounts[sourceIndex], kMaxFluidAmount);
+                if (blockId != kAirBlockId ||
+                    fluidId != kWaterFluidId ||
+                    fluidAmount == 0)
+                {
+                    fluidId = kNoFluidId;
+                    fluidAmount = 0;
+                }
                 column.blockAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding) =
-                    blockIds[sourceIndex];
+                    blockId;
                 column.fluidIdAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding) =
-                    fluidIds[sourceIndex];
+                    fluidId;
                 column.fluidAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding) =
-                    fluidIds[sourceIndex] == kNoFluidId ? 0 : std::min(fluidAmounts[sourceIndex], kMaxFluidAmount);
+                    fluidAmount;
             }
         }
     }
@@ -720,6 +755,18 @@ float WorldGenerator::interpolatedDensityAt(const DensityGrid& densityGrid, int 
     return lerp(dy0, dy1, tz);
 }
 
+int WorldGenerator::highestSolidYAt(const DensityGrid& densityGrid, int x, int z) const
+{
+    for (int y = kChunkHeight - 1; y >= 0; --y)
+    {
+        if (interpolatedDensityAt(densityGrid, x, y, z) >= 0.0f)
+        {
+            return y;
+        }
+    }
+    return -1;
+}
+
 void WorldGenerator::applySurfaceMaterials(GeneratedChunkColumn& column) const
 {
     for (int localPaddedZ = 0; localPaddedZ < GeneratedChunkColumn::kDepth; ++localPaddedZ)
@@ -759,6 +806,181 @@ void WorldGenerator::applySurfaceMaterials(GeneratedChunkColumn& column) const
                 bottomBlockId = kBedrockBlockId;
             }
         }
+    }
+}
+
+void WorldGenerator::applyPlantDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const
+{
+    const int minX = coord.x * kChunkSizeX - GeneratedChunkColumn::kPadding;
+    const int minZ = coord.z * kChunkSizeZ - GeneratedChunkColumn::kPadding;
+
+    for (int localPaddedZ = 0; localPaddedZ < GeneratedChunkColumn::kDepth; ++localPaddedZ)
+    {
+        const int z = minZ + localPaddedZ;
+        for (int localPaddedX = 0; localPaddedX < GeneratedChunkColumn::kWidth; ++localPaddedX)
+        {
+            const int x = minX + localPaddedX;
+            for (int y = kChunkHeight - 1; y >= 0; --y)
+            {
+                if (column.blockAt(localPaddedX, y, localPaddedZ) == kAirBlockId)
+                {
+                    continue;
+                }
+
+                if (column.blockAt(localPaddedX, y, localPaddedZ) != kGrassBlockId ||
+                    y + 1 >= kChunkHeight ||
+                    column.blockAt(localPaddedX, y + 1, localPaddedZ) != kAirBlockId ||
+                    column.fluidIdAt(localPaddedX, y + 1, localPaddedZ) != kNoFluidId ||
+                    column.fluidAt(localPaddedX, y + 1, localPaddedZ) != 0)
+                {
+                    break;
+                }
+
+                if (treeHash(seed_, x, z, 0x1f8215d5919b6c7dull) % 100 < kPlantSpawnChancePercent)
+                {
+                    column.blockAt(localPaddedX, y + 1, localPaddedZ) = kPlantBlockId;
+                }
+                break;
+            }
+        }
+    }
+}
+
+void WorldGenerator::applyTreeDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const
+{
+    const int chunkBaseX = coord.x * kChunkSizeX;
+    const int chunkBaseZ = coord.z * kChunkSizeZ;
+    const int columnMinX = chunkBaseX - GeneratedChunkColumn::kPadding;
+    const int columnMaxX = chunkBaseX + kChunkSizeX - 1 + GeneratedChunkColumn::kPadding;
+    const int columnMinZ = chunkBaseZ - GeneratedChunkColumn::kPadding;
+    const int columnMaxZ = chunkBaseZ + kChunkSizeZ - 1 + GeneratedChunkColumn::kPadding;
+    const int candidateMinX = columnMinX - kTreeDecorationReach;
+    const int candidateMaxX = columnMaxX + kTreeDecorationReach;
+    const int candidateMinZ = columnMinZ - kTreeDecorationReach;
+    const int candidateMaxZ = columnMaxZ + kTreeDecorationReach;
+    const DensityGrid densityGrid = buildDensityGrid(candidateMinX, candidateMaxX, candidateMinZ, candidateMaxZ);
+
+    for (int z = candidateMinZ; z <= candidateMaxZ; ++z)
+    {
+        for (int x = candidateMinX; x <= candidateMaxX; ++x)
+        {
+            const int highestSolidY = highestSolidYAt(densityGrid, x, z);
+            if (highestSolidY < 0 || highestSolidY + 1 <= kInitialWaterLevel)
+            {
+                continue;
+            }
+
+            if (treeHash(seed_, x, z, 0x54b8d7c35f31a21bull) % 100 >= kTreeSpawnChancePercent)
+            {
+                continue;
+            }
+
+            placeTreeInColumn(column, columnMinX, columnMinZ, x, highestSolidY, z);
+        }
+    }
+}
+
+void WorldGenerator::placeTreeInColumn(
+    GeneratedChunkColumn& column,
+    int minX,
+    int minZ,
+    int baseX,
+    int baseY,
+    int baseZ) const
+{
+    const int trunkHeight = kTreeMinTrunkHeight +
+        static_cast<int>(treeHash(seed_, baseX, baseZ, 0x9cd03f1f3f973f01ull) % kTreeTrunkHeightRange);
+    const int leafCenterY = baseY + trunkHeight;
+    if (leafCenterY + 1 >= kChunkHeight)
+    {
+        return;
+    }
+
+    auto placeLeaf = [&](int x, int y, int z)
+    {
+        if (y < 0 || y >= kChunkHeight)
+        {
+            return;
+        }
+
+        const int localPaddedX = x - minX;
+        const int localPaddedZ = z - minZ;
+        if (localPaddedX < 0 || localPaddedX >= GeneratedChunkColumn::kWidth ||
+            localPaddedZ < 0 || localPaddedZ >= GeneratedChunkColumn::kDepth)
+        {
+            return;
+        }
+        const std::uint16_t blockId = column.blockAt(localPaddedX, y, localPaddedZ);
+        if ((blockId != kAirBlockId && blockId != kPlantBlockId) ||
+            column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId ||
+            column.fluidAt(localPaddedX, y, localPaddedZ) != 0)
+        {
+            return;
+        }
+
+        column.blockAt(localPaddedX, y, localPaddedZ) = kLeavesBlockId;
+    };
+
+    auto placeTrunk = [&](int x, int y, int z)
+    {
+        if (y < 0 || y >= kChunkHeight)
+        {
+            return;
+        }
+
+        const int localPaddedX = x - minX;
+        const int localPaddedZ = z - minZ;
+        if (localPaddedX < 0 || localPaddedX >= GeneratedChunkColumn::kWidth ||
+            localPaddedZ < 0 || localPaddedZ >= GeneratedChunkColumn::kDepth)
+        {
+            return;
+        }
+
+        const std::uint16_t blockId = column.blockAt(localPaddedX, y, localPaddedZ);
+        if (blockId != kAirBlockId &&
+            blockId != kPlantBlockId &&
+            blockId != kLeavesBlockId &&
+            blockId != kTrunkBlockId)
+        {
+            return;
+        }
+        if (column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId ||
+            column.fluidAt(localPaddedX, y, localPaddedZ) != 0)
+        {
+            return;
+        }
+
+        column.blockAt(localPaddedX, y, localPaddedZ) = kTrunkBlockId;
+    };
+
+    for (int layer = -2; layer <= 1; ++layer)
+    {
+        const int radius = layer == 1 ? 1 : 2;
+        const int y = leafCenterY + layer;
+        for (int dz = -radius; dz <= radius; ++dz)
+        {
+            for (int dx = -radius; dx <= radius; ++dx)
+            {
+                if (std::abs(dx) + std::abs(dz) > radius + 1)
+                {
+                    continue;
+                }
+                if (radius == 2 &&
+                    std::abs(dx) == radius &&
+                    std::abs(dz) == radius &&
+                    treeHash(seed_, baseX + dx, baseZ + dz, static_cast<std::uint64_t>(y)) % 100 < 45)
+                {
+                    continue;
+                }
+
+                placeLeaf(baseX + dx, y, baseZ + dz);
+            }
+        }
+    }
+
+    for (int offsetY = 1; offsetY <= trunkHeight; ++offsetY)
+    {
+        placeTrunk(baseX, baseY + offsetY, baseZ);
     }
 }
 

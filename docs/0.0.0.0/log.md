@@ -2,8 +2,26 @@
 
 ## 2026-04-30
 
+- 월드 생성 장식 단계에 plant 배치를 추가했다. 표면 재질 적용 후 나무 생성 전에 최상단 블럭이 grass인 칸마다 seed 기반 40% 확률로 바로 위 air 칸에 `plant`를 배치한다. 이후 나무 생성 시 trunk와 leaves는 plant를 덮어쓸 수 있다.
+
+- block 정의 형식을 `renderShape`, `renderLayer`, `collision`, `raycast`, `faceOccluder`, `aoOccluder`로 분리했다. 기존 `solid`는 구버전 config fallback으로만 남기고, 충돌/레이캐스트/메시 가림/AO 판정은 각각 별도 속성을 사용한다.
+- `plant`는 `renderShape: cross`, `renderLayer: cutout`, `collision: false`, `raycast: true`, `faceOccluder: false`, `aoOccluder: false`로 설정했다. 메셔는 cross shape 블럭을 양면 십자 평면으로 생성한다.
+
+- block 정의에 `clay` id 6, `mud` id 7, `sand` id 8, `sandstone` id 9, `plant` id 10000을 추가했다. sandstone은 기존 top/bottom 텍스처 규칙에 따라 `sandstone_topbottom.png`와 `sandstone_side.png`를 사용한다.
+
+- leaves 텍스처를 alpha cutoff로 처리하도록 block fragment shader에 discard를 추가했다. 메시 생성에서는 leaves를 주변 블럭 면을 가리지 않는 solid로 다뤄 trunk/rock/dirt 면이 leaves와 맞닿아도 생성되게 하고, leaves끼리 맞닿은 내부 면은 계속 생략한다.
+
+- `trunk`와 `leaves` 블럭 정의를 추가했다. `trunk`는 id 4, `leaves`는 id 5를 사용하며, trunk top/bottom 텍스처는 `trunk_topbottom.png`를 인식하도록 block texture resolver를 보완했다.
+- 표면 재질 적용 이후 decoration 단계에서 오크형 나무를 생성하도록 했다. 최상단 grass 좌표마다 seed 기반 2% 확률로 후보가 되며, trunk 높이는 4~6, leaves 반경은 2를 사용한다. leaves는 기존 블럭/유체를 덮어쓰지 않고, trunk는 air/leaves/trunk 위치에만 배치되어 leaves를 덮어쓸 수 있다.
+
 - 유체 데이터를 `fluidId + fluidAmount` 구조로 분리했다. `fluidId == 0`은 유체 없음, `fluidId == 1`은 water이며, 청크 저장 RLE 단위는 `blockId + fluidId + fluidAmount + count`로 확장했다.
 - 청크 build worker에서 발생한 예외를 잡아 청크 좌표와 함께 로그에 남기도록 했다. worker thread에서 동시에 로그를 기록할 수 있으므로 `Logger` 쓰기 경로를 mutex로 보호했다.
+- 현재 save payload는 `blockId + fluidId + fluidAmount + count` RLE만 허용하도록 로드 검증을 강화했다. 알 수 없는 fluid id, 빈 run, trailing byte가 있으면 저장 청크를 버리고 재생성하며, solid 셀에 남은 유체 데이터는 저장/로드 경로에서 제거한다.
+- 블럭/유체 texture array에 mipmap 생성을 추가했다. 업로드 후 각 array layer의 mip chain을 `vkCmdBlitImage`와 `VK_FILTER_NEAREST`로 만들고, sampler는 `VK_SAMPLER_MIPMAP_MODE_NEAREST`를 사용한다.
+- 블럭/유체 sampler의 mip LOD bias를 `-0.5`로 설정해 더 먼 거리까지 한 단계 선명한 mip을 사용하도록 했다.
+- 물 텍스처 알파를 180으로 낮추고 fluid pipeline alpha blending을 켜서 water가 반투명하게 보이도록 했다.
+- 고체 블럭 메쉬와 유체 메쉬를 분리했다. 고체는 depth write가 켜진 opaque pipeline으로 먼저 그리고, 물은 alpha blend가 켜지고 depth write가 꺼진 fluid pipeline으로 나중에 그려 청크 경계에서 투명 물이 서로 가리는 문제를 줄였다.
+- 청크 메쉬 생성 시 padding 영역에 현재 로드된 이웃 청크 데이터를 덮어쓰도록 했다. 청크 경계에서 블럭을 편집할 때 이웃 청크 리메시가 생성기 기본 지형이 아니라 실제 편집된 경계 데이터를 기준으로 면을 만들도록 하기 위함이다.
 
 - 정적 물 유체를 추가했다. 각 청크 셀은 `blockId`와 별도 `fluidAmount`를 함께 가지며, 현재 단계에서는 `fluidAmount > 0`을 water로 해석한다.
 - 유체 최대량은 100으로 유지했다. 저장 타입은 `uint8_t`를 사용하고, 렌더 높이는 amount 10당 0.09씩 변하는 `amount / 100 * 0.9` 규칙을 따른다.

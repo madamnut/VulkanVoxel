@@ -57,9 +57,24 @@ const BlockDefinition* ChunkMesher::blockDefinitionForId(std::uint16_t blockId) 
     return blockRegistry_.definitionForId(blockId);
 }
 
-bool ChunkMesher::isSolidBlock(std::uint16_t blockId) const
+bool ChunkMesher::isCollisionBlock(std::uint16_t blockId) const
 {
-    return blockRegistry_.isSolid(blockId);
+    return blockRegistry_.isCollision(blockId);
+}
+
+bool ChunkMesher::isCubeBlock(std::uint16_t blockId) const
+{
+    return blockRegistry_.renderShape(blockId) == BlockRenderShape::Cube;
+}
+
+bool ChunkMesher::isFaceOccluderBlock(std::uint16_t blockId) const
+{
+    return blockRegistry_.isFaceOccluder(blockId);
+}
+
+bool ChunkMesher::isAoOccluderBlock(std::uint16_t blockId) const
+{
+    return blockRegistry_.isAoOccluder(blockId);
 }
 
 std::uint32_t ChunkMesher::textureLayerForBlockFace(std::uint16_t blockId, BlockFace face) const
@@ -109,6 +124,7 @@ ChunkBuildResult ChunkMesher::buildChunkMesh(
     ChunkBuildResult result{};
     result.coord = coord;
     result.subchunks.reserve(kSubchunksPerChunk);
+    result.fluidSubchunks.reserve(kSubchunksPerChunk);
 
     for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
     {
@@ -120,23 +136,48 @@ ChunkBuildResult ChunkMesher::buildChunkMesh(
                 generation,
             },
             column);
-        if (subchunk.indices.empty())
+        if (subchunk.indices.empty() && subchunk.fluidIndices.empty())
         {
             continue;
         }
 
-        SubchunkDraw draw{};
-        draw.chunkX = coord.x;
-        draw.chunkZ = coord.z;
-        draw.subchunkY = subchunkY;
-        draw.range.vertexCount = static_cast<std::uint32_t>(subchunk.vertices.size());
-        draw.range.firstIndex = static_cast<std::uint32_t>(result.indices.size());
-        draw.range.indexCount = static_cast<std::uint32_t>(subchunk.indices.size());
-        draw.range.vertexOffset = static_cast<std::int32_t>(result.vertices.size());
+        if (!subchunk.indices.empty())
+        {
+            SubchunkDraw draw{};
+            draw.chunkX = coord.x;
+            draw.chunkZ = coord.z;
+            draw.subchunkY = subchunkY;
+            draw.range.vertexCount = static_cast<std::uint32_t>(subchunk.vertices.size());
+            draw.range.firstIndex = static_cast<std::uint32_t>(result.indices.size());
+            draw.range.indexCount = static_cast<std::uint32_t>(subchunk.indices.size());
+            draw.range.vertexOffset = static_cast<std::int32_t>(result.vertices.size());
 
-        result.vertices.insert(result.vertices.end(), subchunk.vertices.begin(), subchunk.vertices.end());
-        result.indices.insert(result.indices.end(), subchunk.indices.begin(), subchunk.indices.end());
-        result.subchunks.push_back(draw);
+            result.vertices.insert(result.vertices.end(), subchunk.vertices.begin(), subchunk.vertices.end());
+            result.indices.insert(result.indices.end(), subchunk.indices.begin(), subchunk.indices.end());
+            result.subchunks.push_back(draw);
+        }
+
+        if (!subchunk.fluidIndices.empty())
+        {
+            SubchunkDraw draw{};
+            draw.chunkX = coord.x;
+            draw.chunkZ = coord.z;
+            draw.subchunkY = subchunkY;
+            draw.range.vertexCount = static_cast<std::uint32_t>(subchunk.fluidVertices.size());
+            draw.range.firstIndex = static_cast<std::uint32_t>(result.fluidIndices.size());
+            draw.range.indexCount = static_cast<std::uint32_t>(subchunk.fluidIndices.size());
+            draw.range.vertexOffset = static_cast<std::int32_t>(result.fluidVertices.size());
+
+            result.fluidVertices.insert(
+                result.fluidVertices.end(),
+                subchunk.fluidVertices.begin(),
+                subchunk.fluidVertices.end());
+            result.fluidIndices.insert(
+                result.fluidIndices.end(),
+                subchunk.fluidIndices.begin(),
+                subchunk.fluidIndices.end());
+            result.fluidSubchunks.push_back(draw);
+        }
     }
 
     return result;
@@ -149,10 +190,12 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
         const ChunkCoord chunk = request.coord;
         std::array<std::vector<BlockVertex>, kSubchunkSize> verticesByLocalY;
         std::array<std::vector<std::uint32_t>, kSubchunkSize> indicesByLocalY;
+        std::array<std::vector<BlockVertex>, kSubchunkSize> fluidVerticesByLocalY;
+        std::array<std::vector<std::uint32_t>, kSubchunkSize> fluidIndicesByLocalY;
         std::vector<BlockVertex> subchunkVertices;
         std::vector<std::uint32_t> subchunkIndices;
-        std::vector<SubchunkDraw> subchunkDraws;
-        subchunkDraws.reserve(1);
+        std::vector<BlockVertex> subchunkFluidVertices;
+        std::vector<std::uint32_t> subchunkFluidIndices;
 
         const int chunkX = chunk.x;
         const int chunkZ = chunk.z;
@@ -161,7 +204,7 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
         const int chunkBaseZ = chunkZ * kChunkSizeZ;
         const int subchunkMinY = subchunkY * kSubchunkSize;
 
-        int nonAirBlockCount = 0;
+        int occupiedCellCount = 0;
         for (int localPaddedZ = 1; localPaddedZ <= kChunkSizeZ; ++localPaddedZ)
         {
             for (int localPaddedX = 1; localPaddedX <= kChunkSizeX; ++localPaddedX)
@@ -173,13 +216,13 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                         (column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId &&
                             column.fluidAt(localPaddedX, y, localPaddedZ) > 0))
                     {
-                        ++nonAirBlockCount;
+                        ++occupiedCellCount;
                     }
                 }
             }
         }
 
-        if (nonAirBlockCount == 0)
+        if (occupiedCellCount == 0)
         {
             return {
                 chunk,
@@ -194,7 +237,7 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
         {
             const int localPaddedX = x - chunkBaseX + 1;
             const int localPaddedZ = z - chunkBaseZ + 1;
-            return isSolidBlock(column.blockAt(localPaddedX, y, localPaddedZ));
+            return isCollisionBlock(column.blockAt(localPaddedX, y, localPaddedZ));
         };
 
         auto blockIdAt = [&](int x, int y, int z) -> std::uint16_t
@@ -202,6 +245,26 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             const int localPaddedX = x - chunkBaseX + 1;
             const int localPaddedZ = z - chunkBaseZ + 1;
             return column.blockAt(localPaddedX, y, localPaddedZ);
+        };
+
+        auto isAoOccluder = [&](int x, int y, int z) -> bool
+        {
+            return isAoOccluderBlock(blockIdAt(x, y, z));
+        };
+
+        auto shouldEmitBlockFace = [&](std::uint16_t sourceBlockId, std::uint16_t neighborBlockId) -> bool
+        {
+            if (!isCubeBlock(sourceBlockId))
+            {
+                return false;
+            }
+
+            if (sourceBlockId == neighborBlockId && isCubeBlock(neighborBlockId))
+            {
+                return false;
+            }
+
+            return !isFaceOccluderBlock(neighborBlockId);
         };
 
         auto fluidAmountAt = [&](int x, int y, int z) -> std::uint8_t
@@ -282,14 +345,16 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
         };
 
         auto addFace = [&](
+            std::array<std::vector<BlockVertex>, kSubchunkSize>& targetVerticesByLocalY,
+            std::array<std::vector<std::uint32_t>, kSubchunkSize>& targetIndicesByLocalY,
             int subchunkLocalY,
             std::array<Vec3, 4> corners,
             std::array<std::array<float, 2>, 4> uvs,
             std::uint32_t textureLayer,
             std::array<std::uint8_t, 4> ao)
         {
-            std::vector<BlockVertex>& vertices = verticesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
-            std::vector<std::uint32_t>& indices = indicesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
+            std::vector<BlockVertex>& vertices = targetVerticesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
+            std::vector<std::uint32_t>& indices = targetIndicesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
             const std::uint32_t baseIndex = static_cast<std::uint32_t>(vertices.size());
             const float layer = static_cast<float>(textureLayer);
             vertices.push_back({{corners[0].x, corners[0].y, corners[0].z}, {uvs[0][0], uvs[0][1]}, aoFactor(ao[0]), layer});
@@ -312,6 +377,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             float height)
         {
             addFace(
+                fluidVerticesByLocalY,
+                fluidIndicesByLocalY,
                 subchunkLocalY,
                 corners,
                 {{
@@ -330,9 +397,9 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             int cornerX, int cornerY, int cornerZ) -> std::uint8_t
         {
             return vertexAo(
-                isSolid(side1X, side1Y, side1Z),
-                isSolid(side2X, side2Y, side2Z),
-                isSolid(cornerX, cornerY, cornerZ));
+                isAoOccluder(side1X, side1Y, side1Z),
+                isAoOccluder(side2X, side2Y, side2Z),
+                isAoOccluder(cornerX, cornerY, cornerZ));
         };
 
         auto topFaceAo = [&](int x, int z, int faceY) -> std::array<std::uint8_t, 4>
@@ -416,6 +483,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             const float zEnd = static_cast<float>(z + depth);
             const float y = static_cast<float>(faceY);
             addFace(
+                verticesByLocalY,
+                indicesByLocalY,
                 subchunkLocalY,
                 {{
                     {fx, y, fz},
@@ -449,6 +518,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             const float zEnd = static_cast<float>(z + depth);
             const float y = static_cast<float>(faceY);
             addFace(
+                verticesByLocalY,
+                indicesByLocalY,
                 subchunkLocalY,
                 {{
                     {fx, y, zEnd},
@@ -475,6 +546,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             std::array<std::uint8_t, 4> ao)
         {
             addFace(
+                verticesByLocalY,
+                indicesByLocalY,
                 subchunkLocalY,
                 corners,
                 {{
@@ -487,11 +560,62 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 ao);
         };
 
+        auto addCrossBlock = [&](int subchunkLocalY, int x, int y, int z, std::uint32_t textureLayer)
+        {
+            const float fx = static_cast<float>(x);
+            const float fy = static_cast<float>(y);
+            const float fz = static_cast<float>(z);
+            const float xEnd = static_cast<float>(x + 1);
+            const float yEnd = static_cast<float>(y + 1);
+            const float zEnd = static_cast<float>(z + 1);
+            constexpr std::array<std::uint8_t, 4> fullAo{{3, 3, 3, 3}};
+            constexpr std::array<std::array<float, 2>, 4> uvs{{
+                {{1.0f, 1.0f}},
+                {{1.0f, 0.0f}},
+                {{0.0f, 0.0f}},
+                {{0.0f, 1.0f}},
+            }};
+
+            auto addDoubleSidedFace = [&](std::array<Vec3, 4> corners)
+            {
+                addFace(verticesByLocalY, indicesByLocalY, subchunkLocalY, corners, uvs, textureLayer, fullAo);
+                addFace(
+                    verticesByLocalY,
+                    indicesByLocalY,
+                    subchunkLocalY,
+                    {{corners[3], corners[2], corners[1], corners[0]}},
+                    uvs,
+                    textureLayer,
+                    fullAo);
+            };
+
+            addDoubleSidedFace({{
+                {fx, fy, fz},
+                {fx, yEnd, fz},
+                {xEnd, yEnd, zEnd},
+                {xEnd, fy, zEnd},
+            }});
+            addDoubleSidedFace({{
+                {xEnd, fy, fz},
+                {xEnd, yEnd, fz},
+                {fx, yEnd, zEnd},
+                {fx, fy, zEnd},
+            }});
+        };
+
         for (auto& vertices : verticesByLocalY)
         {
             vertices.clear();
         }
         for (auto& indices : indicesByLocalY)
+        {
+            indices.clear();
+        }
+        for (auto& vertices : fluidVerticesByLocalY)
+        {
+            vertices.clear();
+        }
+        for (auto& indices : fluidIndicesByLocalY)
         {
             indices.clear();
         }
@@ -506,13 +630,14 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     {
                         const int x = chunkBaseX + localX;
                         const int z = chunkBaseZ + localZ;
-                        if (!(isSolid(x, faceY - 1, z) && !isSolid(x, faceY, z)))
+                        const std::uint16_t sourceBlockId = blockIdAt(x, faceY - 1, z);
+                        if (!shouldEmitBlockFace(sourceBlockId, blockIdAt(x, faceY, z)))
                         {
                             return {};
                         }
                         return {
                             true,
-                            textureLayerForBlockFace(blockIdAt(x, faceY - 1, z), BlockFace::Top),
+                            textureLayerForBlockFace(sourceBlockId, BlockFace::Top),
                             topFaceAo(x, z, faceY),
                         };
                     },
@@ -537,13 +662,14 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     {
                         const int x = chunkBaseX + localX;
                         const int z = chunkBaseZ + localZ;
-                        if (!(isSolid(x, bottomFaceY, z) && !isSolid(x, bottomFaceY - 1, z)))
+                        const std::uint16_t sourceBlockId = blockIdAt(x, bottomFaceY, z);
+                        if (!shouldEmitBlockFace(sourceBlockId, blockIdAt(x, bottomFaceY - 1, z)))
                         {
                             return {};
                         }
                         return {
                             true,
-                            textureLayerForBlockFace(blockIdAt(x, bottomFaceY, z), BlockFace::Bottom),
+                            textureLayerForBlockFace(sourceBlockId, BlockFace::Bottom),
                             bottomFaceAo(x, z, bottomFaceY),
                         };
                     },
@@ -572,13 +698,14 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     {
                         const int z = chunkBaseZ + localZ;
                         const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x + 1, y, z)))
+                        const std::uint16_t sourceBlockId = blockIdAt(x, y, z);
+                        if (!shouldEmitBlockFace(sourceBlockId, blockIdAt(x + 1, y, z)))
                         {
                             return {};
                         }
                         return {
                             true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
+                            textureLayerForBlockFace(sourceBlockId, BlockFace::Side),
                             positiveXFaceAo(x, y, z),
                         };
                     },
@@ -610,13 +737,14 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     {
                         const int z = chunkBaseZ + localZ;
                         const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x - 1, y, z)))
+                        const std::uint16_t sourceBlockId = blockIdAt(x, y, z);
+                        if (!shouldEmitBlockFace(sourceBlockId, blockIdAt(x - 1, y, z)))
                         {
                             return {};
                         }
                         return {
                             true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
+                            textureLayerForBlockFace(sourceBlockId, BlockFace::Side),
                             negativeXFaceAo(x, y, z),
                         };
                     },
@@ -652,13 +780,14 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     {
                         const int x = chunkBaseX + localX;
                         const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x, y, z + 1)))
+                        const std::uint16_t sourceBlockId = blockIdAt(x, y, z);
+                        if (!shouldEmitBlockFace(sourceBlockId, blockIdAt(x, y, z + 1)))
                         {
                             return {};
                         }
                         return {
                             true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
+                            textureLayerForBlockFace(sourceBlockId, BlockFace::Side),
                             positiveZFaceAo(x, y, z),
                         };
                     },
@@ -690,13 +819,14 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     {
                         const int x = chunkBaseX + localX;
                         const int y = subchunkMinY + localY;
-                        if (!(isSolid(x, y, z) && !isSolid(x, y, z - 1)))
+                        const std::uint16_t sourceBlockId = blockIdAt(x, y, z);
+                        if (!shouldEmitBlockFace(sourceBlockId, blockIdAt(x, y, z - 1)))
                         {
                             return {};
                         }
                         return {
                             true,
-                            textureLayerForBlockFace(blockIdAt(x, y, z), BlockFace::Side),
+                            textureLayerForBlockFace(sourceBlockId, BlockFace::Side),
                             negativeZFaceAo(x, y, z),
                         };
                     },
@@ -719,6 +849,31 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                         cell.textureLayer,
                         cell.ao);
                     });
+            }
+
+            for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
+            {
+                const int z = chunkBaseZ + localZ;
+                for (int localX = 0; localX < kChunkSizeX; ++localX)
+                {
+                    const int x = chunkBaseX + localX;
+                    for (int localY = 0; localY < kSubchunkSize; ++localY)
+                    {
+                        const int y = subchunkMinY + localY;
+                        const std::uint16_t blockId = blockIdAt(x, y, z);
+                        if (blockRegistry_.renderShape(blockId) != BlockRenderShape::Cross)
+                        {
+                            continue;
+                        }
+
+                        addCrossBlock(
+                            localY,
+                            x,
+                            y,
+                            z,
+                            textureLayerForBlockFace(blockId, BlockFace::Side));
+                    }
+                }
             }
 
             auto fluidTop = [&](int x, int y, int z, std::uint8_t fluidId, std::uint8_t amount) -> float
@@ -856,14 +1011,15 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             }
 
         appendSubchunkMesh(
-            chunkX,
-            chunkZ,
-            subchunkY,
             verticesByLocalY,
             indicesByLocalY,
             subchunkVertices,
-            subchunkIndices,
-            subchunkDraws);
+            subchunkIndices);
+        appendSubchunkMesh(
+            fluidVerticesByLocalY,
+            fluidIndicesByLocalY,
+            subchunkFluidVertices,
+            subchunkFluidIndices);
 
         return {
             chunk,
@@ -871,24 +1027,20 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             request.generation,
             std::move(subchunkVertices),
             std::move(subchunkIndices),
+            std::move(subchunkFluidVertices),
+            std::move(subchunkFluidIndices),
         };
     }
 
 void ChunkMesher::appendSubchunkMesh(
-        int chunkX,
-        int chunkZ,
-        int subchunkY,
         const std::array<std::vector<BlockVertex>, kSubchunkSize>& verticesByLocalY,
         const std::array<std::vector<std::uint32_t>, kSubchunkSize>& indicesByLocalY,
         std::vector<BlockVertex>& chunkVertices,
-        std::vector<std::uint32_t>& chunkIndices,
-        std::vector<SubchunkDraw>& subchunkDraws) const
+        std::vector<std::uint32_t>& chunkIndices) const
 {
-        std::size_t vertexCount = 0;
         std::size_t indexCount = 0;
         for (int localY = 0; localY < kSubchunkSize; ++localY)
         {
-            vertexCount += verticesByLocalY[static_cast<std::size_t>(localY)].size();
             indexCount += indicesByLocalY[static_cast<std::size_t>(localY)].size();
         }
 
@@ -897,8 +1049,6 @@ void ChunkMesher::appendSubchunkMesh(
             return;
         }
 
-        const std::uint32_t vertexOffset = static_cast<std::uint32_t>(chunkVertices.size());
-        const std::uint32_t firstIndex = static_cast<std::uint32_t>(chunkIndices.size());
         std::uint32_t subchunkVertexCount = 0;
 
         for (int localY = 0; localY < kSubchunkSize; ++localY)
@@ -914,16 +1064,6 @@ void ChunkMesher::appendSubchunkMesh(
             }
             subchunkVertexCount += static_cast<std::uint32_t>(sourceVertices.size());
         }
-
-        SubchunkDraw draw{};
-        draw.chunkX = chunkX;
-        draw.chunkZ = chunkZ;
-        draw.subchunkY = subchunkY;
-        draw.range.vertexCount = static_cast<std::uint32_t>(vertexCount);
-        draw.range.firstIndex = firstIndex;
-        draw.range.indexCount = static_cast<std::uint32_t>(indexCount);
-        draw.range.vertexOffset = static_cast<std::int32_t>(vertexOffset);
-        subchunkDraws.push_back(draw);
     }
 
 

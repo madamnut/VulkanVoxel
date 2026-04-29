@@ -14,6 +14,7 @@ struct Texture
     VkFormat format = VK_FORMAT_UNDEFINED;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    std::uint32_t mipLevels = 1;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 

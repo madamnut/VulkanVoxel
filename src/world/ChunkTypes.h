@@ -88,6 +88,8 @@ struct SubchunkBuildResult
     std::uint64_t generation = 0;
     std::vector<BlockVertex> vertices;
     std::vector<std::uint32_t> indices;
+    std::vector<BlockVertex> fluidVertices;
+    std::vector<std::uint32_t> fluidIndices;
 };
 
 struct ChunkBuildResult
@@ -96,6 +98,9 @@ struct ChunkBuildResult
     std::vector<BlockVertex> vertices;
     std::vector<std::uint32_t> indices;
     std::vector<SubchunkDraw> subchunks;
+    std::vector<BlockVertex> fluidVertices;
+    std::vector<std::uint32_t> fluidIndices;
+    std::vector<SubchunkDraw> fluidSubchunks;
     std::vector<std::uint16_t> blockIds;
     std::vector<std::uint8_t> fluidIds;
     std::vector<std::uint8_t> fluidAmounts;

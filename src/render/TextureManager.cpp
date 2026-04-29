@@ -1,8 +1,24 @@
 #include "render/TextureManager.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
+
+namespace
+{
+std::uint32_t mipLevelsForSize(std::uint32_t width, std::uint32_t height)
+{
+    std::uint32_t levels = 1;
+    std::uint32_t size = std::max(width, height);
+    while (size > 1)
+    {
+        size /= 2;
+        ++levels;
+    }
+    return levels;
+}
+}
 
 void TextureManager::setContext(VkDevice device, VulkanResourceContext& resourceContext)
 {
@@ -48,6 +64,7 @@ TextureUpload TextureManager::createTextureFromPixels(
     upload.texture.format = format;
     upload.texture.width = width;
     upload.texture.height = height;
+    upload.texture.mipLevels = 1;
     resourceContext_->createImage(
         width,
         height,
@@ -114,41 +131,47 @@ TextureUpload TextureManager::createTextureArrayFromPixels(const std::vector<Ima
     upload.texture.format = format;
     upload.texture.width = width;
     upload.texture.height = height;
+    upload.texture.mipLevels = mipLevelsForSize(width, height);
     const std::uint32_t layerCount = static_cast<std::uint32_t>(layers.size());
     resourceContext_->createImage(
         width,
         height,
         format,
         VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         upload.texture.image,
         upload.texture.memory,
-        layerCount);
+        layerCount,
+        upload.texture.mipLevels);
 
     upload.commandBuffers.push_back(resourceContext_->transitionImageLayout(
         upload.texture.image,
         VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        layerCount));
+        layerCount,
+        upload.texture.mipLevels));
     upload.commandBuffers.push_back(resourceContext_->copyBufferToImageArray(
         upload.stagingBuffer.buffer,
         upload.texture.image,
         width,
         height,
         layerCount));
-    upload.commandBuffers.push_back(resourceContext_->transitionImageLayout(
+    upload.commandBuffers.push_back(resourceContext_->generateMipmaps(
         upload.texture.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        layerCount));
+        format,
+        width,
+        height,
+        layerCount,
+        upload.texture.mipLevels));
 
     upload.texture.view = createImageView(
         upload.texture.image,
         format,
         VK_IMAGE_ASPECT_COLOR_BIT,
         VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        layerCount);
+        layerCount,
+        upload.texture.mipLevels);
     upload.texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     return upload;
 }
@@ -192,7 +215,8 @@ VkImageView TextureManager::createImageView(
     VkFormat format,
     VkImageAspectFlags aspectFlags,
     VkImageViewType viewType,
-    std::uint32_t layerCount) const
+    std::uint32_t layerCount,
+    std::uint32_t mipLevels) const
 {
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -201,7 +225,7 @@ VkImageView TextureManager::createImageView(
     viewInfo.format = format;
     viewInfo.subresourceRange.aspectMask = aspectFlags;
     viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.levelCount = mipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = layerCount;
 

@@ -141,6 +141,8 @@ private:
     };
 
     static std::int64_t blockKey(int x, int y, int z);
+    static std::uint64_t mixHash(std::uint64_t value);
+    static std::uint64_t treeHash(std::uint64_t seed, int x, int z, std::uint64_t salt);
     static int floorDiv(int value, int divisor);
     static int floorMod(int value, int divisor);
     static float lerp(float a, float b, float t);
@@ -150,8 +152,18 @@ private:
     float sampleDensityLattice(int cellX, int cellY, int cellZ) const;
     DensityGrid buildDensityGrid(int minBlockX, int maxBlockX, int minBlockZ, int maxBlockZ) const;
     float interpolatedDensityAt(const DensityGrid& densityGrid, int x, int y, int z) const;
+    int highestSolidYAt(const DensityGrid& densityGrid, int x, int z) const;
     void generateBaseTerrain(ChunkCoord coord, GeneratedChunkColumn& column) const;
     void applySurfaceMaterials(GeneratedChunkColumn& column) const;
+    void applyPlantDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const;
+    void applyTreeDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const;
+    void placeTreeInColumn(
+        GeneratedChunkColumn& column,
+        int minX,
+        int minZ,
+        int baseX,
+        int baseY,
+        int baseZ) const;
     void applyBlockOverrides(ChunkCoord coord, GeneratedChunkColumn& column) const;
 
     std::uint64_t seed_ = 0;

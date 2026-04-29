@@ -80,17 +80,24 @@ struct ChunkMesh
 {
     Buffer vertexBuffer;
     Buffer indexBuffer;
+    Buffer fluidVertexBuffer;
+    Buffer fluidIndexBuffer;
     std::uint32_t vertexCount = 0;
     std::uint32_t indexCount = 0;
+    std::uint32_t fluidVertexCount = 0;
+    std::uint32_t fluidIndexCount = 0;
     int chunkX = 0;
     int chunkZ = 0;
     std::vector<SubchunkDraw> subchunks;
+    std::vector<SubchunkDraw> fluidSubchunks;
 };
 
 struct DeferredChunkBufferDestroy
 {
     Buffer vertexBuffer;
     Buffer indexBuffer;
+    Buffer fluidVertexBuffer;
+    Buffer fluidIndexBuffer;
     std::uint64_t retireFrame = 0;
 };
 
@@ -321,11 +328,13 @@ private:
     VkDescriptorSetLayout debugTextDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout blockPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout fluidPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout playerPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout selectionPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout debugTextPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
     VkPipeline blockPipeline_ = VK_NULL_HANDLE;
+    VkPipeline fluidPipeline_ = VK_NULL_HANDLE;
     VkPipeline playerPipeline_ = VK_NULL_HANDLE;
     VkPipeline selectionPipeline_ = VK_NULL_HANDLE;
     VkPipeline debugTextPipeline_ = VK_NULL_HANDLE;
@@ -553,6 +562,7 @@ private:
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createBlockPipeline();
+        createFluidPipeline();
         createPlayerPipeline();
         createSelectionPipeline();
         createDebugTextPipeline();
@@ -1145,6 +1155,55 @@ private:
         blockPipeline_ = bundle.pipeline;
     }
 
+    void createFluidPipeline()
+    {
+        const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
+
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(BlockVertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        std::array<VkVertexInputAttributeDescription, 4> attributeDescriptions{};
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(BlockVertex, position);
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(BlockVertex, uv);
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(BlockVertex, ao);
+        attributeDescriptions[3].binding = 0;
+        attributeDescriptions[3].location = 3;
+        attributeDescriptions[3].format = VK_FORMAT_R32_SFLOAT;
+        attributeDescriptions[3].offset = offsetof(BlockVertex, textureLayer);
+
+        GraphicsPipelineConfig config{};
+        config.vertexShaderPath = shaderDir + "block.vert.spv";
+        config.fragmentShaderPath = shaderDir + "block.frag.spv";
+        config.extent = swapchainExtent_;
+        config.renderPass = renderPass_;
+        config.descriptorSetLayout = blockDescriptorSetLayout_;
+        config.cullMode = VK_CULL_MODE_NONE;
+        config.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        config.depthTestEnable = true;
+        config.depthWriteEnable = false;
+        config.alphaBlendEnable = true;
+        config.vertexBindingDescription = &bindingDescription;
+        config.vertexAttributeDescriptions = attributeDescriptions.data();
+        config.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
+        config.layoutErrorMessage = "Failed to create Vulkan fluid pipeline layout.";
+        config.pipelineErrorMessage = "Failed to create Vulkan fluid graphics pipeline.";
+
+        const GraphicsPipelineBundle bundle = createGraphicsPipelineBundle(device_, config);
+        fluidPipelineLayout_ = bundle.layout;
+        fluidPipeline_ = bundle.pipeline;
+    }
+
     void createPlayerPipeline()
     {
         const std::string shaderDir = std::string(VULKAN_VOXEL_BINARY_DIR) + "/shaders/";
@@ -1353,8 +1412,19 @@ private:
         const std::wstring baseRelativePath = L"/assets/textures/block/" + asciiToWide(name) + L".png";
         const std::wstring specificRelativePath =
             L"/assets/textures/block/" + asciiToWide(name) + postfix + L".png";
-        const std::wstring selectedRelativePath =
+        std::wstring selectedRelativePath =
             fileExists(sourcePathWide(specificRelativePath)) ? specificRelativePath : baseRelativePath;
+        const std::wstring postfixText(postfix);
+        if (!fileExists(sourcePathWide(selectedRelativePath)) &&
+            (postfixText == L"_top" || postfixText == L"_bottom"))
+        {
+            const std::wstring topBottomRelativePath =
+                L"/assets/textures/block/" + asciiToWide(name) + L"_topbottom.png";
+            if (fileExists(sourcePathWide(topBottomRelativePath)))
+            {
+                selectedRelativePath = topBottomRelativePath;
+            }
+        }
         if (!fileExists(sourcePathWide(selectedRelativePath)))
         {
             throw std::runtime_error("Missing block texture.");
@@ -1367,7 +1437,7 @@ private:
     {
         for (BlockDefinition& definition : blockRegistry_.mutableDefinitions())
         {
-            if (!definition.solid || definition.id == kAirBlockId)
+            if (definition.renderShape == BlockRenderShape::None || definition.id == kAirBlockId)
             {
                 continue;
             }
@@ -1476,7 +1546,72 @@ private:
             }
         }
 
-        return chunkMesher_.buildChunkMesh(coord, generation, voxels.blockIds, voxels.fluidIds, voxels.fluidAmounts);
+        GeneratedChunkColumn column = worldGenerator_.generateChunkColumn(
+            coord,
+            voxels.blockIds,
+            voxels.fluidIds,
+            voxels.fluidAmounts);
+        overlayLoadedChunkPadding(coord, column);
+
+        ChunkBuildResult result = chunkMesher_.buildChunkMeshFromColumn(coord, generation, column);
+        result.blockIds = std::move(voxels.blockIds);
+        result.fluidIds = std::move(voxels.fluidIds);
+        result.fluidAmounts = std::move(voxels.fluidAmounts);
+        return result;
+    }
+
+    void overlayLoadedChunkPadding(ChunkCoord coord, GeneratedChunkColumn& column)
+    {
+        const int chunkBaseX = coord.x * kChunkSizeX;
+        const int chunkBaseZ = coord.z * kChunkSizeZ;
+
+        std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+        for (int localPaddedZ = 0; localPaddedZ < GeneratedChunkColumn::kDepth; ++localPaddedZ)
+        {
+            for (int localPaddedX = 0; localPaddedX < GeneratedChunkColumn::kWidth; ++localPaddedX)
+            {
+                const bool isCenterCell =
+                    localPaddedX >= GeneratedChunkColumn::kPadding &&
+                    localPaddedX < GeneratedChunkColumn::kPadding + kChunkSizeX &&
+                    localPaddedZ >= GeneratedChunkColumn::kPadding &&
+                    localPaddedZ < GeneratedChunkColumn::kPadding + kChunkSizeZ;
+                if (isCenterCell)
+                {
+                    continue;
+                }
+
+                const int worldX = chunkBaseX + localPaddedX - GeneratedChunkColumn::kPadding;
+                const int worldZ = chunkBaseZ + localPaddedZ - GeneratedChunkColumn::kPadding;
+                const ChunkCoord sourceCoord = chunkCoordForBlock(worldX, worldZ);
+                const auto loadedIt = loadedChunks_.find(sourceCoord);
+                if (loadedIt == loadedChunks_.end() ||
+                    loadedIt->second.blockIds.size() != kChunkBlockCount ||
+                    loadedIt->second.fluidIds.size() != kChunkBlockCount ||
+                    loadedIt->second.fluidAmounts.size() != kChunkBlockCount)
+                {
+                    continue;
+                }
+
+                const int sourceLocalX = floorMod(worldX, kChunkSizeX);
+                const int sourceLocalZ = floorMod(worldZ, kChunkSizeZ);
+                for (int y = 0; y < kChunkHeight; ++y)
+                {
+                    const std::size_t sourceIndex = chunkBlockIndex(sourceLocalX, y, sourceLocalZ);
+                    const std::uint16_t blockId = loadedIt->second.blockIds[sourceIndex];
+                    std::uint8_t fluidId = loadedIt->second.fluidIds[sourceIndex];
+                    std::uint8_t fluidAmount = std::min(loadedIt->second.fluidAmounts[sourceIndex], kMaxFluidAmount);
+                    if (blockId != kAirBlockId || fluidId != kWaterFluidId || fluidAmount == 0)
+                    {
+                        fluidId = kNoFluidId;
+                        fluidAmount = 0;
+                    }
+
+                    column.blockAt(localPaddedX, y, localPaddedZ) = blockId;
+                    column.fluidIdAt(localPaddedX, y, localPaddedZ) = fluidId;
+                    column.fluidAt(localPaddedX, y, localPaddedZ) = fluidAmount;
+                }
+            }
+        }
     }
 
     ChunkLoadUpdateStats updateLoadedChunks()
@@ -1498,9 +1633,12 @@ private:
         int chunkZ,
         const std::vector<BlockVertex>& vertices,
         const std::vector<std::uint32_t>& indices,
-        const std::vector<SubchunkDraw>& subchunkDraws)
+        const std::vector<SubchunkDraw>& subchunkDraws,
+        const std::vector<BlockVertex>& fluidVertices,
+        const std::vector<std::uint32_t>& fluidIndices,
+        const std::vector<SubchunkDraw>& fluidSubchunkDraws)
     {
-        if (indices.empty())
+        if (indices.empty() && fluidIndices.empty())
         {
             return;
         }
@@ -1510,20 +1648,40 @@ private:
         mesh.chunkZ = chunkZ;
         mesh.vertexCount = static_cast<std::uint32_t>(vertices.size());
         mesh.indexCount = static_cast<std::uint32_t>(indices.size());
+        mesh.fluidVertexCount = static_cast<std::uint32_t>(fluidVertices.size());
+        mesh.fluidIndexCount = static_cast<std::uint32_t>(fluidIndices.size());
         mesh.subchunks = subchunkDraws;
-        meshVertexCount_ += vertices.size();
-        meshIndexCount_ += indices.size();
+        mesh.fluidSubchunks = fluidSubchunkDraws;
+        meshVertexCount_ += vertices.size() + fluidVertices.size();
+        meshIndexCount_ += indices.size() + fluidIndices.size();
 
-        createDeviceLocalBuffer(
-            vertices.data(),
-            sizeof(BlockVertex) * vertices.size(),
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-            mesh.vertexBuffer);
-        createDeviceLocalBuffer(
-            indices.data(),
-            sizeof(std::uint32_t) * indices.size(),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-            mesh.indexBuffer);
+        if (!indices.empty())
+        {
+            createDeviceLocalBuffer(
+                vertices.data(),
+                sizeof(BlockVertex) * vertices.size(),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                mesh.vertexBuffer);
+            createDeviceLocalBuffer(
+                indices.data(),
+                sizeof(std::uint32_t) * indices.size(),
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                mesh.indexBuffer);
+        }
+
+        if (!fluidIndices.empty())
+        {
+            createDeviceLocalBuffer(
+                fluidVertices.data(),
+                sizeof(BlockVertex) * fluidVertices.size(),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                mesh.fluidVertexBuffer);
+            createDeviceLocalBuffer(
+                fluidIndices.data(),
+                sizeof(std::uint32_t) * fluidIndices.size(),
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                mesh.fluidIndexBuffer);
+        }
 
         chunkMeshes_.push_back(std::move(mesh));
     }
@@ -1555,7 +1713,10 @@ private:
                 result.coord.z,
                 result.vertices,
                 result.indices,
-                result.subchunks);
+                result.subchunks,
+                result.fluidVertices,
+                result.fluidIndices,
+                result.fluidSubchunks);
             registerLoadedChunkData(
                 result.coord,
                 std::move(result.blockIds),
@@ -1752,6 +1913,9 @@ private:
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.mipLodBias = -0.5f;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
 
         if (vkCreateSampler(device_, &samplerInfo, nullptr, &textureSampler_) != VK_SUCCESS)
         {
@@ -2220,7 +2384,7 @@ private:
         }
 
         const std::optional<std::uint16_t> blockId = loadedBlockIdAt(x, y, z);
-        return blockId.has_value() && blockRegistry_.isSolid(*blockId);
+        return blockId.has_value() && blockRegistry_.isCollision(*blockId);
     }
 
     bool isRaycastBlockSolid(int x, int y, int z) const
@@ -2231,7 +2395,7 @@ private:
         }
 
         const std::optional<std::uint16_t> blockId = loadedBlockIdAt(x, y, z);
-        return blockId.has_value() && blockRegistry_.isSolid(*blockId);
+        return blockId.has_value() && blockRegistry_.isRaycastTarget(*blockId);
     }
 
     bool isChunkLoadedForBlock(int x, int z) const
@@ -2283,7 +2447,7 @@ private:
 
         const std::size_t voxelIndex = chunkBlockIndex(localX, y, localZ);
         loadedIt->second.blockIds[voxelIndex] = blockId;
-        if (blockRegistry_.isSolid(blockId) &&
+        if (blockRegistry_.isCollision(blockId) &&
             loadedIt->second.fluidIds.size() == kChunkBlockCount &&
             loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
         {
@@ -2641,7 +2805,7 @@ private:
         std::size_t blockDrawCalls = 0;
         for (const ChunkMesh& mesh : chunkMeshes_)
         {
-            blockDrawCalls += mesh.subchunks.size();
+            blockDrawCalls += mesh.subchunks.size() + mesh.fluidSubchunks.size();
         }
         const std::size_t debugDrawCalls = debugTextVisible_ ? 1 : 0;
         const std::size_t playerDrawCalls = playerVertexCount_ > 0 && playerIndexCount_ > 0 ? 1 : 0;
@@ -2785,6 +2949,10 @@ private:
             nullptr);
         for (const ChunkMesh& mesh : chunkMeshes_)
         {
+            if (mesh.indexCount == 0)
+            {
+                continue;
+            }
             VkBuffer vertexBuffers[] = {mesh.vertexBuffer.buffer};
             VkDeviceSize offsets[] = {0};
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
@@ -2798,6 +2966,38 @@ private:
                     draw.range.firstIndex,
                     draw.range.vertexOffset,
                 0);
+            }
+        }
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fluidPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            fluidPipelineLayout_,
+            0,
+            1,
+            &blockDescriptorSet_,
+            0,
+            nullptr);
+        for (const ChunkMesh& mesh : chunkMeshes_)
+        {
+            if (mesh.fluidIndexCount == 0)
+            {
+                continue;
+            }
+            VkBuffer vertexBuffers[] = {mesh.fluidVertexBuffer.buffer};
+            VkDeviceSize offsets[] = {0};
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+            vkCmdBindIndexBuffer(commandBuffer, mesh.fluidIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            for (const SubchunkDraw& draw : mesh.fluidSubchunks)
+            {
+                vkCmdDrawIndexed(
+                    commandBuffer,
+                    draw.range.indexCount,
+                    1,
+                    draw.range.firstIndex,
+                    draw.range.vertexOffset,
+                    0);
             }
         }
 
@@ -2901,6 +3101,7 @@ private:
         createDepthResources();
         createGraphicsPipeline();
         createBlockPipeline();
+        createFluidPipeline();
         createPlayerPipeline();
         createSelectionPipeline();
         createDebugTextPipeline();
@@ -2925,6 +3126,11 @@ private:
         {
             vkDestroyPipeline(device_, blockPipeline_, nullptr);
             blockPipeline_ = VK_NULL_HANDLE;
+        }
+        if (fluidPipeline_ != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(device_, fluidPipeline_, nullptr);
+            fluidPipeline_ = VK_NULL_HANDLE;
         }
         if (playerPipeline_ != VK_NULL_HANDLE)
         {
@@ -2951,6 +3157,11 @@ private:
         {
             vkDestroyPipelineLayout(device_, blockPipelineLayout_, nullptr);
             blockPipelineLayout_ = VK_NULL_HANDLE;
+        }
+        if (fluidPipelineLayout_ != VK_NULL_HANDLE)
+        {
+            vkDestroyPipelineLayout(device_, fluidPipelineLayout_, nullptr);
+            fluidPipelineLayout_ = VK_NULL_HANDLE;
         }
         if (playerPipelineLayout_ != VK_NULL_HANDLE)
         {
@@ -3080,6 +3291,8 @@ private:
 
             resourceContext_.destroyBuffer(it->vertexBuffer);
             resourceContext_.destroyBuffer(it->indexBuffer);
+            resourceContext_.destroyBuffer(it->fluidVertexBuffer);
+            resourceContext_.destroyBuffer(it->fluidIndexBuffer);
             it = deferredChunkBufferDestroys_.erase(it);
         }
     }
@@ -3117,10 +3330,16 @@ private:
             deferredChunkBufferDestroys_.push_back({
                 it->vertexBuffer,
                 it->indexBuffer,
+                it->fluidVertexBuffer,
+                it->fluidIndexBuffer,
                 frameCounter_ + static_cast<std::uint64_t>(kMaxFramesInFlight),
             });
-            meshVertexCount_ -= std::min(meshVertexCount_, static_cast<std::size_t>(it->vertexCount));
-            meshIndexCount_ -= std::min(meshIndexCount_, static_cast<std::size_t>(it->indexCount));
+            meshVertexCount_ -= std::min(
+                meshVertexCount_,
+                static_cast<std::size_t>(it->vertexCount) + static_cast<std::size_t>(it->fluidVertexCount));
+            meshIndexCount_ -= std::min(
+                meshIndexCount_,
+                static_cast<std::size_t>(it->indexCount) + static_cast<std::size_t>(it->fluidIndexCount));
             it = chunkMeshes_.erase(it);
         }
     }
@@ -3131,6 +3350,8 @@ private:
         {
             resourceContext_.destroyBuffer(mesh.vertexBuffer);
             resourceContext_.destroyBuffer(mesh.indexBuffer);
+            resourceContext_.destroyBuffer(mesh.fluidVertexBuffer);
+            resourceContext_.destroyBuffer(mesh.fluidIndexBuffer);
         }
         chunkMeshes_.clear();
         collectDeferredChunkBufferDestroys(true);

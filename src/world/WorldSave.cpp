@@ -459,7 +459,7 @@ std::vector<std::uint8_t> WorldSave::encodeRle(const ChunkVoxelData& voxels)
         const std::uint16_t blockId = voxels.blockIds[i];
         std::uint8_t fluidId = voxels.fluidIds[i];
         std::uint8_t fluidAmount = std::min(voxels.fluidAmounts[i], kMaxFluidAmount);
-        if (fluidId == kNoFluidId || fluidAmount == 0)
+        if (blockId != kAirBlockId || fluidId != kWaterFluidId || fluidAmount == 0)
         {
             fluidId = kNoFluidId;
             fluidAmount = 0;
@@ -506,17 +506,25 @@ ChunkVoxelData WorldSave::decodeRle(const std::vector<std::uint8_t>& bytes)
             throw std::runtime_error("RLE stream is truncated.");
         }
         std::uint8_t fluidId = bytes[offset++];
+        if (fluidId != kNoFluidId && fluidId != kWaterFluidId)
+        {
+            throw std::runtime_error("RLE stream contains an unknown fluid id.");
+        }
         if (offset >= bytes.size())
         {
             throw std::runtime_error("RLE stream is truncated.");
         }
         const std::uint8_t fluidAmount = bytes[offset++];
         const std::uint32_t count = readU32(bytes, offset);
+        if (count == 0)
+        {
+            throw std::runtime_error("RLE stream contains an empty run.");
+        }
         if (voxels.blockIds.size() + count > kChunkBlockCount)
         {
             throw std::runtime_error("RLE stream expands past chunk size.");
         }
-        if (fluidId == kNoFluidId || fluidAmount == 0)
+        if (blockId != kAirBlockId || fluidId == kNoFluidId || fluidAmount == 0)
         {
             fluidId = kNoFluidId;
         }
@@ -531,6 +539,10 @@ ChunkVoxelData WorldSave::decodeRle(const std::vector<std::uint8_t>& bytes)
     if (!voxels.valid())
     {
         throw std::runtime_error("RLE stream did not fill a chunk.");
+    }
+    if (offset != bytes.size())
+    {
+        throw std::runtime_error("RLE stream has trailing bytes.");
     }
     return voxels;
 }

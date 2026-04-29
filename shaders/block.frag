@@ -10,5 +10,9 @@ layout(location = 0) out vec4 outColor;
 void main()
 {
     vec4 color = texture(blockTexture, vec3(fract(inUv), inTextureLayer));
+    if (color.a < 0.5)
+    {
+        discard;
+    }
     outColor = vec4(color.rgb * inAo, color.a);
 }
