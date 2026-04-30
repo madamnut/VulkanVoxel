@@ -33,6 +33,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -48,6 +49,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -64,6 +66,9 @@ constexpr int kDefaultChunkBuildThreads = 4;
 constexpr int kMaxChunkBuildThreads = 16;
 constexpr float kDefaultInteractionDistance = 5.0f;
 constexpr std::size_t kSelectionOutlineVertexCount = 24;
+constexpr float kRenderFovY = 70.0f * kPi / 180.0f;
+constexpr float kRenderNearPlane = 0.05f;
+constexpr float kRenderFarPlane = 1200.0f;
 
 struct QueueFamilyIndices
 {
@@ -90,6 +95,17 @@ struct ChunkMesh
     int chunkZ = 0;
     std::vector<SubchunkDraw> subchunks;
     std::vector<SubchunkDraw> fluidSubchunks;
+};
+
+struct FrustumPlane
+{
+    Vec3 normal{};
+    float distance = 0.0f;
+};
+
+struct ViewFrustum
+{
+    std::array<FrustumPlane, 6> planes{};
 };
 
 struct DeferredChunkBufferDestroy
@@ -389,6 +405,9 @@ private:
     bool debugTextVisible_ = true;
     int chunkUploadsPerFrame_ = kDefaultChunkUploadsPerFrame;
     float interactionDistance_ = kDefaultInteractionDistance;
+    ViewFrustum currentViewFrustum_{};
+    std::size_t visibleSubchunkDraws_ = 0;
+    std::size_t culledSubchunkDraws_ = 0;
     std::optional<BlockRaycastHit> selectedBlock_;
     std::chrono::steady_clock::time_point lastInteractionRaycastTime_ = std::chrono::steady_clock::now();
     BlockRegistry blockRegistry_{};
@@ -397,6 +416,10 @@ private:
     ChunkStreamingManager chunkStreaming_{chunkMesher_};
     std::unordered_map<ChunkCoord, LoadedChunkData, ChunkCoordHash> loadedChunks_;
     mutable std::mutex loadedChunksMutex_;
+    std::unordered_map<ChunkCoord, ChunkVoxelData, ChunkCoordHash> chunkDataCache_;
+    std::unordered_set<ChunkCoord, ChunkCoordHash> chunkDataLoadsInProgress_;
+    std::mutex chunkDataCacheMutex_;
+    std::condition_variable chunkDataCacheCv_;
     std::mutex saveMutex_;
     std::vector<DeferredChunkBufferDestroy> deferredChunkBufferDestroys_;
     std::vector<DeferredUploadCleanup> deferredUploadCleanups_;
@@ -1520,86 +1543,184 @@ private:
 
     ChunkBuildResult buildChunkForStreaming(ChunkCoord coord, std::uint64_t generation)
     {
-        ChunkVoxelData voxels;
+        std::array<ChunkVoxelData, 9> neighborVoxels;
+        for (int dz = -1; dz <= 1; ++dz)
         {
-            std::lock_guard<std::mutex> lock(loadedChunksMutex_);
-            const auto loadedIt = loadedChunks_.find(coord);
-            if (loadedIt != loadedChunks_.end())
+            for (int dx = -1; dx <= 1; ++dx)
             {
-                voxels.blockIds = loadedIt->second.blockIds;
-                voxels.fluidIds = loadedIt->second.fluidIds;
-                voxels.fluidAmounts = loadedIt->second.fluidAmounts;
+                neighborVoxels[static_cast<std::size_t>((dz + 1) * 3 + (dx + 1))] =
+                    ensureChunkData({coord.x + dx, coord.z + dz});
             }
+        }
+
+        GeneratedChunkColumn column = buildMeshingColumnFromChunkData(coord, neighborVoxels);
+        ChunkBuildResult result = chunkMesher_.buildChunkMeshFromColumn(coord, generation, column);
+
+        ChunkVoxelData& centerVoxels = neighborVoxels[4];
+        result.blockIds = std::move(centerVoxels.blockIds);
+        result.fluidIds = std::move(centerVoxels.fluidIds);
+        result.fluidAmounts = std::move(centerVoxels.fluidAmounts);
+        return result;
+    }
+
+    ChunkVoxelData ensureChunkData(ChunkCoord coord)
+    {
+        while (true)
+        {
+            {
+                std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+                const auto loadedIt = loadedChunks_.find(coord);
+                if (loadedIt != loadedChunks_.end() &&
+                    loadedIt->second.blockIds.size() == kChunkBlockCount &&
+                    loadedIt->second.fluidIds.size() == kChunkBlockCount &&
+                    loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+                {
+                    return {
+                        loadedIt->second.blockIds,
+                        loadedIt->second.fluidIds,
+                        loadedIt->second.fluidAmounts,
+                    };
+                }
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(chunkDataCacheMutex_);
+                const auto cacheIt = chunkDataCache_.find(coord);
+                if (cacheIt != chunkDataCache_.end() && cacheIt->second.valid())
+                {
+                    return cacheIt->second;
+                }
+
+                if (!chunkDataLoadsInProgress_.contains(coord))
+                {
+                    chunkDataLoadsInProgress_.insert(coord);
+                    break;
+                }
+
+                chunkDataCacheCv_.wait(lock, [&]()
+                {
+                    return !chunkDataLoadsInProgress_.contains(coord) || chunkDataCache_.contains(coord);
+                });
+            }
+        }
+
+        ChunkVoxelData voxels;
+        try
+        {
+            voxels = loadOrGenerateChunkData(coord);
+        }
+        catch (...)
+        {
+            {
+                std::lock_guard<std::mutex> lock(chunkDataCacheMutex_);
+                chunkDataLoadsInProgress_.erase(coord);
+            }
+            chunkDataCacheCv_.notify_all();
+            throw;
         }
 
         if (!voxels.valid())
         {
-            if (std::optional<ChunkVoxelData> savedVoxels = loadChunkFromDisk(coord))
             {
-                voxels = std::move(*savedVoxels);
+                std::lock_guard<std::mutex> lock(chunkDataCacheMutex_);
+                chunkDataLoadsInProgress_.erase(coord);
             }
+            chunkDataCacheCv_.notify_all();
+            throw std::runtime_error("Chunk data load/generation produced invalid voxel data.");
+        }
 
-            if (!voxels.valid())
+        {
+            std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+            const auto loadedIt = loadedChunks_.find(coord);
+            if (loadedIt != loadedChunks_.end() &&
+                loadedIt->second.blockIds.size() == kChunkBlockCount &&
+                loadedIt->second.fluidIds.size() == kChunkBlockCount &&
+                loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
             {
-                voxels = worldGenerator_.generateChunkVoxels(coord);
-                saveChunkToDisk(coord, voxels);
+                voxels = {
+                    loadedIt->second.blockIds,
+                    loadedIt->second.fluidIds,
+                    loadedIt->second.fluidAmounts,
+                };
             }
         }
 
-        GeneratedChunkColumn column = worldGenerator_.generateChunkColumn(
-            coord,
-            voxels.blockIds,
-            voxels.fluidIds,
-            voxels.fluidAmounts);
-        overlayLoadedChunkPadding(coord, column);
-
-        ChunkBuildResult result = chunkMesher_.buildChunkMeshFromColumn(coord, generation, column);
-        result.blockIds = std::move(voxels.blockIds);
-        result.fluidIds = std::move(voxels.fluidIds);
-        result.fluidAmounts = std::move(voxels.fluidAmounts);
-        return result;
+        {
+            std::lock_guard<std::mutex> lock(chunkDataCacheMutex_);
+            chunkDataCache_[coord] = voxels;
+            chunkDataLoadsInProgress_.erase(coord);
+        }
+        chunkDataCacheCv_.notify_all();
+        return voxels;
     }
 
-    void overlayLoadedChunkPadding(ChunkCoord coord, GeneratedChunkColumn& column)
+    ChunkVoxelData loadOrGenerateChunkData(ChunkCoord coord)
+    {
+        {
+            std::lock_guard<std::mutex> lock(loadedChunksMutex_);
+            const auto loadedIt = loadedChunks_.find(coord);
+            if (loadedIt != loadedChunks_.end() &&
+                loadedIt->second.blockIds.size() == kChunkBlockCount &&
+                loadedIt->second.fluidIds.size() == kChunkBlockCount &&
+                loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+            {
+                return {
+                    loadedIt->second.blockIds,
+                    loadedIt->second.fluidIds,
+                    loadedIt->second.fluidAmounts,
+                };
+            }
+        }
+
+        if (std::optional<ChunkVoxelData> savedVoxels = loadChunkFromDisk(coord))
+        {
+            if (savedVoxels->valid())
+            {
+                return std::move(*savedVoxels);
+            }
+        }
+
+        ChunkVoxelData generatedVoxels = worldGenerator_.generateChunkVoxels(coord);
+        saveChunkToDisk(coord, generatedVoxels);
+        return generatedVoxels;
+    }
+
+    GeneratedChunkColumn buildMeshingColumnFromChunkData(
+        ChunkCoord coord,
+        const std::array<ChunkVoxelData, 9>& neighborVoxels) const
     {
         const int chunkBaseX = coord.x * kChunkSizeX;
         const int chunkBaseZ = coord.z * kChunkSizeZ;
+        GeneratedChunkColumn column{};
 
-        std::lock_guard<std::mutex> lock(loadedChunksMutex_);
         for (int localPaddedZ = 0; localPaddedZ < GeneratedChunkColumn::kDepth; ++localPaddedZ)
         {
             for (int localPaddedX = 0; localPaddedX < GeneratedChunkColumn::kWidth; ++localPaddedX)
             {
-                const bool isCenterCell =
-                    localPaddedX >= GeneratedChunkColumn::kPadding &&
-                    localPaddedX < GeneratedChunkColumn::kPadding + kChunkSizeX &&
-                    localPaddedZ >= GeneratedChunkColumn::kPadding &&
-                    localPaddedZ < GeneratedChunkColumn::kPadding + kChunkSizeZ;
-                if (isCenterCell)
-                {
-                    continue;
-                }
-
                 const int worldX = chunkBaseX + localPaddedX - GeneratedChunkColumn::kPadding;
                 const int worldZ = chunkBaseZ + localPaddedZ - GeneratedChunkColumn::kPadding;
                 const ChunkCoord sourceCoord = chunkCoordForBlock(worldX, worldZ);
-                const auto loadedIt = loadedChunks_.find(sourceCoord);
-                if (loadedIt == loadedChunks_.end() ||
-                    loadedIt->second.blockIds.size() != kChunkBlockCount ||
-                    loadedIt->second.fluidIds.size() != kChunkBlockCount ||
-                    loadedIt->second.fluidAmounts.size() != kChunkBlockCount)
+                const int neighborX = sourceCoord.x - coord.x + 1;
+                const int neighborZ = sourceCoord.z - coord.z + 1;
+                if (neighborX < 0 || neighborX >= 3 || neighborZ < 0 || neighborZ >= 3)
                 {
-                    continue;
+                    throw std::runtime_error("Meshing column source chunk is outside neighbor data range.");
                 }
 
+                const ChunkVoxelData& sourceVoxels =
+                    neighborVoxels[static_cast<std::size_t>(neighborZ * 3 + neighborX)];
+                if (!sourceVoxels.valid())
+                {
+                    throw std::runtime_error("Meshing column source chunk data is invalid.");
+                }
                 const int sourceLocalX = floorMod(worldX, kChunkSizeX);
                 const int sourceLocalZ = floorMod(worldZ, kChunkSizeZ);
                 for (int y = 0; y < kChunkHeight; ++y)
                 {
                     const std::size_t sourceIndex = chunkBlockIndex(sourceLocalX, y, sourceLocalZ);
-                    const std::uint16_t blockId = loadedIt->second.blockIds[sourceIndex];
-                    std::uint8_t fluidId = loadedIt->second.fluidIds[sourceIndex];
-                    std::uint8_t fluidAmount = std::min(loadedIt->second.fluidAmounts[sourceIndex], kMaxFluidAmount);
+                    const std::uint16_t blockId = sourceVoxels.blockIds[sourceIndex];
+                    std::uint8_t fluidId = sourceVoxels.fluidIds[sourceIndex];
+                    std::uint8_t fluidAmount = std::min(sourceVoxels.fluidAmounts[sourceIndex], kMaxFluidAmount);
                     if (blockId != kAirBlockId || fluidId != kWaterFluidId || fluidAmount == 0)
                     {
                         fluidId = kNoFluidId;
@@ -1612,6 +1733,8 @@ private:
                 }
             }
         }
+
+        return column;
     }
 
     ChunkLoadUpdateStats updateLoadedChunks()
@@ -1748,6 +1871,8 @@ private:
             return;
         }
 
+        cacheChunkData(coord, {blockIds, fluidIds, fluidAmounts});
+
         std::lock_guard<std::mutex> lock(loadedChunksMutex_);
         bool dirty = false;
         const auto loadedIt = loadedChunks_.find(coord);
@@ -1782,6 +1907,21 @@ private:
         {
             saveChunkToDisk(coord, {chunkData->blockIds, chunkData->fluidIds, chunkData->fluidAmounts});
         }
+        cacheChunkData(coord, {chunkData->blockIds, chunkData->fluidIds, chunkData->fluidAmounts});
+    }
+
+    void cacheChunkData(ChunkCoord coord, const ChunkVoxelData& voxels)
+    {
+        if (!voxels.valid())
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(chunkDataCacheMutex_);
+            chunkDataCache_[coord] = voxels;
+        }
+        chunkDataCacheCv_.notify_all();
     }
 
     void saveLoadedChunks(bool onlyDirty)
@@ -2455,6 +2595,22 @@ private:
             loadedIt->second.fluidAmounts[voxelIndex] = 0;
         }
         loadedIt->second.dirty = true;
+
+        {
+            std::lock_guard<std::mutex> cacheLock(chunkDataCacheMutex_);
+            auto cacheIt = chunkDataCache_.find(coord);
+            if (cacheIt != chunkDataCache_.end() && cacheIt->second.valid())
+            {
+                cacheIt->second.blockIds[voxelIndex] = loadedIt->second.blockIds[voxelIndex];
+                if (loadedIt->second.fluidIds.size() == kChunkBlockCount &&
+                    loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+                {
+                    cacheIt->second.fluidIds[voxelIndex] = loadedIt->second.fluidIds[voxelIndex];
+                    cacheIt->second.fluidAmounts[voxelIndex] = loadedIt->second.fluidAmounts[voxelIndex];
+                }
+            }
+        }
+        chunkDataCacheCv_.notify_all();
         return true;
     }
 
@@ -2489,6 +2645,98 @@ private:
     Vec3 renderCameraPosition() const
     {
         return playerController_.renderCameraPosition(camera_);
+    }
+
+    static FrustumPlane makeFrustumPlane(Vec3 a, Vec3 b, Vec3 c, Vec3 insidePoint)
+    {
+        FrustumPlane plane{};
+        plane.normal = normalize(cross(b - a, c - a));
+        plane.distance = -dot(plane.normal, a);
+        if (dot(plane.normal, insidePoint) + plane.distance < 0.0f)
+        {
+            plane.normal = -plane.normal;
+            plane.distance = -plane.distance;
+        }
+        return plane;
+    }
+
+    static ViewFrustum makeViewFrustum(
+        Vec3 position,
+        Vec3 forward,
+        float fovY,
+        float aspect,
+        float nearPlane,
+        float farPlane)
+    {
+        forward = normalize(forward);
+        if (length(forward) <= 0.00001f)
+        {
+            forward = {1.0f, 0.0f, 0.0f};
+        }
+
+        Vec3 right = normalize(cross(forward, {0.0f, 1.0f, 0.0f}));
+        if (length(right) <= 0.00001f)
+        {
+            right = {1.0f, 0.0f, 0.0f};
+        }
+        const Vec3 up = normalize(cross(right, forward));
+        const float nearHalfHeight = std::tan(fovY * 0.5f) * nearPlane;
+        const float nearHalfWidth = nearHalfHeight * aspect;
+        const float farHalfHeight = std::tan(fovY * 0.5f) * farPlane;
+        const float farHalfWidth = farHalfHeight * aspect;
+        const Vec3 nearCenter = position + forward * nearPlane;
+        const Vec3 farCenter = position + forward * farPlane;
+        const Vec3 insidePoint = position + forward * ((nearPlane + farPlane) * 0.5f);
+
+        const Vec3 nearTopLeft = nearCenter + up * nearHalfHeight - right * nearHalfWidth;
+        const Vec3 nearTopRight = nearCenter + up * nearHalfHeight + right * nearHalfWidth;
+        const Vec3 nearBottomLeft = nearCenter - up * nearHalfHeight - right * nearHalfWidth;
+        const Vec3 nearBottomRight = nearCenter - up * nearHalfHeight + right * nearHalfWidth;
+        const Vec3 farTopLeft = farCenter + up * farHalfHeight - right * farHalfWidth;
+        const Vec3 farTopRight = farCenter + up * farHalfHeight + right * farHalfWidth;
+        const Vec3 farBottomLeft = farCenter - up * farHalfHeight - right * farHalfWidth;
+        const Vec3 farBottomRight = farCenter - up * farHalfHeight + right * farHalfWidth;
+
+        ViewFrustum frustum{};
+        frustum.planes[0] = makeFrustumPlane(nearTopLeft, nearTopRight, nearBottomRight, insidePoint);
+        frustum.planes[1] = makeFrustumPlane(farTopRight, farTopLeft, farBottomLeft, insidePoint);
+        frustum.planes[2] = makeFrustumPlane(nearTopLeft, nearBottomLeft, farBottomLeft, insidePoint);
+        frustum.planes[3] = makeFrustumPlane(nearBottomRight, nearTopRight, farBottomRight, insidePoint);
+        frustum.planes[4] = makeFrustumPlane(nearTopRight, nearTopLeft, farTopLeft, insidePoint);
+        frustum.planes[5] = makeFrustumPlane(nearBottomLeft, nearBottomRight, farBottomRight, insidePoint);
+        return frustum;
+    }
+
+    static bool isAabbVisibleInFrustum(const ViewFrustum& frustum, Vec3 minimum, Vec3 maximum)
+    {
+        for (const FrustumPlane& plane : frustum.planes)
+        {
+            const Vec3 positiveVertex{
+                plane.normal.x >= 0.0f ? maximum.x : minimum.x,
+                plane.normal.y >= 0.0f ? maximum.y : minimum.y,
+                plane.normal.z >= 0.0f ? maximum.z : minimum.z,
+            };
+            if (dot(plane.normal, positiveVertex) + plane.distance < 0.0f)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool isSubchunkVisible(const ViewFrustum& frustum, const SubchunkDraw& draw)
+    {
+        const Vec3 minimum{
+            static_cast<float>(draw.chunkX * kChunkSizeX),
+            static_cast<float>(draw.subchunkY * kSubchunkSize),
+            static_cast<float>(draw.chunkZ * kChunkSizeZ),
+        };
+        const Vec3 maximum{
+            minimum.x + static_cast<float>(kChunkSizeX),
+            minimum.y + static_cast<float>(kSubchunkSize),
+            minimum.z + static_cast<float>(kChunkSizeZ),
+        };
+        return isAabbVisibleInFrustum(frustum, minimum, maximum);
     }
 
     void updateBlockSelection(bool force)
@@ -2695,6 +2943,13 @@ private:
         const double frameMs = 1000.0 / std::max(fps, 0.001);
         const int fpsInteger = std::clamp(static_cast<int>(std::lround(fps)), 0, 9999);
 
+        auto profilerLine = [](const wchar_t* label, double milliseconds)
+        {
+            std::wostringstream line;
+            line << label << L": " << std::fixed << std::setprecision(3) << milliseconds << L"MS";
+            return line.str();
+        };
+
         std::wostringstream fpsText;
         fpsText << L"FPS: " << std::setw(4) << std::setfill(L'0') << fpsInteger
                 << L" [" << std::setw(6) << std::setfill(L'0') << std::fixed << std::setprecision(3)
@@ -2737,6 +2992,20 @@ private:
             cameraText.str(),
             timeText.str(),
             L"SEED: " + std::to_wstring(worldSeed_),
+        };
+
+        const FrameProfiler profile = frameProfiler_;
+        debugTextOverlay_.bottomLeftLines = {
+            profilerLine(L"FRAME CPU", profile.frameCpuMs),
+            profilerLine(L"FENCE", profile.fenceWaitMs),
+            profilerLine(L"ACQUIRE", profile.acquireMs),
+            profilerLine(L"LOAD", profile.loadUpdateMs),
+            profilerLine(L"DONE", profile.subchunkDoneMs),
+            profilerLine(L"UPLOAD", profile.chunkUploadMs),
+            profilerLine(L"UNIFORM", profile.uniformMs),
+            profilerLine(L"DEBUG", profile.debugTextMs),
+            profilerLine(L"RECORD", profile.recordMs),
+            profilerLine(L"SUBMIT", profile.submitPresentMs),
         };
 
         const bool shouldUpdateRightText =
@@ -2825,6 +3094,8 @@ private:
             apiDebugLine_,
             driverDebugLine_,
             L"DRAWS: " + std::to_wstring(drawCalls),
+            L"VISIBLE SUBCHUNKS: " + std::to_wstring(visibleSubchunkDraws_),
+            L"CULLED SUBCHUNKS: " + std::to_wstring(culledSubchunkDraws_),
             L"CHUNKS: " + std::to_wstring(chunkStreaming_.loadedChunkCount()),
             L"LOAD RADIUS: " + std::to_wstring(chunkStreaming_.loadRadius()),
             L"UPLOADS/FRAME: " + std::to_wstring(chunkUploadsPerFrame_),
@@ -2843,7 +3114,6 @@ private:
     {
         SkyUniform uniform{};
         const float aspect = static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height);
-        const float fovY = 70.0f * kPi / 180.0f;
         const Vec3 renderPosition = renderCameraPosition();
         const Vec3 renderForward = renderCameraForward();
         const auto [renderYaw, renderPitch] = yawPitchFromForward(renderForward);
@@ -2851,7 +3121,7 @@ private:
         uniform.camera[0] = renderYaw;
         uniform.camera[1] = renderPitch;
         uniform.camera[2] = aspect;
-        uniform.camera[3] = std::tan(fovY * 0.5f);
+        uniform.camera[3] = std::tan(kRenderFovY * 0.5f);
 
         const Vec3 sunDirection = sunDirectionFromWorldTime(worldTimeTicks_);
         uniform.sunDirection[0] = sunDirection.x;
@@ -2873,8 +3143,10 @@ private:
 
         BlockUniform blockUniform{};
         const Mat4 view = makeViewMatrixFromForward(renderPosition, renderForward);
-        const Mat4 projection = makePerspectiveMatrix(fovY, aspect, 0.05f, 1200.0f);
+        const Mat4 projection = makePerspectiveMatrix(kRenderFovY, aspect, kRenderNearPlane, kRenderFarPlane);
         const Mat4 viewProjection = multiply(projection, view);
+        currentViewFrustum_ =
+            makeViewFrustum(renderPosition, renderForward, kRenderFovY, aspect, kRenderNearPlane, kRenderFarPlane);
         std::memcpy(blockUniform.viewProjection, viewProjection.m, sizeof(blockUniform.viewProjection));
         std::memcpy(blockUniformMappedMemory_, &blockUniform, sizeof(blockUniform));
     }
@@ -2947,6 +3219,8 @@ private:
             &blockDescriptorSet_,
             0,
             nullptr);
+        std::size_t visibleSubchunkDraws = 0;
+        std::size_t culledSubchunkDraws = 0;
         for (const ChunkMesh& mesh : chunkMeshes_)
         {
             if (mesh.indexCount == 0)
@@ -2959,6 +3233,12 @@ private:
             vkCmdBindIndexBuffer(commandBuffer, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
             for (const SubchunkDraw& draw : mesh.subchunks)
             {
+                if (!isSubchunkVisible(currentViewFrustum_, draw))
+                {
+                    ++culledSubchunkDraws;
+                    continue;
+                }
+                ++visibleSubchunkDraws;
                 vkCmdDrawIndexed(
                     commandBuffer,
                     draw.range.indexCount,
@@ -2991,6 +3271,12 @@ private:
             vkCmdBindIndexBuffer(commandBuffer, mesh.fluidIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
             for (const SubchunkDraw& draw : mesh.fluidSubchunks)
             {
+                if (!isSubchunkVisible(currentViewFrustum_, draw))
+                {
+                    ++culledSubchunkDraws;
+                    continue;
+                }
+                ++visibleSubchunkDraws;
                 vkCmdDrawIndexed(
                     commandBuffer,
                     draw.range.indexCount,
@@ -3000,6 +3286,8 @@ private:
                     0);
             }
         }
+        visibleSubchunkDraws_ = visibleSubchunkDraws;
+        culledSubchunkDraws_ = culledSubchunkDraws;
 
         if (selectionVertexCount_ > 0)
         {
@@ -3356,8 +3644,19 @@ private:
         chunkMeshes_.clear();
         collectDeferredChunkBufferDestroys(true);
         chunkStreaming_.reset();
+        clearChunkDataCache();
         meshVertexCount_ = 0;
         meshIndexCount_ = 0;
+    }
+
+    void clearChunkDataCache()
+    {
+        {
+            std::lock_guard<std::mutex> lock(chunkDataCacheMutex_);
+            chunkDataCache_.clear();
+            chunkDataLoadsInProgress_.clear();
+        }
+        chunkDataCacheCv_.notify_all();
     }
 
 

@@ -2,6 +2,18 @@
 
 ## 2026-04-30
 
+- 좌하단 디버그 텍스트에 프레임 프로파일러 타이밍을 추가했다. frame cpu, fence, acquire, load, completed build 처리, upload, uniform, debug, command record, submit/present 시간을 ms 단위로 표시한다.
+
+- 렌더 카메라 기준 프러스텀 컬링을 추가했다. `renderCameraPosition()`과 `renderCameraForward()`로 3인칭 카메라 위치까지 반영한 frustum을 만들고, block/fluid 서브청크 AABB가 frustum 밖이면 draw를 생략한다. 디버그 텍스트에는 visible/culled subchunk 수를 표시한다.
+
+- `ChunkMesher`가 완전히 막힌 서브청크를 early-out 하도록 했다. 서브청크 내부와 6방향 경계가 모두 face occluder이고 유체가 없으면 greedy meshing/AO/fluid/cross 스캔을 생략한다.
+
+- `ChunkMesher`에 block id별 메싱 속성 캐시를 추가했다. 서브청크 메싱 중 collision/renderShape/faceOccluder/aoOccluder/texture layer 판정이 `BlockRegistry`를 반복 조회하지 않고 캐시 배열을 직접 참조한다. 캐시는 `unique_ptr` 배열로 한 번 할당하고, 텍스처 레이어 확정 후 등록된 block definition만 덮어쓴다.
+
+- 월드 생성 시 decoration 영향 범위까지 포함한 density grid를 한 번 만들고, base terrain 생성 루프에서 surface grid도 함께 산출하도록 변경했다. plant/tree 배치는 이 surface grid를 공유하므로 tree 단계에서 별도 density grid와 highest solid 재계산을 하지 않는다.
+
+- 청크 메싱 입력 구성을 현재 청크와 8방향 이웃의 정식 `ChunkVoxelData` 기반으로 변경했다. 저장/캐시된 청크는 중앙 데이터를 다시 월드 생성하지 않고, 이웃 데이터가 없으면 `ensureChunkData`가 디스크 로드 또는 신규 생성 후 캐시에 보관해 padding에 재사용한다.
+
 - 월드 생성 장식 단계에 plant 배치를 추가했다. 표면 재질 적용 후 나무 생성 전에 최상단 블럭이 grass인 칸마다 seed 기반 40% 확률로 바로 위 air 칸에 `plant`를 배치한다. 이후 나무 생성 시 trunk와 leaves는 plant를 덮어쓸 수 있다.
 
 - block 정의 형식을 `renderShape`, `renderLayer`, `collision`, `raycast`, `faceOccluder`, `aoOccluder`로 분리했다. 기존 `solid`는 구버전 config fallback으로만 남기고, 충돌/레이캐스트/메시 가림/AO 판정은 각각 별도 속성을 사용한다.

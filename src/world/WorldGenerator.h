@@ -86,11 +86,6 @@ public:
     float landformRawAt(int x, int z) const;
     float landformCenterOffsetAt(int x, int z) const;
     GeneratedChunkColumn generateChunkColumn(ChunkCoord coord) const;
-    GeneratedChunkColumn generateChunkColumn(
-        ChunkCoord coord,
-        const std::vector<std::uint16_t>& blockIds,
-        const std::vector<std::uint8_t>& fluidIds,
-        const std::vector<std::uint8_t>& fluidAmounts) const;
     std::vector<std::uint16_t> generateChunkBlocks(ChunkCoord coord) const;
     std::vector<std::uint8_t> generateChunkFluids(ChunkCoord coord) const;
     ChunkVoxelData generateChunkVoxels(ChunkCoord coord) const;
@@ -118,6 +113,17 @@ private:
         std::vector<float> values;
 
         float valueAt(int localCellX, int cellY, int localCellZ) const;
+    };
+
+    struct SurfaceGrid
+    {
+        int minX = 0;
+        int minZ = 0;
+        int countX = 0;
+        int countZ = 0;
+        std::vector<int> highestSolidY;
+
+        int highestSolidYAt(int x, int z) const;
     };
 
     struct LandformLookup
@@ -153,10 +159,23 @@ private:
     DensityGrid buildDensityGrid(int minBlockX, int maxBlockX, int minBlockZ, int maxBlockZ) const;
     float interpolatedDensityAt(const DensityGrid& densityGrid, int x, int y, int z) const;
     int highestSolidYAt(const DensityGrid& densityGrid, int x, int z) const;
-    void generateBaseTerrain(ChunkCoord coord, GeneratedChunkColumn& column) const;
+    SurfaceGrid generateBaseTerrain(
+        ChunkCoord coord,
+        const DensityGrid& densityGrid,
+        int minBlockX,
+        int maxBlockX,
+        int minBlockZ,
+        int maxBlockZ,
+        GeneratedChunkColumn& column) const;
     void applySurfaceMaterials(GeneratedChunkColumn& column) const;
-    void applyPlantDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const;
-    void applyTreeDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const;
+    void applyPlantDecorations(
+        ChunkCoord coord,
+        const SurfaceGrid& surfaceGrid,
+        GeneratedChunkColumn& column) const;
+    void applyTreeDecorations(
+        ChunkCoord coord,
+        const SurfaceGrid& surfaceGrid,
+        GeneratedChunkColumn& column) const;
     void placeTreeInColumn(
         GeneratedChunkColumn& column,
         int minX,

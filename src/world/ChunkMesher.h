@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 class ChunkMesher
@@ -18,12 +19,6 @@ public:
 
     void setWaterTextureLayer(std::uint32_t textureLayer);
     ChunkBuildResult buildChunkMesh(ChunkCoord coord, std::uint64_t generation) const;
-    ChunkBuildResult buildChunkMesh(
-        ChunkCoord coord,
-        std::uint64_t generation,
-        const std::vector<std::uint16_t>& blockIds,
-        const std::vector<std::uint8_t>& fluidIds,
-        const std::vector<std::uint8_t>& fluidAmounts) const;
     ChunkBuildResult buildChunkMeshFromColumn(
         ChunkCoord coord,
         std::uint64_t generation,
@@ -88,7 +83,17 @@ public:
     SubchunkBuildResult buildSubchunkMesh(ChunkBuildRequest request) const;
 
 private:
-    const BlockDefinition* blockDefinitionForId(std::uint16_t blockId) const;
+    struct CachedBlockMeshInfo
+    {
+        BlockRenderShape renderShape = BlockRenderShape::None;
+        bool collision = false;
+        bool faceOccluder = false;
+        bool aoOccluder = false;
+        std::array<std::uint32_t, 3> textureLayers{};
+    };
+
+    void refreshBlockMeshInfo();
+    const CachedBlockMeshInfo& blockInfoForId(std::uint16_t blockId) const;
     bool isCollisionBlock(std::uint16_t blockId) const;
     bool isCubeBlock(std::uint16_t blockId) const;
     bool isFaceOccluderBlock(std::uint16_t blockId) const;
@@ -110,5 +115,6 @@ private:
 
     const WorldGenerator& worldGenerator_;
     const BlockRegistry& blockRegistry_;
+    std::unique_ptr<CachedBlockMeshInfo[]> blockMeshInfo_;
     std::uint32_t waterTextureLayer_ = 0;
 };

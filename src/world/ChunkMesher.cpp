@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 
 namespace
@@ -44,47 +45,63 @@ ChunkMesher::ChunkMesher(
     const BlockRegistry& blockRegistry)
     : worldGenerator_(worldGenerator)
     , blockRegistry_(blockRegistry)
+    , blockMeshInfo_(std::make_unique<CachedBlockMeshInfo[]>(kBlockIdCount))
 {
+    refreshBlockMeshInfo();
 }
 
 void ChunkMesher::setWaterTextureLayer(std::uint32_t textureLayer)
 {
     waterTextureLayer_ = textureLayer;
+    refreshBlockMeshInfo();
 }
 
-const BlockDefinition* ChunkMesher::blockDefinitionForId(std::uint16_t blockId) const
+void ChunkMesher::refreshBlockMeshInfo()
 {
-    return blockRegistry_.definitionForId(blockId);
+    if (!blockMeshInfo_)
+    {
+        blockMeshInfo_ = std::make_unique<CachedBlockMeshInfo[]>(kBlockIdCount);
+    }
+
+    for (const BlockDefinition& definition : blockRegistry_.definitions())
+    {
+        CachedBlockMeshInfo& info = blockMeshInfo_[definition.id];
+        info.renderShape = definition.renderShape;
+        info.collision = definition.collision;
+        info.faceOccluder = definition.faceOccluder;
+        info.aoOccluder = definition.aoOccluder;
+        info.textureLayers = definition.textureLayers;
+    }
+}
+
+const ChunkMesher::CachedBlockMeshInfo& ChunkMesher::blockInfoForId(std::uint16_t blockId) const
+{
+    return blockMeshInfo_[blockId];
 }
 
 bool ChunkMesher::isCollisionBlock(std::uint16_t blockId) const
 {
-    return blockRegistry_.isCollision(blockId);
+    return blockInfoForId(blockId).collision;
 }
 
 bool ChunkMesher::isCubeBlock(std::uint16_t blockId) const
 {
-    return blockRegistry_.renderShape(blockId) == BlockRenderShape::Cube;
+    return blockInfoForId(blockId).renderShape == BlockRenderShape::Cube;
 }
 
 bool ChunkMesher::isFaceOccluderBlock(std::uint16_t blockId) const
 {
-    return blockRegistry_.isFaceOccluder(blockId);
+    return blockInfoForId(blockId).faceOccluder;
 }
 
 bool ChunkMesher::isAoOccluderBlock(std::uint16_t blockId) const
 {
-    return blockRegistry_.isAoOccluder(blockId);
+    return blockInfoForId(blockId).aoOccluder;
 }
 
 std::uint32_t ChunkMesher::textureLayerForBlockFace(std::uint16_t blockId, BlockFace face) const
 {
-    const BlockDefinition* definition = blockDefinitionForId(blockId);
-    if (definition == nullptr)
-    {
-        return 0;
-    }
-    return definition->textureLayers[static_cast<std::size_t>(face)];
+    return blockInfoForId(blockId).textureLayers[static_cast<std::size_t>(face)];
 }
 
 SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) const
@@ -95,24 +112,26 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(ChunkBuildRequest request) co
 
 ChunkBuildResult ChunkMesher::buildChunkMesh(ChunkCoord coord, std::uint64_t generation) const
 {
-    ChunkVoxelData voxels = worldGenerator_.generateChunkVoxels(coord);
-    return buildChunkMesh(coord, generation, voxels.blockIds, voxels.fluidIds, voxels.fluidAmounts);
-}
-
-ChunkBuildResult ChunkMesher::buildChunkMesh(
-    ChunkCoord coord,
-    std::uint64_t generation,
-    const std::vector<std::uint16_t>& blockIds,
-    const std::vector<std::uint8_t>& fluidIds,
-    const std::vector<std::uint8_t>& fluidAmounts) const
-{
-    ChunkBuildResult result = buildChunkMesh(
-        coord,
-        generation,
-        worldGenerator_.generateChunkColumn(coord, blockIds, fluidIds, fluidAmounts));
-    result.blockIds = blockIds;
-    result.fluidIds = fluidIds;
-    result.fluidAmounts = fluidAmounts;
+    const GeneratedChunkColumn column = worldGenerator_.generateChunkColumn(coord);
+    ChunkBuildResult result = buildChunkMesh(coord, generation, column);
+    result.blockIds.resize(kChunkBlockCount);
+    result.fluidIds.resize(kChunkBlockCount);
+    result.fluidAmounts.resize(kChunkBlockCount);
+    for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
+    {
+        for (int localX = 0; localX < kChunkSizeX; ++localX)
+        {
+            for (int y = 0; y < kChunkHeight; ++y)
+            {
+                const std::size_t targetIndex = chunkBlockIndex(localX, y, localZ);
+                const int localPaddedX = localX + GeneratedChunkColumn::kPadding;
+                const int localPaddedZ = localZ + GeneratedChunkColumn::kPadding;
+                result.blockIds[targetIndex] = column.blockAt(localPaddedX, y, localPaddedZ);
+                result.fluidIds[targetIndex] = column.fluidIdAt(localPaddedX, y, localPaddedZ);
+                result.fluidAmounts[targetIndex] = column.fluidAt(localPaddedX, y, localPaddedZ);
+            }
+        }
+    }
     return result;
 }
 
@@ -204,7 +223,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
         const int chunkBaseZ = chunkZ * kChunkSizeZ;
         const int subchunkMinY = subchunkY * kSubchunkSize;
 
-        int occupiedCellCount = 0;
+        bool hasOccupiedCell = false;
+        bool fullyOccludedCandidate = true;
         for (int localPaddedZ = 1; localPaddedZ <= kChunkSizeZ; ++localPaddedZ)
         {
             for (int localPaddedX = 1; localPaddedX <= kChunkSizeX; ++localPaddedX)
@@ -212,17 +232,22 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 for (int localY = 0; localY < kSubchunkSize; ++localY)
                 {
                     const int y = subchunkMinY + localY;
-                    if (column.blockAt(localPaddedX, y, localPaddedZ) != kAirBlockId ||
-                        (column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId &&
-                            column.fluidAt(localPaddedX, y, localPaddedZ) > 0))
+                    const std::uint16_t blockId = column.blockAt(localPaddedX, y, localPaddedZ);
+                    const bool hasFluid = column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId &&
+                        column.fluidAt(localPaddedX, y, localPaddedZ) > 0;
+                    if (blockId != kAirBlockId || hasFluid)
                     {
-                        ++occupiedCellCount;
+                        hasOccupiedCell = true;
+                    }
+                    if (hasFluid || !isFaceOccluderBlock(blockId))
+                    {
+                        fullyOccludedCandidate = false;
                     }
                 }
             }
         }
 
-        if (occupiedCellCount == 0)
+        if (!hasOccupiedCell)
         {
             return {
                 chunk,
@@ -231,6 +256,56 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 {},
                 {},
             };
+        }
+
+        auto isFaceOccluderAt = [&](int localPaddedX, int y, int localPaddedZ) -> bool
+        {
+            if (y < 0 || y >= kChunkHeight)
+            {
+                return false;
+            }
+            return isFaceOccluderBlock(column.blockAt(localPaddedX, y, localPaddedZ));
+        };
+
+        if (fullyOccludedCandidate)
+        {
+            bool boundaryOccluded = true;
+            const int subchunkMaxY = subchunkMinY + kSubchunkSize - 1;
+            for (int y = subchunkMinY; y <= subchunkMaxY && boundaryOccluded; ++y)
+            {
+                for (int localPaddedZ = 1; localPaddedZ <= kChunkSizeZ && boundaryOccluded; ++localPaddedZ)
+                {
+                    boundaryOccluded =
+                        isFaceOccluderAt(0, y, localPaddedZ) &&
+                        isFaceOccluderAt(kChunkSizeX + 1, y, localPaddedZ);
+                }
+                for (int localPaddedX = 1; localPaddedX <= kChunkSizeX && boundaryOccluded; ++localPaddedX)
+                {
+                    boundaryOccluded =
+                        isFaceOccluderAt(localPaddedX, y, 0) &&
+                        isFaceOccluderAt(localPaddedX, y, kChunkSizeZ + 1);
+                }
+            }
+            for (int localPaddedZ = 1; localPaddedZ <= kChunkSizeZ && boundaryOccluded; ++localPaddedZ)
+            {
+                for (int localPaddedX = 1; localPaddedX <= kChunkSizeX && boundaryOccluded; ++localPaddedX)
+                {
+                    boundaryOccluded =
+                        isFaceOccluderAt(localPaddedX, subchunkMinY - 1, localPaddedZ) &&
+                        isFaceOccluderAt(localPaddedX, subchunkMinY + kSubchunkSize, localPaddedZ);
+                }
+            }
+
+            if (boundaryOccluded)
+            {
+                return {
+                    chunk,
+                    subchunkY,
+                    request.generation,
+                    {},
+                    {},
+                };
+            }
         }
 
         auto isSolid = [&](int x, int y, int z) -> bool
@@ -861,7 +936,7 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     {
                         const int y = subchunkMinY + localY;
                         const std::uint16_t blockId = blockIdAt(x, y, z);
-                        if (blockRegistry_.renderShape(blockId) != BlockRenderShape::Cross)
+                        if (blockInfoForId(blockId).renderShape != BlockRenderShape::Cross)
                         {
                             continue;
                         }

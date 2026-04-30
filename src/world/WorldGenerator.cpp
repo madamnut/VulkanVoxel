@@ -126,6 +126,23 @@ float WorldGenerator::DensityGrid::valueAt(int localCellX, int cellY, int localC
     return values[index];
 }
 
+int WorldGenerator::SurfaceGrid::highestSolidYAt(int x, int z) const
+{
+    const int localX = x - minX;
+    const int localZ = z - minZ;
+    if (localX < 0 || localX >= countX || localZ < 0 || localZ >= countZ)
+    {
+        throw std::out_of_range("SurfaceGrid coordinate is out of range.");
+    }
+
+    const std::size_t index = static_cast<std::size_t>(localZ * countX + localX);
+    if (index >= highestSolidY.size())
+    {
+        throw std::out_of_range("SurfaceGrid storage is invalid.");
+    }
+    return highestSolidY[index];
+}
+
 WorldGenerator::WorldGenerator()
 {
     setSeed(0);
@@ -346,55 +363,25 @@ float WorldGenerator::landformRawAt(int x, int z) const
 GeneratedChunkColumn WorldGenerator::generateChunkColumn(ChunkCoord coord) const
 {
     std::shared_lock lock(generatorMutex_);
+    const int chunkBaseX = coord.x * kChunkSizeX;
+    const int chunkBaseZ = coord.z * kChunkSizeZ;
+    const int columnMinX = chunkBaseX - GeneratedChunkColumn::kPadding;
+    const int columnMaxX = chunkBaseX + kChunkSizeX - 1 + GeneratedChunkColumn::kPadding;
+    const int columnMinZ = chunkBaseZ - GeneratedChunkColumn::kPadding;
+    const int columnMaxZ = chunkBaseZ + kChunkSizeZ - 1 + GeneratedChunkColumn::kPadding;
+    const int candidateMinX = columnMinX - kTreeDecorationReach;
+    const int candidateMaxX = columnMaxX + kTreeDecorationReach;
+    const int candidateMinZ = columnMinZ - kTreeDecorationReach;
+    const int candidateMaxZ = columnMaxZ + kTreeDecorationReach;
+    const DensityGrid densityGrid = buildDensityGrid(candidateMinX, candidateMaxX, candidateMinZ, candidateMaxZ);
+
     GeneratedChunkColumn column{};
-    generateBaseTerrain(coord, column);
+    const SurfaceGrid surfaceGrid =
+        generateBaseTerrain(coord, densityGrid, candidateMinX, candidateMaxX, candidateMinZ, candidateMaxZ, column);
     applySurfaceMaterials(column);
-    applyPlantDecorations(coord, column);
-    applyTreeDecorations(coord, column);
+    applyPlantDecorations(coord, surfaceGrid, column);
+    applyTreeDecorations(coord, surfaceGrid, column);
     applyBlockOverrides(coord, column);
-    return column;
-}
-
-GeneratedChunkColumn WorldGenerator::generateChunkColumn(
-    ChunkCoord coord,
-    const std::vector<std::uint16_t>& blockIds,
-    const std::vector<std::uint8_t>& fluidIds,
-    const std::vector<std::uint8_t>& fluidAmounts) const
-{
-    if (blockIds.size() != kChunkBlockCount ||
-        fluidIds.size() != kChunkBlockCount ||
-        fluidAmounts.size() != kChunkBlockCount)
-    {
-        throw std::runtime_error("Cannot build chunk column from invalid voxel data.");
-    }
-
-    GeneratedChunkColumn column = generateChunkColumn(coord);
-    for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
-    {
-        for (int localX = 0; localX < kChunkSizeX; ++localX)
-        {
-            for (int y = 0; y < kChunkHeight; ++y)
-            {
-                const std::size_t sourceIndex = chunkBlockIndex(localX, y, localZ);
-                const std::uint16_t blockId = blockIds[sourceIndex];
-                std::uint8_t fluidId = fluidIds[sourceIndex];
-                std::uint8_t fluidAmount = std::min(fluidAmounts[sourceIndex], kMaxFluidAmount);
-                if (blockId != kAirBlockId ||
-                    fluidId != kWaterFluidId ||
-                    fluidAmount == 0)
-                {
-                    fluidId = kNoFluidId;
-                    fluidAmount = 0;
-                }
-                column.blockAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding) =
-                    blockId;
-                column.fluidIdAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding) =
-                    fluidId;
-                column.fluidAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding) =
-                    fluidAmount;
-            }
-        }
-    }
     return column;
 }
 
@@ -460,25 +447,56 @@ ChunkVoxelData WorldGenerator::generateChunkVoxels(ChunkCoord coord) const
     return voxels;
 }
 
-void WorldGenerator::generateBaseTerrain(ChunkCoord coord, GeneratedChunkColumn& column) const
+WorldGenerator::SurfaceGrid WorldGenerator::generateBaseTerrain(
+    ChunkCoord coord,
+    const DensityGrid& densityGrid,
+    int minBlockX,
+    int maxBlockX,
+    int minBlockZ,
+    int maxBlockZ,
+    GeneratedChunkColumn& column) const
 {
     const int chunkBaseX = coord.x * kChunkSizeX;
     const int chunkBaseZ = coord.z * kChunkSizeZ;
-    const int minX = chunkBaseX - GeneratedChunkColumn::kPadding;
-    const int maxX = chunkBaseX + kChunkSizeX - 1 + GeneratedChunkColumn::kPadding;
-    const int minZ = chunkBaseZ - GeneratedChunkColumn::kPadding;
-    const int maxZ = chunkBaseZ + kChunkSizeZ - 1 + GeneratedChunkColumn::kPadding;
-    const DensityGrid densityGrid = buildDensityGrid(minX, maxX, minZ, maxZ);
+    const int columnMinX = chunkBaseX - GeneratedChunkColumn::kPadding;
+    const int columnMaxX = chunkBaseX + kChunkSizeX - 1 + GeneratedChunkColumn::kPadding;
+    const int columnMinZ = chunkBaseZ - GeneratedChunkColumn::kPadding;
+    const int columnMaxZ = chunkBaseZ + kChunkSizeZ - 1 + GeneratedChunkColumn::kPadding;
 
-    for (int localPaddedZ = 0; localPaddedZ < GeneratedChunkColumn::kDepth; ++localPaddedZ)
+    SurfaceGrid surfaceGrid{};
+    surfaceGrid.minX = minBlockX;
+    surfaceGrid.minZ = minBlockZ;
+    surfaceGrid.countX = maxBlockX - minBlockX + 1;
+    surfaceGrid.countZ = maxBlockZ - minBlockZ + 1;
+    surfaceGrid.highestSolidY.resize(static_cast<std::size_t>(surfaceGrid.countX * surfaceGrid.countZ), -1);
+
+    for (int z = minBlockZ; z <= maxBlockZ; ++z)
     {
-        const int z = minZ + localPaddedZ;
-        for (int localPaddedX = 0; localPaddedX < GeneratedChunkColumn::kWidth; ++localPaddedX)
+        const int localZ = z - minBlockZ;
+        const bool inColumnZ = z >= columnMinZ && z <= columnMaxZ;
+        const int localPaddedZ = z - columnMinZ;
+        for (int x = minBlockX; x <= maxBlockX; ++x)
         {
-            const int x = minX + localPaddedX;
+            const int localX = x - minBlockX;
+            const bool inColumn = inColumnZ && x >= columnMinX && x <= columnMaxX;
+            const int localPaddedX = x - columnMinX;
+            int highestSolidY = -1;
+
             for (int y = 0; y < kChunkHeight; ++y)
             {
-                if (interpolatedDensityAt(densityGrid, x, y, z) >= 0.0f)
+                const float density = interpolatedDensityAt(densityGrid, x, y, z);
+                const bool solid = density >= 0.0f;
+                if (solid)
+                {
+                    highestSolidY = y;
+                }
+
+                if (!inColumn)
+                {
+                    continue;
+                }
+
+                if (solid)
                 {
                     column.blockAt(localPaddedX, y, localPaddedZ) = kRockBlockId;
                 }
@@ -488,8 +506,13 @@ void WorldGenerator::generateBaseTerrain(ChunkCoord coord, GeneratedChunkColumn&
                     column.fluidAt(localPaddedX, y, localPaddedZ) = kMaxFluidAmount;
                 }
             }
+
+            surfaceGrid.highestSolidY[static_cast<std::size_t>(localZ * surfaceGrid.countX + localX)] =
+                highestSolidY;
         }
     }
+
+    return surfaceGrid;
 }
 
 int WorldGenerator::floorDiv(int value, int divisor)
@@ -809,7 +832,10 @@ void WorldGenerator::applySurfaceMaterials(GeneratedChunkColumn& column) const
     }
 }
 
-void WorldGenerator::applyPlantDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const
+void WorldGenerator::applyPlantDecorations(
+    ChunkCoord coord,
+    const SurfaceGrid& surfaceGrid,
+    GeneratedChunkColumn& column) const
 {
     const int minX = coord.x * kChunkSizeX - GeneratedChunkColumn::kPadding;
     const int minZ = coord.z * kChunkSizeZ - GeneratedChunkColumn::kPadding;
@@ -820,33 +846,33 @@ void WorldGenerator::applyPlantDecorations(ChunkCoord coord, GeneratedChunkColum
         for (int localPaddedX = 0; localPaddedX < GeneratedChunkColumn::kWidth; ++localPaddedX)
         {
             const int x = minX + localPaddedX;
-            for (int y = kChunkHeight - 1; y >= 0; --y)
+            const int y = surfaceGrid.highestSolidYAt(x, z);
+            if (y < 0)
             {
-                if (column.blockAt(localPaddedX, y, localPaddedZ) == kAirBlockId)
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                if (column.blockAt(localPaddedX, y, localPaddedZ) != kGrassBlockId ||
-                    y + 1 >= kChunkHeight ||
-                    column.blockAt(localPaddedX, y + 1, localPaddedZ) != kAirBlockId ||
-                    column.fluidIdAt(localPaddedX, y + 1, localPaddedZ) != kNoFluidId ||
-                    column.fluidAt(localPaddedX, y + 1, localPaddedZ) != 0)
-                {
-                    break;
-                }
+            if (column.blockAt(localPaddedX, y, localPaddedZ) != kGrassBlockId ||
+                y + 1 >= kChunkHeight ||
+                column.blockAt(localPaddedX, y + 1, localPaddedZ) != kAirBlockId ||
+                column.fluidIdAt(localPaddedX, y + 1, localPaddedZ) != kNoFluidId ||
+                column.fluidAt(localPaddedX, y + 1, localPaddedZ) != 0)
+            {
+                continue;
+            }
 
-                if (treeHash(seed_, x, z, 0x1f8215d5919b6c7dull) % 100 < kPlantSpawnChancePercent)
-                {
-                    column.blockAt(localPaddedX, y + 1, localPaddedZ) = kPlantBlockId;
-                }
-                break;
+            if (treeHash(seed_, x, z, 0x1f8215d5919b6c7dull) % 100 < kPlantSpawnChancePercent)
+            {
+                column.blockAt(localPaddedX, y + 1, localPaddedZ) = kPlantBlockId;
             }
         }
     }
 }
 
-void WorldGenerator::applyTreeDecorations(ChunkCoord coord, GeneratedChunkColumn& column) const
+void WorldGenerator::applyTreeDecorations(
+    ChunkCoord coord,
+    const SurfaceGrid& surfaceGrid,
+    GeneratedChunkColumn& column) const
 {
     const int chunkBaseX = coord.x * kChunkSizeX;
     const int chunkBaseZ = coord.z * kChunkSizeZ;
@@ -858,13 +884,12 @@ void WorldGenerator::applyTreeDecorations(ChunkCoord coord, GeneratedChunkColumn
     const int candidateMaxX = columnMaxX + kTreeDecorationReach;
     const int candidateMinZ = columnMinZ - kTreeDecorationReach;
     const int candidateMaxZ = columnMaxZ + kTreeDecorationReach;
-    const DensityGrid densityGrid = buildDensityGrid(candidateMinX, candidateMaxX, candidateMinZ, candidateMaxZ);
 
     for (int z = candidateMinZ; z <= candidateMaxZ; ++z)
     {
         for (int x = candidateMinX; x <= candidateMaxX; ++x)
         {
-            const int highestSolidY = highestSolidYAt(densityGrid, x, z);
+            const int highestSolidY = surfaceGrid.highestSolidYAt(x, z);
             if (highestSolidY < 0 || highestSolidY + 1 <= kInitialWaterLevel)
             {
                 continue;
