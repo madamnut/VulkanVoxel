@@ -220,10 +220,6 @@ WorldConfig loadWorldConfigFile(
         readInt(config, "chunkUploadsPerFrame", defaults.chunkUploadsPerFrame),
         minimums.chunkUploadsPerFrame,
         maximums.chunkUploadsPerFrame);
-    result.chunkBuildThreads = std::clamp(
-        readInt(config, "chunkBuildThreads", defaults.chunkBuildThreads),
-        minimums.chunkBuildThreads,
-        maximums.chunkBuildThreads);
     result.terrainDensity = readTerrainDensityConfig(
         config,
         defaults.terrainDensity,

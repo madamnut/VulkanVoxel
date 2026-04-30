@@ -142,11 +142,15 @@ VkCommandBuffer VulkanResourceContext::submitSingleTimeCommands(VkCommandBuffer 
 VkCommandBuffer VulkanResourceContext::copyBuffer(
     VkBuffer sourceBuffer,
     VkBuffer destinationBuffer,
-    VkDeviceSize size) const
+    VkDeviceSize size,
+    VkDeviceSize sourceOffset,
+    VkDeviceSize destinationOffset) const
 {
     VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
     VkBufferCopy copyRegion{};
+    copyRegion.srcOffset = sourceOffset;
+    copyRegion.dstOffset = destinationOffset;
     copyRegion.size = size;
     vkCmdCopyBuffer(commandBuffer, sourceBuffer, destinationBuffer, 1, &copyRegion);
 

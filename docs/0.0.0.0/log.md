@@ -2,6 +2,20 @@
 
 ## 2026-04-30
 
+- `world.json`의 `chunkBuildThreads` 옵션을 제거했다. 청크 빌드 worker 수는 실행 시 `std::thread::hardware_concurrency()`에서 6개를 뺀 값으로 자동 설정하며, 6개 이하이거나 값을 얻지 못하는 환경에서는 최소 1개를 사용한다.
+
+- F3 디버그 텍스트 표시를 3단계 순환으로 바꿨다. 기본 모드는 기존 좌상단/우상단 정보를 표시하고, 프로파일러 모드는 병목 확인용 프레임/청크 빌드/업로드/visibility/record/submit 지표를 좌상단에만 표시하며, 마지막 모드는 디버그 텍스트를 숨긴다.
+
+- 청크 메시 결과 누적 경로를 외부 `ChunkBuildResult` 직접 수정 방식에서 메셔 내부 로컬 결과를 완성한 뒤 반환하는 방식으로 바꿨다. worker thread에서 `fluidSubchunks` push 중 vector 재할당 경로로 떨어지는 문제를 외부 결과 객체 메타데이터 손상 가능성과 분리하기 위한 변경이다.
+
+- `buildSubchunkMesh` 내부의 localY별 임시 vertex/index vector 16개를 제거하고, 서브청크 결과 vector에 직접 face를 append하도록 단순화했다. worker thread에서 작은 임시 vector들이 반복 재할당/병합되던 경로를 없애 heap 손상 지점과 할당 횟수를 줄였다.
+
+- `ChunkBuildResult` 파괴 시점에 드러나던 vector heap 손상 가능성을 좁히기 위해 청크 메시 생성/업로드 경로에 검증을 추가했다. 매셔의 localY별 임시 배열 접근을 범위 체크하고, subchunk index가 local vertex 범위를 벗어나면 즉시 예외를 던지며, 메인 스레드 업로드 직전 block/fluid draw range와 triangle index 정렬을 검증해 잘못된 결과는 로그로 남기고 업로드하지 않도록 했다.
+
+- 프러스텀 컬링 결과를 visible draw list로 분리했다. uniform/frustum 갱신 후 block/fluid visible subchunk 목록을 먼저 만들고, command buffer record 단계는 이 목록만 순회한다. 좌하단 프로파일러에는 visibility list 생성 시간도 표시한다.
+
+- 프러스텀 컬링에 청크 단위 coarse culling을 추가했다. 청크 전체 AABB가 렌더 카메라 frustum 밖이면 해당 청크의 block/fluid 서브청크 컬링과 draw 기록을 통째로 건너뛴다.
+
 - 좌하단 디버그 텍스트에 프레임 프로파일러 타이밍을 추가했다. frame cpu, fence, acquire, load, completed build 처리, upload, uniform, debug, command record, submit/present 시간을 ms 단위로 표시한다.
 
 - 렌더 카메라 기준 프러스텀 컬링을 추가했다. `renderCameraPosition()`과 `renderCameraForward()`로 3인칭 카메라 위치까지 반영한 frustum을 만들고, block/fluid 서브청크 AABB가 frustum 밖이면 draw를 생략한다. 디버그 텍스트에는 visible/culled subchunk 수를 표시한다.
@@ -173,3 +187,18 @@
 - 세이브 파일 구조를 추가했다. `saves/world/world.bin`에는 플레이어 위치/시선/이동 모드/카메라 모드만 저장하고, `saves/world/regions/r.<x>.<z>.vvr` region 파일은 16x16 청크 table과 4KB sector-aligned payload 영역으로 구성한다.
 - 청크 payload는 전체 16x512x16 block id 배열을 컬럼 단위 `localZ -> localX -> y` 순서로 만들고 RLE 인코딩 후 LZ4로 압축해 저장한다. 새로 생성된 청크는 생성 직후 저장하고, 이후 편집된 dirty 청크만 언로드/종료 시 다시 저장한다.
 - 실행마다 `logs/YYYYMMDD-HHMMSS.log` 파일을 생성해 세이브/로드 경로와 오류를 기록하도록 했다. LZ4는 `third_party/lz4`에 소스를 포함해 빌드 환경 차이를 줄인다.
+- 청크 메쉬 GPU 저장 방식을 청크별 개별 vertex/index buffer에서 block/fluid 전역 mesh arena buffer로 바꿨다. 업로드 시 arena 할당 offset을 서브청크 draw range에 반영하고, command record 단계에서는 block/fluid arena buffer를 각각 한 번만 bind한 뒤 보이는 서브청크 draw list만 순회한다.
+- 보이는 block/fluid 서브청크 draw range를 매 프레임 `VkDrawIndexedIndirectCommand` 목록으로 변환해 `vkCmdDrawIndexedIndirect`로 묶어서 기록하도록 했다. `multiDrawIndirect`가 지원되면 여러 서브청크를 한 호출로 묶고, 미지원 장치에서는 Vulkan feature 조건에 맞춰 1개씩 나눠 기록한다. 우측 `DRAWS` 수치는 이제 서브청크 개별 draw가 아니라 indirect batch 호출 기준으로 표시된다.
+- visible list 생성 시간과 indirect command buffer 업로드 시간을 분리해 좌하단에 `VISIBILITY`와 `INDIRECT`로 각각 표시한다. 프레임별 indirect buffer는 persistent mapped host-visible buffer로 유지해 매 프레임 `vkMapMemory`/`vkUnmapMemory` 비용을 제거했다.
+- 유체 데이터를 `fluidId + fluidAmount` 두 배열에서 `uint16_t fluidState` 단일 배열로 변경했다. `0`은 빈 유체, `1~100`은 물의 양을 직접 나타내며, 이후 유체는 100 단위 구간으로 배치할 수 있다. 청크 저장 RLE payload도 block id와 fluidState를 함께 저장하도록 정리했다.
+- 좌하단 디버그 텍스트를 현재 성능 분석용 지표 중심으로 재구성했다. 청크 worker build 결과에 data 준비, disk load, generate, disk save, meshing column 생성, mesh 생성 시간을 담아 업로드 프레임에 표시하고, load queue/unload, main thread upload, visibility, indirect, record, submit 시간을 함께 보여준다.
+- worker와 메인 스레드 사이의 `ChunkBuildResult` 전달을 값 이동 방식에서 `shared_ptr` 전달 방식으로 바꿨다. 대형 vector를 가진 청크 결과가 worker return, completed queue pop 과정에서 반복적으로 move-construction/move-assignment 되는 경로를 제거했다.
+- `ChunkBuildResult`에서 청크 voxel 원본 데이터(`blockIds`, `fluidStates`)를 제거했다. worker 결과는 메쉬와 프로파일만 들고, 메인 스레드는 업로드 시 이미 준비된 chunk data cache에서 voxel 데이터를 다시 가져와 loaded chunk로 등록한다.
+- 좌하단 프로파일 시간 항목은 현재값 옆에 최근 3초 피크값을 `[peak]` 형태로 함께 표시하도록 했다. 순간적으로 튀는 병목도 화면 캡쳐로 확인하기 쉽다.
+- `F2` 키로 현재 게임 창 클라이언트 영역을 캡쳐해 `screenshots/screenshot-YYYYMMDD-HHMMSS-ms.png` 파일로 저장하도록 했다.
+- `F2` 스크린샷 캡쳐를 Win32 창 DC 복사 방식에서 Vulkan swapchain image readback 방식으로 변경했다. 전체화면에서도 실제 렌더 framebuffer 해상도 기준으로 PNG가 저장된다.
+- 좌하단 청크 worker 프로파일의 `DATA 9CH`를 loaded chunk 조회, chunk data cache 조회, 다른 worker 대기, miss load/generate, voxel data copy, cache store 시간으로 세분화했다.
+- 청크 메셔의 y 범위 밖 이웃 조회를 air/no fluid로 처리하도록 명시했다. 최하단/최상단 face, AO, fluid face 판정에서 `y=-1` 또는 `y=512`를 직접 읽지 않도록 방어했다.
+- `ChunkMesher::appendChunkMeshFromPreparedColumn` 구현을 cpp로 두고, 준비된 column 기반 청크 메쉬 조립 경로를 한 곳으로 정리했다.
+- `buildSubchunkMesh`의 localY별 block/fluid vertex/index 임시 배열을 heap 할당으로 바꿔 worker 스레드의 대형 스택 사용을 줄였다.
+- 월드 생성기 프로파일을 세분화했다. `GENERATE` 내부를 generator lock, density grid, base terrain, surface material, plant, tree, override, voxel copy 시간으로 나눠 좌하단 디버그 텍스트에 표시한다.

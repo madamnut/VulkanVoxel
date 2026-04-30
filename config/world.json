@@ -1,7 +1,6 @@
 {
   "chunkLoadRadius": 30,
   "chunkUploadsPerFrame": 64,
-  "chunkBuildThreads": 4,
   "terrainDensity": {
     "gradient": {
       "center": 0.4, //0.4 기본 높이 205

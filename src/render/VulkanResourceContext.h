@@ -27,7 +27,12 @@ public:
         std::uint32_t arrayLayers = 1,
         std::uint32_t mipLevels = 1) const;
 
-    VkCommandBuffer copyBuffer(VkBuffer sourceBuffer, VkBuffer destinationBuffer, VkDeviceSize size) const;
+    VkCommandBuffer copyBuffer(
+        VkBuffer sourceBuffer,
+        VkBuffer destinationBuffer,
+        VkDeviceSize size,
+        VkDeviceSize sourceOffset = 0,
+        VkDeviceSize destinationOffset = 0) const;
 
     VkCommandBuffer transitionImageLayout(
         VkImage image,

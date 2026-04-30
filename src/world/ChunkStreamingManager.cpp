@@ -4,6 +4,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <string>
 
 namespace
@@ -48,7 +49,8 @@ void ChunkStreamingManager::setBuildThreadCount(int buildThreadCount)
     buildThreadCount_ = buildThreadCount;
 }
 
-void ChunkStreamingManager::setChunkBuildCallback(std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> callback)
+void ChunkStreamingManager::setChunkBuildCallback(
+    std::function<std::shared_ptr<ChunkBuildResult>(ChunkCoord, std::uint64_t)> callback)
 {
     chunkBuildCallback_ = std::move(callback);
 }
@@ -259,20 +261,20 @@ std::size_t ChunkStreamingManager::processCompletedSubchunkBuilds()
     return processedCount;
 }
 
-bool ChunkStreamingManager::popCompletedChunkBuild(ChunkBuildResult& result)
+std::shared_ptr<ChunkBuildResult> ChunkStreamingManager::popCompletedChunkBuild()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (completedChunks_.empty())
     {
-        return false;
+        return {};
     }
 
-    result = std::move(completedChunks_.front());
+    std::shared_ptr<ChunkBuildResult> result = std::move(completedChunks_.front());
     completedChunks_.pop_front();
-    queuedChunks_.erase(result.coord);
-    queuedGenerations_.erase(result.coord);
-    pendingChunkMeshes_.erase(result.coord);
-    return true;
+    queuedChunks_.erase(result->coord);
+    queuedGenerations_.erase(result->coord);
+    pendingChunkMeshes_.erase(result->coord);
+    return result;
 }
 
 bool ChunkStreamingManager::shouldAcceptCompletedChunk(ChunkCoord coord) const
@@ -384,12 +386,18 @@ void ChunkStreamingManager::workerLoop()
             continue;
         }
 
-        ChunkBuildResult result{};
+        std::shared_ptr<ChunkBuildResult> result;
         try
         {
-            result = chunkBuildCallback_
-                ? chunkBuildCallback_(request.coord, request.generation)
-                : chunkMesher_.buildChunkMesh(request.coord, request.generation);
+            if (!chunkBuildCallback_)
+            {
+                throw std::runtime_error("Missing chunk build callback.");
+            }
+            result = chunkBuildCallback_(request.coord, request.generation);
+            if (!result)
+            {
+                throw std::runtime_error("Chunk build callback returned no result.");
+            }
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -519,10 +527,12 @@ bool ChunkStreamingManager::isChunkInCurrentLoadRangeLocked(ChunkCoord coord) co
     return isChunkInLoadRange(coord, loadedCenterChunkX_, loadedCenterChunkZ_);
 }
 
-ChunkBuildResult ChunkStreamingManager::assembleChunkMesh(ChunkCoord coord, PendingChunkMesh& pendingMesh) const
+std::shared_ptr<ChunkBuildResult> ChunkStreamingManager::assembleChunkMesh(
+    ChunkCoord coord,
+    PendingChunkMesh& pendingMesh) const
 {
-    ChunkBuildResult result{};
-    result.coord = coord;
+    auto result = std::make_shared<ChunkBuildResult>();
+    result->coord = coord;
 
     std::size_t vertexCount = 0;
     std::size_t indexCount = 0;
@@ -536,12 +546,12 @@ ChunkBuildResult ChunkStreamingManager::assembleChunkMesh(ChunkCoord coord, Pend
         fluidIndexCount += pendingMesh.fluidIndices[static_cast<std::size_t>(subchunkY)].size();
     }
 
-    result.vertices.reserve(vertexCount);
-    result.indices.reserve(indexCount);
-    result.subchunks.reserve(kSubchunksPerChunk);
-    result.fluidVertices.reserve(fluidVertexCount);
-    result.fluidIndices.reserve(fluidIndexCount);
-    result.fluidSubchunks.reserve(kSubchunksPerChunk);
+    result->vertices.reserve(vertexCount);
+    result->indices.reserve(indexCount);
+    result->subchunks.reserve(kSubchunksPerChunk);
+    result->fluidVertices.reserve(fluidVertexCount);
+    result->fluidIndices.reserve(fluidIndexCount);
+    result->fluidSubchunks.reserve(kSubchunksPerChunk);
 
     for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
     {
@@ -557,13 +567,13 @@ ChunkBuildResult ChunkStreamingManager::assembleChunkMesh(ChunkCoord coord, Pend
         draw.chunkZ = coord.z;
         draw.subchunkY = subchunkY;
         draw.range.vertexCount = static_cast<std::uint32_t>(sourceVertices.size());
-        draw.range.firstIndex = static_cast<std::uint32_t>(result.indices.size());
+        draw.range.firstIndex = static_cast<std::uint32_t>(result->indices.size());
         draw.range.indexCount = static_cast<std::uint32_t>(sourceIndices.size());
-        draw.range.vertexOffset = static_cast<std::int32_t>(result.vertices.size());
+        draw.range.vertexOffset = static_cast<std::int32_t>(result->vertices.size());
 
-        result.vertices.insert(result.vertices.end(), sourceVertices.begin(), sourceVertices.end());
-        result.indices.insert(result.indices.end(), sourceIndices.begin(), sourceIndices.end());
-        result.subchunks.push_back(draw);
+        result->vertices.insert(result->vertices.end(), sourceVertices.begin(), sourceVertices.end());
+        result->indices.insert(result->indices.end(), sourceIndices.begin(), sourceIndices.end());
+        result->subchunks.push_back(draw);
     }
 
     for (int subchunkY = 0; subchunkY < kSubchunksPerChunk; ++subchunkY)
@@ -580,13 +590,13 @@ ChunkBuildResult ChunkStreamingManager::assembleChunkMesh(ChunkCoord coord, Pend
         draw.chunkZ = coord.z;
         draw.subchunkY = subchunkY;
         draw.range.vertexCount = static_cast<std::uint32_t>(sourceVertices.size());
-        draw.range.firstIndex = static_cast<std::uint32_t>(result.fluidIndices.size());
+        draw.range.firstIndex = static_cast<std::uint32_t>(result->fluidIndices.size());
         draw.range.indexCount = static_cast<std::uint32_t>(sourceIndices.size());
-        draw.range.vertexOffset = static_cast<std::int32_t>(result.fluidVertices.size());
+        draw.range.vertexOffset = static_cast<std::int32_t>(result->fluidVertices.size());
 
-        result.fluidVertices.insert(result.fluidVertices.end(), sourceVertices.begin(), sourceVertices.end());
-        result.fluidIndices.insert(result.fluidIndices.end(), sourceIndices.begin(), sourceIndices.end());
-        result.fluidSubchunks.push_back(draw);
+        result->fluidVertices.insert(result->fluidVertices.end(), sourceVertices.begin(), sourceVertices.end());
+        result->fluidIndices.insert(result->fluidIndices.end(), sourceIndices.begin(), sourceIndices.end());
+        result->fluidSubchunks.push_back(draw);
     }
 
     return result;

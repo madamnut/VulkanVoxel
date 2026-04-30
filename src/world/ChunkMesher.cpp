@@ -6,7 +6,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace
@@ -114,28 +116,18 @@ ChunkBuildResult ChunkMesher::buildChunkMesh(ChunkCoord coord, std::uint64_t gen
 {
     const GeneratedChunkColumn column = worldGenerator_.generateChunkColumn(coord);
     ChunkBuildResult result = buildChunkMesh(coord, generation, column);
-    result.blockIds.resize(kChunkBlockCount);
-    result.fluidIds.resize(kChunkBlockCount);
-    result.fluidAmounts.resize(kChunkBlockCount);
-    for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
-    {
-        for (int localX = 0; localX < kChunkSizeX; ++localX)
-        {
-            for (int y = 0; y < kChunkHeight; ++y)
-            {
-                const std::size_t targetIndex = chunkBlockIndex(localX, y, localZ);
-                const int localPaddedX = localX + GeneratedChunkColumn::kPadding;
-                const int localPaddedZ = localZ + GeneratedChunkColumn::kPadding;
-                result.blockIds[targetIndex] = column.blockAt(localPaddedX, y, localPaddedZ);
-                result.fluidIds[targetIndex] = column.fluidIdAt(localPaddedX, y, localPaddedZ);
-                result.fluidAmounts[targetIndex] = column.fluidAt(localPaddedX, y, localPaddedZ);
-            }
-        }
-    }
     return result;
 }
 
 ChunkBuildResult ChunkMesher::buildChunkMesh(
+    ChunkCoord coord,
+    std::uint64_t generation,
+    const GeneratedChunkColumn& column) const
+{
+    return buildChunkMeshFromPreparedColumn(coord, generation, column);
+}
+
+ChunkBuildResult ChunkMesher::buildChunkMeshFromPreparedColumn(
     ChunkCoord coord,
     std::uint64_t generation,
     const GeneratedChunkColumn& column) const
@@ -162,6 +154,14 @@ ChunkBuildResult ChunkMesher::buildChunkMesh(
 
         if (!subchunk.indices.empty())
         {
+            if (subchunk.vertices.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) ||
+                subchunk.indices.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) ||
+                result.vertices.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+                result.indices.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+            {
+                throw std::runtime_error("Chunk mesh is too large for Vulkan indirect draw ranges.");
+            }
+
             SubchunkDraw draw{};
             draw.chunkX = coord.x;
             draw.chunkZ = coord.z;
@@ -178,6 +178,14 @@ ChunkBuildResult ChunkMesher::buildChunkMesh(
 
         if (!subchunk.fluidIndices.empty())
         {
+            if (subchunk.fluidVertices.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) ||
+                subchunk.fluidIndices.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) ||
+                result.fluidVertices.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+                result.fluidIndices.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+            {
+                throw std::runtime_error("Chunk fluid mesh is too large for Vulkan indirect draw ranges.");
+            }
+
             SubchunkDraw draw{};
             draw.chunkX = coord.x;
             draw.chunkZ = coord.z;
@@ -202,19 +210,28 @@ ChunkBuildResult ChunkMesher::buildChunkMesh(
     return result;
 }
 
+void ChunkMesher::appendChunkMeshFromPreparedColumn(
+    ChunkBuildResult& result,
+    ChunkCoord coord,
+    std::uint64_t generation,
+    const GeneratedChunkColumn& column) const
+{
+    result = buildChunkMeshFromPreparedColumn(coord, generation, column);
+}
+
 SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
     ChunkBuildRequest request,
     const GeneratedChunkColumn& column) const
 {
         const ChunkCoord chunk = request.coord;
-        std::array<std::vector<BlockVertex>, kSubchunkSize> verticesByLocalY;
-        std::array<std::vector<std::uint32_t>, kSubchunkSize> indicesByLocalY;
-        std::array<std::vector<BlockVertex>, kSubchunkSize> fluidVerticesByLocalY;
-        std::array<std::vector<std::uint32_t>, kSubchunkSize> fluidIndicesByLocalY;
         std::vector<BlockVertex> subchunkVertices;
         std::vector<std::uint32_t> subchunkIndices;
         std::vector<BlockVertex> subchunkFluidVertices;
         std::vector<std::uint32_t> subchunkFluidIndices;
+        subchunkVertices.reserve(8192);
+        subchunkIndices.reserve(12288);
+        subchunkFluidVertices.reserve(4096);
+        subchunkFluidIndices.reserve(6144);
 
         const int chunkX = chunk.x;
         const int chunkZ = chunk.z;
@@ -233,8 +250,7 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 {
                     const int y = subchunkMinY + localY;
                     const std::uint16_t blockId = column.blockAt(localPaddedX, y, localPaddedZ);
-                    const bool hasFluid = column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId &&
-                        column.fluidAt(localPaddedX, y, localPaddedZ) > 0;
+                    const bool hasFluid = column.fluidStateAt(localPaddedX, y, localPaddedZ) != kNoFluidState;
                     if (blockId != kAirBlockId || hasFluid)
                     {
                         hasOccupiedCell = true;
@@ -310,6 +326,10 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
 
         auto isSolid = [&](int x, int y, int z) -> bool
         {
+            if (y < 0 || y >= kChunkHeight)
+            {
+                return false;
+            }
             const int localPaddedX = x - chunkBaseX + 1;
             const int localPaddedZ = z - chunkBaseZ + 1;
             return isCollisionBlock(column.blockAt(localPaddedX, y, localPaddedZ));
@@ -317,6 +337,10 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
 
         auto blockIdAt = [&](int x, int y, int z) -> std::uint16_t
         {
+            if (y < 0 || y >= kChunkHeight)
+            {
+                return kAirBlockId;
+            }
             const int localPaddedX = x - chunkBaseX + 1;
             const int localPaddedZ = z - chunkBaseZ + 1;
             return column.blockAt(localPaddedX, y, localPaddedZ);
@@ -342,18 +366,15 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             return !isFaceOccluderBlock(neighborBlockId);
         };
 
-        auto fluidAmountAt = [&](int x, int y, int z) -> std::uint8_t
+        auto fluidStateAt = [&](int x, int y, int z) -> std::uint16_t
         {
+            if (y < 0 || y >= kChunkHeight)
+            {
+                return kNoFluidState;
+            }
             const int localPaddedX = x - chunkBaseX + 1;
             const int localPaddedZ = z - chunkBaseZ + 1;
-            return column.fluidAt(localPaddedX, y, localPaddedZ);
-        };
-
-        auto fluidIdAt = [&](int x, int y, int z) -> std::uint8_t
-        {
-            const int localPaddedX = x - chunkBaseX + 1;
-            const int localPaddedZ = z - chunkBaseZ + 1;
-            return column.fluidIdAt(localPaddedX, y, localPaddedZ);
+            return column.fluidStateAt(localPaddedX, y, localPaddedZ);
         };
 
         auto emitGreedyRectangles = [](
@@ -420,16 +441,22 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
         };
 
         auto addFace = [&](
-            std::array<std::vector<BlockVertex>, kSubchunkSize>& targetVerticesByLocalY,
-            std::array<std::vector<std::uint32_t>, kSubchunkSize>& targetIndicesByLocalY,
+            std::vector<BlockVertex>& vertices,
+            std::vector<std::uint32_t>& indices,
             int subchunkLocalY,
             std::array<Vec3, 4> corners,
             std::array<std::array<float, 2>, 4> uvs,
             std::uint32_t textureLayer,
             std::array<std::uint8_t, 4> ao)
         {
-            std::vector<BlockVertex>& vertices = targetVerticesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
-            std::vector<std::uint32_t>& indices = targetIndicesByLocalY[static_cast<std::size_t>(subchunkLocalY)];
+            if (subchunkLocalY < 0 || subchunkLocalY >= kSubchunkSize)
+            {
+                return;
+            }
+            if (vertices.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max() - 4))
+            {
+                throw std::runtime_error("Subchunk mesh has too many vertices.");
+            }
             const std::uint32_t baseIndex = static_cast<std::uint32_t>(vertices.size());
             const float layer = static_cast<float>(textureLayer);
             vertices.push_back({{corners[0].x, corners[0].y, corners[0].z}, {uvs[0][0], uvs[0][1]}, aoFactor(ao[0]), layer});
@@ -452,8 +479,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             float height)
         {
             addFace(
-                fluidVerticesByLocalY,
-                fluidIndicesByLocalY,
+                subchunkFluidVertices,
+                subchunkFluidIndices,
                 subchunkLocalY,
                 corners,
                 {{
@@ -558,8 +585,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             const float zEnd = static_cast<float>(z + depth);
             const float y = static_cast<float>(faceY);
             addFace(
-                verticesByLocalY,
-                indicesByLocalY,
+                subchunkVertices,
+                subchunkIndices,
                 subchunkLocalY,
                 {{
                     {fx, y, fz},
@@ -593,8 +620,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             const float zEnd = static_cast<float>(z + depth);
             const float y = static_cast<float>(faceY);
             addFace(
-                verticesByLocalY,
-                indicesByLocalY,
+                subchunkVertices,
+                subchunkIndices,
                 subchunkLocalY,
                 {{
                     {fx, y, zEnd},
@@ -621,8 +648,8 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             std::array<std::uint8_t, 4> ao)
         {
             addFace(
-                verticesByLocalY,
-                indicesByLocalY,
+                subchunkVertices,
+                subchunkIndices,
                 subchunkLocalY,
                 corners,
                 {{
@@ -653,10 +680,10 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
 
             auto addDoubleSidedFace = [&](std::array<Vec3, 4> corners)
             {
-                addFace(verticesByLocalY, indicesByLocalY, subchunkLocalY, corners, uvs, textureLayer, fullAo);
+                addFace(subchunkVertices, subchunkIndices, subchunkLocalY, corners, uvs, textureLayer, fullAo);
                 addFace(
-                    verticesByLocalY,
-                    indicesByLocalY,
+                    subchunkVertices,
+                    subchunkIndices,
                     subchunkLocalY,
                     {{corners[3], corners[2], corners[1], corners[0]}},
                     uvs,
@@ -677,23 +704,6 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 {fx, fy, zEnd},
             }});
         };
-
-        for (auto& vertices : verticesByLocalY)
-        {
-            vertices.clear();
-        }
-        for (auto& indices : indicesByLocalY)
-        {
-            indices.clear();
-        }
-        for (auto& vertices : fluidVerticesByLocalY)
-        {
-            vertices.clear();
-        }
-        for (auto& indices : fluidIndicesByLocalY)
-        {
-            indices.clear();
-        }
 
             for (int localY = 0; localY < kSubchunkSize; ++localY)
             {
@@ -951,11 +961,14 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 }
             }
 
-            auto fluidTop = [&](int x, int y, int z, std::uint8_t fluidId, std::uint8_t amount) -> float
+            auto fluidTop = [&](int x, int y, int z, std::uint16_t fluidState) -> float
             {
+                const std::uint16_t amount = fluidAmountFromState(fluidState);
+                const std::uint16_t fluidType = fluidTypeFromState(fluidState);
+                const std::uint16_t aboveFluidState = fluidStateAt(x, y + 1, z);
                 if (amount == kMaxFluidAmount &&
-                    fluidIdAt(x, y + 1, z) == fluidId &&
-                    fluidAmountAt(x, y + 1, z) == kMaxFluidAmount)
+                    fluidTypeFromState(aboveFluidState) == fluidType &&
+                    fluidAmountFromState(aboveFluidState) == kMaxFluidAmount)
                 {
                     return static_cast<float>(y + 1);
                 }
@@ -972,21 +985,21 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                     for (int localY = 0; localY < kSubchunkSize; ++localY)
                     {
                         const int y = subchunkMinY + localY;
-                        const std::uint8_t fluidId = fluidIdAt(x, y, z);
-                        const std::uint8_t amount = fluidAmountAt(x, y, z);
-                        if (fluidId != kWaterFluidId || amount == 0 || isSolid(x, y, z))
+                        const std::uint16_t fluidState = fluidStateAt(x, y, z);
+                        if (!isWaterFluidState(fluidState) || isSolid(x, y, z))
                         {
                             continue;
                         }
+                        const std::uint16_t fluidType = fluidTypeFromState(fluidState);
 
                         const float bottom = static_cast<float>(y);
-                        const float top = fluidTop(x, y, z, fluidId, amount);
+                        const float top = fluidTop(x, y, z, fluidState);
                         const float fx = static_cast<float>(x);
                         const float fz = static_cast<float>(z);
                         const float xEnd = static_cast<float>(x + 1);
                         const float zEnd = static_cast<float>(z + 1);
 
-                        if ((fluidIdAt(x, y + 1, z) != fluidId || fluidAmountAt(x, y + 1, z) == 0) &&
+                        if (fluidTypeFromState(fluidStateAt(x, y + 1, z)) != fluidType &&
                             !isSolid(x, y + 1, z))
                         {
                             addFluidFace(
@@ -1001,7 +1014,7 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                                 1.0f);
                         }
 
-                        if ((fluidIdAt(x, y - 1, z) != fluidId || fluidAmountAt(x, y - 1, z) == 0) &&
+                        if (fluidTypeFromState(fluidStateAt(x, y - 1, z)) != fluidType &&
                             !isSolid(x, y - 1, z))
                         {
                             addFluidFace(
@@ -1027,11 +1040,10 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                             }
 
                             float sideBottom = bottom;
-                            const std::uint8_t neighborFluidId = fluidIdAt(neighborX, y, neighborZ);
-                            const std::uint8_t neighborAmount = fluidAmountAt(neighborX, y, neighborZ);
-                            if (neighborFluidId == fluidId && neighborAmount > 0)
+                            const std::uint16_t neighborFluidState = fluidStateAt(neighborX, y, neighborZ);
+                            if (fluidTypeFromState(neighborFluidState) == fluidType)
                             {
-                                sideBottom = fluidTop(neighborX, y, neighborZ, neighborFluidId, neighborAmount);
+                                sideBottom = fluidTop(neighborX, y, neighborZ, neighborFluidState);
                                 if (sideBottom >= top)
                                 {
                                     return;
@@ -1085,17 +1097,6 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
                 }
             }
 
-        appendSubchunkMesh(
-            verticesByLocalY,
-            indicesByLocalY,
-            subchunkVertices,
-            subchunkIndices);
-        appendSubchunkMesh(
-            fluidVerticesByLocalY,
-            fluidIndicesByLocalY,
-            subchunkFluidVertices,
-            subchunkFluidIndices);
-
         return {
             chunk,
             subchunkY,
@@ -1105,40 +1106,6 @@ SubchunkBuildResult ChunkMesher::buildSubchunkMesh(
             std::move(subchunkFluidVertices),
             std::move(subchunkFluidIndices),
         };
-    }
-
-void ChunkMesher::appendSubchunkMesh(
-        const std::array<std::vector<BlockVertex>, kSubchunkSize>& verticesByLocalY,
-        const std::array<std::vector<std::uint32_t>, kSubchunkSize>& indicesByLocalY,
-        std::vector<BlockVertex>& chunkVertices,
-        std::vector<std::uint32_t>& chunkIndices) const
-{
-        std::size_t indexCount = 0;
-        for (int localY = 0; localY < kSubchunkSize; ++localY)
-        {
-            indexCount += indicesByLocalY[static_cast<std::size_t>(localY)].size();
-        }
-
-        if (indexCount == 0)
-        {
-            return;
-        }
-
-        std::uint32_t subchunkVertexCount = 0;
-
-        for (int localY = 0; localY < kSubchunkSize; ++localY)
-        {
-            const auto& sourceVertices = verticesByLocalY[static_cast<std::size_t>(localY)];
-            const auto& sourceIndices = indicesByLocalY[static_cast<std::size_t>(localY)];
-            const std::uint32_t baseVertex = subchunkVertexCount;
-
-            chunkVertices.insert(chunkVertices.end(), sourceVertices.begin(), sourceVertices.end());
-            for (std::uint32_t index : sourceIndices)
-            {
-                chunkIndices.push_back(baseVertex + index);
-            }
-            subchunkVertexCount += static_cast<std::uint32_t>(sourceVertices.size());
-        }
     }
 
 

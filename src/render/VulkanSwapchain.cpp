@@ -115,6 +115,10 @@ VulkanSwapchainResources createVulkanSwapchain(const VulkanSwapchainCreateInfo& 
         createInfo.presentFamily,
     };
 
+    VulkanSwapchainResources resources{};
+    resources.supportsTransferSrc =
+        (support.capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+
     VkSwapchainCreateInfoKHR swapchainCreateInfo{};
     swapchainCreateInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     swapchainCreateInfo.surface = createInfo.surface;
@@ -124,6 +128,10 @@ VulkanSwapchainResources createVulkanSwapchain(const VulkanSwapchainCreateInfo& 
     swapchainCreateInfo.imageExtent = extent;
     swapchainCreateInfo.imageArrayLayers = 1;
     swapchainCreateInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (resources.supportsTransferSrc)
+    {
+        swapchainCreateInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
 
     if (createInfo.graphicsFamily != createInfo.presentFamily)
     {
@@ -141,7 +149,6 @@ VulkanSwapchainResources createVulkanSwapchain(const VulkanSwapchainCreateInfo& 
     swapchainCreateInfo.presentMode = presentMode;
     swapchainCreateInfo.clipped = VK_TRUE;
 
-    VulkanSwapchainResources resources{};
     if (vkCreateSwapchainKHR(
             createInfo.device,
             &swapchainCreateInfo,

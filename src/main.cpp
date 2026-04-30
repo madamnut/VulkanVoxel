@@ -1,8 +1,9 @@
+#define NOMINMAX
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
-#define NOMINMAX
 #include <Windows.h>
+#include <wincodec.h>
 
 #include "core/FileSystem.h"
 #include "core/GameConfig.h"
@@ -42,12 +43,14 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -62,13 +65,14 @@ constexpr int kDefaultChunkLoadRadius = 5;
 constexpr int kMaxChunkLoadRadius = 64;
 constexpr int kDefaultChunkUploadsPerFrame = 1;
 constexpr int kMaxChunkUploadsPerFrame = 64;
-constexpr int kDefaultChunkBuildThreads = 4;
-constexpr int kMaxChunkBuildThreads = 16;
 constexpr float kDefaultInteractionDistance = 5.0f;
 constexpr std::size_t kSelectionOutlineVertexCount = 24;
 constexpr float kRenderFovY = 70.0f * kPi / 180.0f;
 constexpr float kRenderNearPlane = 0.05f;
 constexpr float kRenderFarPlane = 1200.0f;
+constexpr VkDeviceSize kInitialMeshArenaBytes = 16ull * 1024ull * 1024ull;
+constexpr std::uint32_t kInitialIndirectDrawCapacity = 1024;
+constexpr double kProfilerPeakHoldSeconds = 3.0;
 
 struct QueueFamilyIndices
 {
@@ -81,20 +85,62 @@ struct QueueFamilyIndices
     }
 };
 
+struct MeshArenaAllocation
+{
+    VkDeviceSize vertexOffset = 0;
+    VkDeviceSize vertexSize = 0;
+    VkDeviceSize indexOffset = 0;
+    VkDeviceSize indexSize = 0;
+
+    bool valid() const
+    {
+        return vertexSize > 0 || indexSize > 0;
+    }
+};
+
 struct ChunkMesh
 {
-    Buffer vertexBuffer;
-    Buffer indexBuffer;
-    Buffer fluidVertexBuffer;
-    Buffer fluidIndexBuffer;
     std::uint32_t vertexCount = 0;
     std::uint32_t indexCount = 0;
     std::uint32_t fluidVertexCount = 0;
     std::uint32_t fluidIndexCount = 0;
     int chunkX = 0;
     int chunkZ = 0;
+    MeshArenaAllocation blockAllocation;
+    MeshArenaAllocation fluidAllocation;
     std::vector<SubchunkDraw> subchunks;
     std::vector<SubchunkDraw> fluidSubchunks;
+};
+
+struct MeshArenaFreeRange
+{
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+};
+
+struct MeshBufferArena
+{
+    Buffer vertexBuffer;
+    Buffer indexBuffer;
+    VkDeviceSize vertexCapacity = 0;
+    VkDeviceSize indexCapacity = 0;
+    VkDeviceSize vertexUsed = 0;
+    VkDeviceSize indexUsed = 0;
+    std::vector<MeshArenaFreeRange> vertexFreeRanges;
+    std::vector<MeshArenaFreeRange> indexFreeRanges;
+};
+
+struct DeferredMeshArenaFree
+{
+    MeshArenaAllocation blockAllocation;
+    MeshArenaAllocation fluidAllocation;
+    std::uint64_t retireFrame = 0;
+};
+
+struct DeferredBufferDestroy
+{
+    Buffer buffer;
+    std::uint64_t retireFrame = 0;
 };
 
 struct FrustumPlane
@@ -108,13 +154,12 @@ struct ViewFrustum
     std::array<FrustumPlane, 6> planes{};
 };
 
-struct DeferredChunkBufferDestroy
+struct IndirectDrawBuffer
 {
-    Buffer vertexBuffer;
-    Buffer indexBuffer;
-    Buffer fluidVertexBuffer;
-    Buffer fluidIndexBuffer;
-    std::uint64_t retireFrame = 0;
+    Buffer buffer;
+    void* mappedMemory = nullptr;
+    std::uint32_t capacity = 0;
+    std::uint32_t count = 0;
 };
 
 struct DeferredUploadCleanup
@@ -179,6 +224,13 @@ struct DebugTextOverlay
     std::vector<std::wstring> bottomLeftLines;
 };
 
+enum class DebugTextMode
+{
+    Default,
+    Profiler,
+    Hidden,
+};
+
 struct FrameProfiler
 {
     double frameCpuMs = 0.0;
@@ -188,6 +240,8 @@ struct FrameProfiler
     double subchunkDoneMs = 0.0;
     double chunkUploadMs = 0.0;
     double uniformMs = 0.0;
+    double visibilityMs = 0.0;
+    double indirectUploadMs = 0.0;
     double debugTextMs = 0.0;
     double recordMs = 0.0;
     double submitPresentMs = 0.0;
@@ -196,11 +250,70 @@ struct FrameProfiler
     std::size_t chunksLoaded = 0;
     std::size_t chunksUnloaded = 0;
     std::size_t chunksQueued = 0;
+    double chunkBuildTotalMs = 0.0;
+    double chunkDataMs = 0.0;
+    double chunkDataLoadedLookupMs = 0.0;
+    double chunkDataCacheLookupMs = 0.0;
+    double chunkDataWaitMs = 0.0;
+    double chunkDataLoadGenerateMs = 0.0;
+    double chunkDataCopyMs = 0.0;
+    double chunkDataCacheStoreMs = 0.0;
+    double chunkDiskLoadMs = 0.0;
+    double chunkGenerateMs = 0.0;
+    double chunkGenLockMs = 0.0;
+    double chunkGenDensityGridMs = 0.0;
+    double chunkGenBaseTerrainMs = 0.0;
+    double chunkGenSurfaceMs = 0.0;
+    double chunkGenPlantMs = 0.0;
+    double chunkGenTreeMs = 0.0;
+    double chunkGenOverrideMs = 0.0;
+    double chunkGenVoxelCopyMs = 0.0;
+    double chunkDiskSaveMs = 0.0;
+    double chunkColumnMs = 0.0;
+    double chunkMeshMs = 0.0;
+    std::uint32_t chunkLoadedHits = 0;
+    std::uint32_t chunkCacheHits = 0;
+    std::uint32_t chunkWaitedLoads = 0;
+    std::uint32_t chunkDiskLoaded = 0;
+    std::uint32_t chunkGenerated = 0;
+};
+
+struct HeldProfilerValue
+{
+    double value = 0.0;
+    std::chrono::steady_clock::time_point lastPeakTime{};
+};
+
+struct PendingScreenshot
+{
+    Buffer buffer;
+    std::wstring path;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+
+    bool valid() const
+    {
+        return buffer.buffer != VK_NULL_HANDLE;
+    }
 };
 
 void glfwErrorCallback(int errorCode, const char* description)
 {
     std::cerr << "GLFW error " << errorCode << ": " << description << '\n';
+}
+
+double elapsedMilliseconds(std::chrono::steady_clock::time_point begin)
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+}
+
+int automaticGameWorkerCount()
+{
+    const unsigned hardwareThreads = std::thread::hardware_concurrency();
+    const unsigned workerCount = hardwareThreads > 6 ? hardwareThreads - 6 : 1;
+    return static_cast<int>(std::max(1u, workerCount));
 }
 
 int floorDiv(int value, int divisor)
@@ -319,6 +432,7 @@ private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties physicalDeviceProperties_{};
     bool memoryBudgetSupported_ = false;
+    bool multiDrawIndirectEnabled_ = false;
     VulkanResourceContext resourceContext_{};
     TextureManager textureManager_{};
     DebugTextRenderer debugTextRenderer_{};
@@ -334,6 +448,7 @@ private:
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat swapchainImageFormat_ = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchainExtent_{};
+    bool swapchainScreenshotSupported_ = false;
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> swapchainImageViews_;
     std::vector<VkFramebuffer> framebuffers_;
@@ -402,10 +517,14 @@ private:
     WorldSave worldSave_{};
     DebugTextOverlay debugTextOverlay_{};
     FrameProfiler frameProfiler_{};
-    bool debugTextVisible_ = true;
+    std::unordered_map<std::wstring, HeldProfilerValue> bottomLeftHeldPeaks_;
+    DebugTextMode debugTextMode_ = DebugTextMode::Default;
+    bool screenshotRequested_ = false;
     int chunkUploadsPerFrame_ = kDefaultChunkUploadsPerFrame;
     float interactionDistance_ = kDefaultInteractionDistance;
     ViewFrustum currentViewFrustum_{};
+    std::vector<VkDrawIndexedIndirectCommand> visibleBlockDrawCommands_;
+    std::vector<VkDrawIndexedIndirectCommand> visibleFluidDrawCommands_;
     std::size_t visibleSubchunkDraws_ = 0;
     std::size_t culledSubchunkDraws_ = 0;
     std::optional<BlockRaycastHit> selectedBlock_;
@@ -421,8 +540,13 @@ private:
     std::mutex chunkDataCacheMutex_;
     std::condition_variable chunkDataCacheCv_;
     std::mutex saveMutex_;
-    std::vector<DeferredChunkBufferDestroy> deferredChunkBufferDestroys_;
+    std::vector<DeferredMeshArenaFree> deferredMeshArenaFrees_;
+    std::vector<DeferredBufferDestroy> deferredMeshBufferDestroys_;
     std::vector<DeferredUploadCleanup> deferredUploadCleanups_;
+    MeshBufferArena blockMeshArena_;
+    MeshBufferArena fluidMeshArena_;
+    std::array<IndirectDrawBuffer, kMaxFramesInFlight> blockIndirectDrawBuffers_{};
+    std::array<IndirectDrawBuffer, kMaxFramesInFlight> fluidIndirectDrawBuffers_{};
     std::size_t meshVertexCount_ = 0;
     std::size_t meshIndexCount_ = 0;
     std::uint64_t worldSeed_ = 0;
@@ -480,7 +604,11 @@ private:
         }
         else if (key == GLFW_KEY_F3 && action == GLFW_PRESS)
         {
-            app->debugTextVisible_ = !app->debugTextVisible_;
+            app->cycleDebugTextMode();
+        }
+        else if (key == GLFW_KEY_F2 && action == GLFW_PRESS)
+        {
+            app->screenshotRequested_ = true;
         }
         else if (key == GLFW_KEY_F && action == GLFW_PRESS)
         {
@@ -531,6 +659,259 @@ private:
         worldSeed_ = generateRandomWorldSeed();
         worldGenerator_.setSeed(worldSeed_);
         saveWorldState();
+    }
+
+    std::wstring screenshotPathForNow() const
+    {
+        const std::wstring directory = sourcePathWide(L"/screenshots");
+        CreateDirectoryW(directory.c_str(), nullptr);
+
+        SYSTEMTIME time{};
+        GetLocalTime(&time);
+        std::wostringstream filename;
+        filename << directory << L"/"
+                 << L"screenshot-"
+                 << std::setw(4) << std::setfill(L'0') << time.wYear
+                 << std::setw(2) << std::setfill(L'0') << time.wMonth
+                 << std::setw(2) << std::setfill(L'0') << time.wDay
+                 << L"-"
+                 << std::setw(2) << std::setfill(L'0') << time.wHour
+                 << std::setw(2) << std::setfill(L'0') << time.wMinute
+                 << std::setw(2) << std::setfill(L'0') << time.wSecond
+                 << L"-"
+                 << std::setw(3) << std::setfill(L'0') << time.wMilliseconds
+                 << L".png";
+        return filename.str();
+    }
+
+    bool writePngFile(
+        const std::wstring& path,
+        int width,
+        int height,
+        const void* pixels) const
+    {
+        if (width <= 0 || height <= 0 || pixels == nullptr)
+        {
+            return false;
+        }
+
+        IWICImagingFactory* factory = nullptr;
+        IWICStream* stream = nullptr;
+        IWICBitmapEncoder* encoder = nullptr;
+        IWICBitmapFrameEncode* frame = nullptr;
+        IPropertyBag2* properties = nullptr;
+
+        HRESULT hr = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory));
+
+        if (SUCCEEDED(hr))
+        {
+            hr = factory->CreateStream(&stream);
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = encoder->CreateNewFrame(&frame, &properties);
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = frame->Initialize(properties);
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = frame->SetSize(static_cast<UINT>(width), static_cast<UINT>(height));
+        }
+        if (SUCCEEDED(hr))
+        {
+            WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppBGRA;
+            hr = frame->SetPixelFormat(&pixelFormat);
+            if (SUCCEEDED(hr) && !IsEqualGUID(pixelFormat, GUID_WICPixelFormat32bppBGRA))
+            {
+                hr = E_FAIL;
+            }
+        }
+        if (SUCCEEDED(hr))
+        {
+            const UINT stride = static_cast<UINT>(width * 4);
+            const UINT bufferSize = static_cast<UINT>(stride * height);
+            std::vector<BYTE> pngPixels(bufferSize);
+            const BYTE* sourcePixels = static_cast<const BYTE*>(pixels);
+            for (UINT i = 0; i < bufferSize; i += 4)
+            {
+                pngPixels[i + 0] = sourcePixels[i + 0];
+                pngPixels[i + 1] = sourcePixels[i + 1];
+                pngPixels[i + 2] = sourcePixels[i + 2];
+                pngPixels[i + 3] = 255;
+            }
+            hr = frame->WritePixels(
+                static_cast<UINT>(height),
+                stride,
+                bufferSize,
+                pngPixels.data());
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = frame->Commit();
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = encoder->Commit();
+        }
+
+        if (properties != nullptr)
+        {
+            properties->Release();
+        }
+        if (frame != nullptr)
+        {
+            frame->Release();
+        }
+        if (encoder != nullptr)
+        {
+            encoder->Release();
+        }
+        if (stream != nullptr)
+        {
+            stream->Release();
+        }
+        if (factory != nullptr)
+        {
+            factory->Release();
+        }
+
+        return SUCCEEDED(hr);
+    }
+
+    PendingScreenshot consumeScreenshotRequest()
+    {
+        if (!screenshotRequested_)
+        {
+            return {};
+        }
+        screenshotRequested_ = false;
+
+        if (!swapchainScreenshotSupported_)
+        {
+            logger_.warn("Failed to capture screenshot: swapchain transfer source is not supported");
+            return {};
+        }
+        if (swapchainExtent_.width == 0 || swapchainExtent_.height == 0)
+        {
+            logger_.warn("Failed to capture screenshot: empty swapchain extent");
+            return {};
+        }
+
+        PendingScreenshot screenshot{};
+        screenshot.path = screenshotPathForNow();
+        screenshot.format = swapchainImageFormat_;
+        screenshot.width = swapchainExtent_.width;
+        screenshot.height = swapchainExtent_.height;
+        const VkDeviceSize imageSize =
+            static_cast<VkDeviceSize>(screenshot.width) *
+            static_cast<VkDeviceSize>(screenshot.height) *
+            4;
+        screenshot.buffer = resourceContext_.createBuffer(
+            imageSize,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        return screenshot;
+    }
+
+    static bool isBgraSwapchainFormat(VkFormat format)
+    {
+        return format == VK_FORMAT_B8G8R8A8_UNORM ||
+            format == VK_FORMAT_B8G8R8A8_SRGB;
+    }
+
+    static bool isRgbaSwapchainFormat(VkFormat format)
+    {
+        return format == VK_FORMAT_R8G8B8A8_UNORM ||
+            format == VK_FORMAT_R8G8B8A8_SRGB;
+    }
+
+    bool saveScreenshotFromBuffer(const PendingScreenshot& screenshot)
+    {
+        if (!screenshot.valid() || screenshot.width == 0 || screenshot.height == 0)
+        {
+            return false;
+        }
+
+        const VkDeviceSize imageSize =
+            static_cast<VkDeviceSize>(screenshot.width) *
+            static_cast<VkDeviceSize>(screenshot.height) *
+            4;
+        void* mappedMemory = nullptr;
+        if (vkMapMemory(device_, screenshot.buffer.memory, 0, imageSize, 0, &mappedMemory) != VK_SUCCESS)
+        {
+            return false;
+        }
+
+        const std::uint8_t* sourcePixels = static_cast<const std::uint8_t*>(mappedMemory);
+        std::vector<std::uint8_t> bgraPixels(static_cast<std::size_t>(imageSize));
+        if (isRgbaSwapchainFormat(screenshot.format))
+        {
+            for (std::size_t i = 0; i < bgraPixels.size(); i += 4)
+            {
+                bgraPixels[i + 0] = sourcePixels[i + 2];
+                bgraPixels[i + 1] = sourcePixels[i + 1];
+                bgraPixels[i + 2] = sourcePixels[i + 0];
+                bgraPixels[i + 3] = 255;
+            }
+        }
+        else
+        {
+            if (!isBgraSwapchainFormat(screenshot.format))
+            {
+                logger_.warn("Saving screenshot by assuming BGRA swapchain pixel order");
+            }
+            for (std::size_t i = 0; i < bgraPixels.size(); i += 4)
+            {
+                bgraPixels[i + 0] = sourcePixels[i + 0];
+                bgraPixels[i + 1] = sourcePixels[i + 1];
+                bgraPixels[i + 2] = sourcePixels[i + 2];
+                bgraPixels[i + 3] = 255;
+            }
+        }
+
+        vkUnmapMemory(device_, screenshot.buffer.memory);
+        return writePngFile(
+            screenshot.path,
+            static_cast<int>(screenshot.width),
+            static_cast<int>(screenshot.height),
+            bgraPixels.data());
+    }
+
+    void finishScreenshot(PendingScreenshot& screenshot)
+    {
+        if (!screenshot.valid())
+        {
+            return;
+        }
+
+        const bool saved = saveScreenshotFromBuffer(screenshot);
+        resourceContext_.destroyBuffer(screenshot.buffer);
+        if (saved)
+        {
+            logger_.info("Saved screenshot");
+        }
+        else
+        {
+            logger_.warn("Failed to save screenshot");
+        }
     }
 
     void initWindow()
@@ -653,7 +1034,8 @@ private:
         {
             vkDeviceWaitIdle(device_);
             collectDeferredUploadCleanups(true);
-            collectDeferredChunkBufferDestroys(true);
+            collectDeferredMeshArenaFrees(true);
+            collectDeferredMeshBufferDestroys(true);
         }
 
         cleanupSwapchain();
@@ -665,6 +1047,7 @@ private:
         resourceContext_.destroyBuffer(playerVertexBuffer_);
         resourceContext_.destroyBuffer(playerIndexBuffer_);
         resourceContext_.destroyBuffer(selectionVertexBuffer_);
+        destroyIndirectDrawBuffers();
         destroyAllChunkMeshes();
 
         if (descriptorPool_ != VK_NULL_HANDLE)
@@ -904,7 +1287,13 @@ private:
             queueCreateInfos.push_back(queueCreateInfo);
         }
 
+        VkPhysicalDeviceFeatures supportedFeatures{};
+        vkGetPhysicalDeviceFeatures(physicalDevice_, &supportedFeatures);
+
         VkPhysicalDeviceFeatures deviceFeatures{};
+        deviceFeatures.multiDrawIndirect = supportedFeatures.multiDrawIndirect;
+        multiDrawIndirectEnabled_ = supportedFeatures.multiDrawIndirect == VK_TRUE;
+
         std::vector<const char*> deviceExtensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
         memoryBudgetSupported_ = isDeviceExtensionAvailable(physicalDevice_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
         if (memoryBudgetSupported_)
@@ -949,6 +1338,7 @@ private:
         swapchain_ = resources.swapchain;
         swapchainImageFormat_ = resources.imageFormat;
         swapchainExtent_ = resources.extent;
+        swapchainScreenshotSupported_ = resources.supportsTransferSrc;
         swapchainImages_ = std::move(resources.images);
         swapchainImageViews_ = std::move(resources.imageViews);
     }
@@ -1509,13 +1899,13 @@ private:
         };
         const WorldConfig config = loadWorldConfigFile(
             sourcePath("/config/world.json"),
-            {kDefaultChunkLoadRadius, kDefaultChunkUploadsPerFrame, kDefaultChunkBuildThreads, defaultTerrainDensity},
-            {0, 1, 1, minTerrainDensity},
-            {kMaxChunkLoadRadius, kMaxChunkUploadsPerFrame, kMaxChunkBuildThreads, maxTerrainDensity});
+            {kDefaultChunkLoadRadius, kDefaultChunkUploadsPerFrame, defaultTerrainDensity},
+            {0, 1, minTerrainDensity},
+            {kMaxChunkLoadRadius, kMaxChunkUploadsPerFrame, maxTerrainDensity});
 
         chunkUploadsPerFrame_ = config.chunkUploadsPerFrame;
         chunkStreaming_.setLoadRadius(config.chunkLoadRadius);
-        chunkStreaming_.setBuildThreadCount(config.chunkBuildThreads);
+        chunkStreaming_.setBuildThreadCount(automaticGameWorkerCount());
         worldGenerator_.setTerrainDensityConfig(config.terrainDensity);
         const std::string landformCurvePath = sourcePath("/assets/worldgen/landform_curve.bin");
         if (!worldGenerator_.loadLandformCurveFile(landformCurvePath))
@@ -1541,73 +1931,153 @@ private:
         chunkStreaming_.stopWorkers();
     }
 
-    ChunkBuildResult buildChunkForStreaming(ChunkCoord coord, std::uint64_t generation)
+    bool isDebugTextVisible() const
     {
+        return debugTextMode_ != DebugTextMode::Hidden;
+    }
+
+    void cycleDebugTextMode()
+    {
+        switch (debugTextMode_)
+        {
+        case DebugTextMode::Default:
+            debugTextMode_ = DebugTextMode::Profiler;
+            break;
+        case DebugTextMode::Profiler:
+            debugTextMode_ = DebugTextMode::Hidden;
+            break;
+        case DebugTextMode::Hidden:
+        default:
+            debugTextMode_ = DebugTextMode::Default;
+            break;
+        }
+    }
+
+    std::shared_ptr<ChunkBuildResult> buildChunkForStreaming(ChunkCoord coord, std::uint64_t generation)
+    {
+        const auto totalStart = std::chrono::steady_clock::now();
+        ChunkBuildProfile profile{};
+
+        auto mark = []()
+        {
+            return std::chrono::steady_clock::now();
+        };
+
         std::array<ChunkVoxelData, 9> neighborVoxels;
+        auto sectionStart = mark();
         for (int dz = -1; dz <= 1; ++dz)
         {
             for (int dx = -1; dx <= 1; ++dx)
             {
                 neighborVoxels[static_cast<std::size_t>((dz + 1) * 3 + (dx + 1))] =
-                    ensureChunkData({coord.x + dx, coord.z + dz});
+                    ensureChunkData({coord.x + dx, coord.z + dz}, &profile);
             }
         }
+        profile.dataMs += elapsedMilliseconds(sectionStart);
 
+        sectionStart = mark();
         GeneratedChunkColumn column = buildMeshingColumnFromChunkData(coord, neighborVoxels);
-        ChunkBuildResult result = chunkMesher_.buildChunkMeshFromColumn(coord, generation, column);
+        profile.columnMs += elapsedMilliseconds(sectionStart);
 
-        ChunkVoxelData& centerVoxels = neighborVoxels[4];
-        result.blockIds = std::move(centerVoxels.blockIds);
-        result.fluidIds = std::move(centerVoxels.fluidIds);
-        result.fluidAmounts = std::move(centerVoxels.fluidAmounts);
+        sectionStart = mark();
+        ChunkBuildResult meshResult = chunkMesher_.buildChunkMeshFromPreparedColumn(coord, generation, column);
+        profile.meshMs += elapsedMilliseconds(sectionStart);
+
+        profile.totalMs += elapsedMilliseconds(totalStart);
+        meshResult.profile = profile;
+        auto result = std::make_shared<ChunkBuildResult>(std::move(meshResult));
         return result;
     }
 
-    ChunkVoxelData ensureChunkData(ChunkCoord coord)
+    ChunkVoxelData ensureChunkData(ChunkCoord coord, ChunkBuildProfile* profile = nullptr)
     {
         while (true)
         {
+            auto sectionStart = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> lock(loadedChunksMutex_);
                 const auto loadedIt = loadedChunks_.find(coord);
                 if (loadedIt != loadedChunks_.end() &&
                     loadedIt->second.blockIds.size() == kChunkBlockCount &&
-                    loadedIt->second.fluidIds.size() == kChunkBlockCount &&
-                    loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+                    loadedIt->second.fluidStates.size() == kChunkBlockCount)
                 {
-                    return {
+                    if (profile != nullptr)
+                    {
+                        profile->dataLoadedLookupMs += elapsedMilliseconds(sectionStart);
+                        ++profile->loadedHits;
+                        sectionStart = std::chrono::steady_clock::now();
+                        ChunkVoxelData result{
+                            loadedIt->second.blockIds,
+                            loadedIt->second.fluidStates,
+                        };
+                        profile->dataCopyMs += elapsedMilliseconds(sectionStart);
+                        return result;
+                    }
+                    return ChunkVoxelData{
                         loadedIt->second.blockIds,
-                        loadedIt->second.fluidIds,
-                        loadedIt->second.fluidAmounts,
+                        loadedIt->second.fluidStates,
                     };
                 }
             }
+            if (profile != nullptr)
+            {
+                profile->dataLoadedLookupMs += elapsedMilliseconds(sectionStart);
+            }
 
+            sectionStart = std::chrono::steady_clock::now();
             {
                 std::unique_lock<std::mutex> lock(chunkDataCacheMutex_);
                 const auto cacheIt = chunkDataCache_.find(coord);
                 if (cacheIt != chunkDataCache_.end() && cacheIt->second.valid())
                 {
+                    if (profile != nullptr)
+                    {
+                        profile->dataCacheLookupMs += elapsedMilliseconds(sectionStart);
+                        ++profile->cacheHits;
+                        sectionStart = std::chrono::steady_clock::now();
+                        ChunkVoxelData result = cacheIt->second;
+                        profile->dataCopyMs += elapsedMilliseconds(sectionStart);
+                        return result;
+                    }
                     return cacheIt->second;
                 }
 
                 if (!chunkDataLoadsInProgress_.contains(coord))
                 {
                     chunkDataLoadsInProgress_.insert(coord);
+                    if (profile != nullptr)
+                    {
+                        profile->dataCacheLookupMs += elapsedMilliseconds(sectionStart);
+                    }
                     break;
                 }
 
+                if (profile != nullptr)
+                {
+                    profile->dataCacheLookupMs += elapsedMilliseconds(sectionStart);
+                }
+                sectionStart = std::chrono::steady_clock::now();
                 chunkDataCacheCv_.wait(lock, [&]()
                 {
                     return !chunkDataLoadsInProgress_.contains(coord) || chunkDataCache_.contains(coord);
                 });
+                if (profile != nullptr)
+                {
+                    profile->dataWaitMs += elapsedMilliseconds(sectionStart);
+                    ++profile->waitedLoads;
+                }
             }
         }
 
         ChunkVoxelData voxels;
         try
         {
-            voxels = loadOrGenerateChunkData(coord);
+            const auto sectionStart = std::chrono::steady_clock::now();
+            voxels = loadOrGenerateChunkData(coord, profile);
+            if (profile != nullptr)
+            {
+                profile->dataLoadGenerateMs += elapsedMilliseconds(sectionStart);
+            }
         }
         catch (...)
         {
@@ -1630,58 +2100,103 @@ private:
         }
 
         {
+            const auto sectionStart = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lock(loadedChunksMutex_);
             const auto loadedIt = loadedChunks_.find(coord);
             if (loadedIt != loadedChunks_.end() &&
                 loadedIt->second.blockIds.size() == kChunkBlockCount &&
-                loadedIt->second.fluidIds.size() == kChunkBlockCount &&
-                loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+                loadedIt->second.fluidStates.size() == kChunkBlockCount)
             {
-                voxels = {
-                    loadedIt->second.blockIds,
-                    loadedIt->second.fluidIds,
-                    loadedIt->second.fluidAmounts,
-                };
+                if (profile != nullptr)
+                {
+                    profile->dataLoadedLookupMs += elapsedMilliseconds(sectionStart);
+                    ++profile->loadedHits;
+                    const auto copyStart = std::chrono::steady_clock::now();
+                    voxels = {
+                        loadedIt->second.blockIds,
+                        loadedIt->second.fluidStates,
+                    };
+                    profile->dataCopyMs += elapsedMilliseconds(copyStart);
+                }
+                else
+                {
+                    voxels = {
+                        loadedIt->second.blockIds,
+                        loadedIt->second.fluidStates,
+                    };
+                }
+            }
+            else if (profile != nullptr)
+            {
+                profile->dataLoadedLookupMs += elapsedMilliseconds(sectionStart);
             }
         }
 
         {
+            const auto sectionStart = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lock(chunkDataCacheMutex_);
             chunkDataCache_[coord] = voxels;
             chunkDataLoadsInProgress_.erase(coord);
+            if (profile != nullptr)
+            {
+                profile->dataCacheStoreMs += elapsedMilliseconds(sectionStart);
+            }
         }
         chunkDataCacheCv_.notify_all();
         return voxels;
     }
 
-    ChunkVoxelData loadOrGenerateChunkData(ChunkCoord coord)
+    ChunkVoxelData loadOrGenerateChunkData(ChunkCoord coord, ChunkBuildProfile* profile = nullptr)
     {
         {
             std::lock_guard<std::mutex> lock(loadedChunksMutex_);
             const auto loadedIt = loadedChunks_.find(coord);
             if (loadedIt != loadedChunks_.end() &&
                 loadedIt->second.blockIds.size() == kChunkBlockCount &&
-                loadedIt->second.fluidIds.size() == kChunkBlockCount &&
-                loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+                loadedIt->second.fluidStates.size() == kChunkBlockCount)
             {
+                if (profile != nullptr)
+                {
+                    ++profile->loadedHits;
+                }
                 return {
                     loadedIt->second.blockIds,
-                    loadedIt->second.fluidIds,
-                    loadedIt->second.fluidAmounts,
+                    loadedIt->second.fluidStates,
                 };
             }
         }
 
-        if (std::optional<ChunkVoxelData> savedVoxels = loadChunkFromDisk(coord))
+        auto sectionStart = std::chrono::steady_clock::now();
+        std::optional<ChunkVoxelData> savedVoxels = loadChunkFromDisk(coord);
+        if (profile != nullptr)
+        {
+            profile->diskLoadMs += elapsedMilliseconds(sectionStart);
+        }
+        if (savedVoxels)
         {
             if (savedVoxels->valid())
             {
+                if (profile != nullptr)
+                {
+                    ++profile->diskLoaded;
+                }
                 return std::move(*savedVoxels);
             }
         }
 
-        ChunkVoxelData generatedVoxels = worldGenerator_.generateChunkVoxels(coord);
+        sectionStart = std::chrono::steady_clock::now();
+        ChunkVoxelData generatedVoxels = worldGenerator_.generateChunkVoxels(coord, profile);
+        if (profile != nullptr)
+        {
+            profile->generateMs += elapsedMilliseconds(sectionStart);
+            ++profile->generated;
+        }
+        sectionStart = std::chrono::steady_clock::now();
         saveChunkToDisk(coord, generatedVoxels);
+        if (profile != nullptr)
+        {
+            profile->diskSaveMs += elapsedMilliseconds(sectionStart);
+        }
         return generatedVoxels;
     }
 
@@ -1719,17 +2234,14 @@ private:
                 {
                     const std::size_t sourceIndex = chunkBlockIndex(sourceLocalX, y, sourceLocalZ);
                     const std::uint16_t blockId = sourceVoxels.blockIds[sourceIndex];
-                    std::uint8_t fluidId = sourceVoxels.fluidIds[sourceIndex];
-                    std::uint8_t fluidAmount = std::min(sourceVoxels.fluidAmounts[sourceIndex], kMaxFluidAmount);
-                    if (blockId != kAirBlockId || fluidId != kWaterFluidId || fluidAmount == 0)
+                    std::uint16_t fluidState = sourceVoxels.fluidStates[sourceIndex];
+                    if (blockId != kAirBlockId)
                     {
-                        fluidId = kNoFluidId;
-                        fluidAmount = 0;
+                        fluidState = kNoFluidState;
                     }
 
                     column.blockAt(localPaddedX, y, localPaddedZ) = blockId;
-                    column.fluidIdAt(localPaddedX, y, localPaddedZ) = fluidId;
-                    column.fluidAt(localPaddedX, y, localPaddedZ) = fluidAmount;
+                    column.fluidStateAt(localPaddedX, y, localPaddedZ) = fluidState;
                 }
             }
         }
@@ -1749,6 +2261,277 @@ private:
                 unloadLoadedChunkData(coord);
                 destroyChunkMeshes(coord);
             });
+    }
+
+    void createMeshArenaBuffers(MeshBufferArena& arena, VkDeviceSize vertexCapacity, VkDeviceSize indexCapacity)
+    {
+        arena.vertexBuffer = resourceContext_.createBuffer(
+            vertexCapacity,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        arena.indexBuffer = resourceContext_.createBuffer(
+            indexCapacity,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        arena.vertexCapacity = vertexCapacity;
+        arena.indexCapacity = indexCapacity;
+    }
+
+    VkDeviceSize nextMeshArenaCapacity(VkDeviceSize currentCapacity, VkDeviceSize requiredCapacity)
+    {
+        VkDeviceSize capacity = std::max(currentCapacity, kInitialMeshArenaBytes);
+        while (capacity < requiredCapacity)
+        {
+            capacity *= 2;
+        }
+        return capacity;
+    }
+
+    void deferMeshBufferDestroy(Buffer& buffer)
+    {
+        if (buffer.buffer == VK_NULL_HANDLE && buffer.memory == VK_NULL_HANDLE)
+        {
+            return;
+        }
+        deferredMeshBufferDestroys_.push_back({
+            buffer,
+            frameCounter_ + static_cast<std::uint64_t>(kMaxFramesInFlight),
+        });
+        buffer = {};
+    }
+
+    void ensureMeshArenaCapacity(
+        MeshBufferArena& arena,
+        VkDeviceSize requiredVertexCapacity,
+        VkDeviceSize requiredIndexCapacity)
+    {
+        if (arena.vertexCapacity >= requiredVertexCapacity && arena.indexCapacity >= requiredIndexCapacity)
+        {
+            return;
+        }
+
+        const VkDeviceSize newVertexCapacity = nextMeshArenaCapacity(arena.vertexCapacity, requiredVertexCapacity);
+        const VkDeviceSize newIndexCapacity = nextMeshArenaCapacity(arena.indexCapacity, requiredIndexCapacity);
+        MeshBufferArena newArena{};
+        createMeshArenaBuffers(newArena, newVertexCapacity, newIndexCapacity);
+        newArena.vertexUsed = arena.vertexUsed;
+        newArena.indexUsed = arena.indexUsed;
+        newArena.vertexFreeRanges = std::move(arena.vertexFreeRanges);
+        newArena.indexFreeRanges = std::move(arena.indexFreeRanges);
+
+        if (arena.vertexBuffer.buffer != VK_NULL_HANDLE && arena.vertexUsed > 0)
+        {
+            deferUploadCommandBuffer(resourceContext_.copyBuffer(
+                arena.vertexBuffer.buffer,
+                newArena.vertexBuffer.buffer,
+                arena.vertexUsed));
+        }
+        if (arena.indexBuffer.buffer != VK_NULL_HANDLE && arena.indexUsed > 0)
+        {
+            deferUploadCommandBuffer(resourceContext_.copyBuffer(
+                arena.indexBuffer.buffer,
+                newArena.indexBuffer.buffer,
+                arena.indexUsed));
+        }
+
+        deferMeshBufferDestroy(arena.vertexBuffer);
+        deferMeshBufferDestroy(arena.indexBuffer);
+        arena = std::move(newArena);
+    }
+
+    static std::optional<VkDeviceSize> tryAllocateMeshArenaRange(
+        std::vector<MeshArenaFreeRange>& freeRanges,
+        VkDeviceSize size)
+    {
+        if (size == 0)
+        {
+            return 0;
+        }
+
+        for (auto it = freeRanges.begin(); it != freeRanges.end(); ++it)
+        {
+            if (it->size < size)
+            {
+                continue;
+            }
+            const VkDeviceSize offset = it->offset;
+            it->offset += size;
+            it->size -= size;
+            if (it->size == 0)
+            {
+                freeRanges.erase(it);
+            }
+            return offset;
+        }
+
+        return std::nullopt;
+    }
+
+    static void freeMeshArenaRange(
+        std::vector<MeshArenaFreeRange>& freeRanges,
+        VkDeviceSize offset,
+        VkDeviceSize size)
+    {
+        if (size == 0)
+        {
+            return;
+        }
+
+        auto insertIt = freeRanges.begin();
+        while (insertIt != freeRanges.end() && insertIt->offset < offset)
+        {
+            ++insertIt;
+        }
+        insertIt = freeRanges.insert(insertIt, {offset, size});
+
+        if (insertIt != freeRanges.begin())
+        {
+            auto previous = insertIt - 1;
+            if (previous->offset + previous->size == insertIt->offset)
+            {
+                previous->size += insertIt->size;
+                insertIt = freeRanges.erase(insertIt);
+                insertIt = previous;
+            }
+        }
+
+        auto next = insertIt + 1;
+        if (next != freeRanges.end() && insertIt->offset + insertIt->size == next->offset)
+        {
+            insertIt->size += next->size;
+            freeRanges.erase(next);
+        }
+    }
+
+    MeshArenaAllocation allocateMeshArena(
+        MeshBufferArena& arena,
+        VkDeviceSize vertexSize,
+        VkDeviceSize indexSize)
+    {
+        ensureMeshArenaCapacity(
+            arena,
+            arena.vertexUsed + vertexSize,
+            arena.indexUsed + indexSize);
+
+        MeshArenaAllocation allocation{};
+        allocation.vertexSize = vertexSize;
+        allocation.indexSize = indexSize;
+
+        if (const std::optional<VkDeviceSize> vertexFreeOffset =
+                tryAllocateMeshArenaRange(arena.vertexFreeRanges, vertexSize))
+        {
+            allocation.vertexOffset = *vertexFreeOffset;
+        }
+        else
+        {
+            allocation.vertexOffset = arena.vertexUsed;
+            arena.vertexUsed += vertexSize;
+        }
+
+        if (const std::optional<VkDeviceSize> indexFreeOffset =
+                tryAllocateMeshArenaRange(arena.indexFreeRanges, indexSize))
+        {
+            allocation.indexOffset = *indexFreeOffset;
+        }
+        else
+        {
+            allocation.indexOffset = arena.indexUsed;
+            arena.indexUsed += indexSize;
+        }
+
+        ensureMeshArenaCapacity(arena, arena.vertexUsed, arena.indexUsed);
+        return allocation;
+    }
+
+    void freeMeshArenaAllocation(MeshBufferArena& arena, const MeshArenaAllocation& allocation)
+    {
+        if (!allocation.valid())
+        {
+            return;
+        }
+        freeMeshArenaRange(arena.vertexFreeRanges, allocation.vertexOffset, allocation.vertexSize);
+        freeMeshArenaRange(arena.indexFreeRanges, allocation.indexOffset, allocation.indexSize);
+    }
+
+    void uploadMeshArenaBytes(
+        const void* sourceData,
+        VkDeviceSize size,
+        VkDeviceSize destinationOffset,
+        VkBuffer destinationBuffer)
+    {
+        if (sourceData == nullptr || size == 0)
+        {
+            return;
+        }
+
+        Buffer stagingBuffer = resourceContext_.createBuffer(
+            size,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        void* mappedMemory = nullptr;
+        vkMapMemory(device_, stagingBuffer.memory, 0, size, 0, &mappedMemory);
+        std::memcpy(mappedMemory, sourceData, static_cast<std::size_t>(size));
+        vkUnmapMemory(device_, stagingBuffer.memory);
+
+        deferUploadCommandBuffer(resourceContext_.copyBuffer(
+            stagingBuffer.buffer,
+            destinationBuffer,
+            size,
+            0,
+            destinationOffset));
+        deferUploadStagingBuffer(stagingBuffer);
+    }
+
+    MeshArenaAllocation uploadMeshToArena(
+        MeshBufferArena& arena,
+        const std::vector<BlockVertex>& vertices,
+        const std::vector<std::uint32_t>& indices)
+    {
+        const VkDeviceSize vertexSize = sizeof(BlockVertex) * vertices.size();
+        const VkDeviceSize indexSize = sizeof(std::uint32_t) * indices.size();
+        MeshArenaAllocation allocation = allocateMeshArena(arena, vertexSize, indexSize);
+        uploadMeshArenaBytes(
+            vertices.data(),
+            vertexSize,
+            allocation.vertexOffset,
+            arena.vertexBuffer.buffer);
+        uploadMeshArenaBytes(
+            indices.data(),
+            indexSize,
+            allocation.indexOffset,
+            arena.indexBuffer.buffer);
+        return allocation;
+    }
+
+    static void applyArenaAllocationToDraws(
+        const MeshArenaAllocation& allocation,
+        std::vector<SubchunkDraw>& draws)
+    {
+        const std::uint32_t firstIndexOffset =
+            static_cast<std::uint32_t>(allocation.indexOffset / sizeof(std::uint32_t));
+        const std::int32_t vertexOffset =
+            static_cast<std::int32_t>(allocation.vertexOffset / sizeof(BlockVertex));
+        for (SubchunkDraw& draw : draws)
+        {
+            draw.range.firstIndex += firstIndexOffset;
+            draw.range.vertexOffset += vertexOffset;
+        }
+    }
+
+    static VkDrawIndexedIndirectCommand makeIndirectDrawCommand(const SubchunkDraw& draw)
+    {
+        VkDrawIndexedIndirectCommand command{};
+        command.indexCount = draw.range.indexCount;
+        command.instanceCount = 1;
+        command.firstIndex = draw.range.firstIndex;
+        command.vertexOffset = draw.range.vertexOffset;
+        command.firstInstance = 0;
+        return command;
     }
 
     void uploadChunkMesh(
@@ -1780,30 +2563,14 @@ private:
 
         if (!indices.empty())
         {
-            createDeviceLocalBuffer(
-                vertices.data(),
-                sizeof(BlockVertex) * vertices.size(),
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                mesh.vertexBuffer);
-            createDeviceLocalBuffer(
-                indices.data(),
-                sizeof(std::uint32_t) * indices.size(),
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                mesh.indexBuffer);
+            mesh.blockAllocation = uploadMeshToArena(blockMeshArena_, vertices, indices);
+            applyArenaAllocationToDraws(mesh.blockAllocation, mesh.subchunks);
         }
 
         if (!fluidIndices.empty())
         {
-            createDeviceLocalBuffer(
-                fluidVertices.data(),
-                sizeof(BlockVertex) * fluidVertices.size(),
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                mesh.fluidVertexBuffer);
-            createDeviceLocalBuffer(
-                fluidIndices.data(),
-                sizeof(std::uint32_t) * fluidIndices.size(),
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                mesh.fluidIndexBuffer);
+            mesh.fluidAllocation = uploadMeshToArena(fluidMeshArena_, fluidVertices, fluidIndices);
+            applyArenaAllocationToDraws(mesh.fluidAllocation, mesh.fluidSubchunks);
         }
 
         chunkMeshes_.push_back(std::move(mesh));
@@ -1814,38 +2581,150 @@ private:
         return chunkStreaming_.processCompletedSubchunkBuilds();
     }
 
-    int processCompletedChunkUploads()
+    void addChunkBuildProfileToFrame(FrameProfiler& frame, const ChunkBuildProfile& chunk)
+    {
+        frame.chunkBuildTotalMs += chunk.totalMs;
+        frame.chunkDataMs += chunk.dataMs;
+        frame.chunkDataLoadedLookupMs += chunk.dataLoadedLookupMs;
+        frame.chunkDataCacheLookupMs += chunk.dataCacheLookupMs;
+        frame.chunkDataWaitMs += chunk.dataWaitMs;
+        frame.chunkDataLoadGenerateMs += chunk.dataLoadGenerateMs;
+        frame.chunkDataCopyMs += chunk.dataCopyMs;
+        frame.chunkDataCacheStoreMs += chunk.dataCacheStoreMs;
+        frame.chunkDiskLoadMs += chunk.diskLoadMs;
+        frame.chunkGenerateMs += chunk.generateMs;
+        frame.chunkGenLockMs += chunk.genLockMs;
+        frame.chunkGenDensityGridMs += chunk.genDensityGridMs;
+        frame.chunkGenBaseTerrainMs += chunk.genBaseTerrainMs;
+        frame.chunkGenSurfaceMs += chunk.genSurfaceMs;
+        frame.chunkGenPlantMs += chunk.genPlantMs;
+        frame.chunkGenTreeMs += chunk.genTreeMs;
+        frame.chunkGenOverrideMs += chunk.genOverrideMs;
+        frame.chunkGenVoxelCopyMs += chunk.genVoxelCopyMs;
+        frame.chunkDiskSaveMs += chunk.diskSaveMs;
+        frame.chunkColumnMs += chunk.columnMs;
+        frame.chunkMeshMs += chunk.meshMs;
+        frame.chunkLoadedHits += chunk.loadedHits;
+        frame.chunkCacheHits += chunk.cacheHits;
+        frame.chunkWaitedLoads += chunk.waitedLoads;
+        frame.chunkDiskLoaded += chunk.diskLoaded;
+        frame.chunkGenerated += chunk.generated;
+    }
+
+    bool validateChunkBuildResult(const ChunkBuildResult& result)
+    {
+        auto fail = [&](const std::string& reason)
+        {
+            logger_.error(
+                "Invalid chunk mesh at (" +
+                std::to_string(result.coord.x) +
+                ", " +
+                std::to_string(result.coord.z) +
+                "): " +
+                reason);
+            return false;
+        };
+
+        auto validateDraws = [&](const std::vector<SubchunkDraw>& draws,
+                                 const std::vector<std::uint32_t>& indices,
+                                 std::size_t vertexCount,
+                                 const char* label) -> bool
+        {
+            for (const SubchunkDraw& draw : draws)
+            {
+                if (draw.subchunkY < 0 || draw.subchunkY >= kSubchunksPerChunk)
+                {
+                    return fail(std::string(label) + " draw has invalid subchunk y.");
+                }
+                if (draw.range.indexCount == 0)
+                {
+                    return fail(std::string(label) + " draw has no indices.");
+                }
+                const std::uint64_t firstIndex = draw.range.firstIndex;
+                const std::uint64_t indexEnd = firstIndex + draw.range.indexCount;
+                if (indexEnd > indices.size())
+                {
+                    return fail(std::string(label) + " draw index range is outside its index buffer.");
+                }
+                if (draw.range.vertexOffset < 0)
+                {
+                    return fail(std::string(label) + " draw has a negative vertex offset.");
+                }
+                const std::uint64_t vertexOffset = static_cast<std::uint64_t>(draw.range.vertexOffset);
+                const std::uint64_t vertexEnd = vertexOffset + draw.range.vertexCount;
+                if (vertexEnd > vertexCount)
+                {
+                    return fail(std::string(label) + " draw vertex range is outside its vertex buffer.");
+                }
+                for (std::uint64_t indexOffset = firstIndex; indexOffset < indexEnd; ++indexOffset)
+                {
+                    if (indices[static_cast<std::size_t>(indexOffset)] >= draw.range.vertexCount)
+                    {
+                        return fail(std::string(label) + " draw contains an out-of-range local index.");
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (result.indices.size() % 3 != 0 || result.fluidIndices.size() % 3 != 0)
+        {
+            return fail("index count is not triangle-aligned.");
+        }
+        if (!result.indices.empty() && result.vertices.empty())
+        {
+            return fail("block index buffer exists without block vertices.");
+        }
+        if (!result.fluidIndices.empty() && result.fluidVertices.empty())
+        {
+            return fail("fluid index buffer exists without fluid vertices.");
+        }
+        if (!validateDraws(result.subchunks, result.indices, result.vertices.size(), "block"))
+        {
+            return false;
+        }
+        if (!validateDraws(result.fluidSubchunks, result.fluidIndices, result.fluidVertices.size(), "fluid"))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    int processCompletedChunkUploads(FrameProfiler& profile)
     {
         int uploadedCount = 0;
         for (int uploaded = 0; uploaded < chunkUploadsPerFrame_; ++uploaded)
         {
-            ChunkBuildResult result{};
-            if (!chunkStreaming_.popCompletedChunkBuild(result))
+            std::shared_ptr<ChunkBuildResult> result = chunkStreaming_.popCompletedChunkBuild();
+            if (!result)
             {
                 return uploadedCount;
             }
 
-            if (!chunkStreaming_.shouldAcceptCompletedChunk(result.coord))
+            if (!chunkStreaming_.shouldAcceptCompletedChunk(result->coord))
             {
                 continue;
             }
 
-            destroyChunkMeshes(result.coord);
+            addChunkBuildProfileToFrame(profile, result->profile);
+            if (!validateChunkBuildResult(*result))
+            {
+                continue;
+            }
+            destroyChunkMeshes(result->coord);
             uploadChunkMesh(
-                result.coord.x,
-                result.coord.z,
-                result.vertices,
-                result.indices,
-                result.subchunks,
-                result.fluidVertices,
-                result.fluidIndices,
-                result.fluidSubchunks);
+                result->coord.x,
+                result->coord.z,
+                result->vertices,
+                result->indices,
+                result->subchunks,
+                result->fluidVertices,
+                result->fluidIndices,
+                result->fluidSubchunks);
             registerLoadedChunkData(
-                result.coord,
-                std::move(result.blockIds),
-                std::move(result.fluidIds),
-                std::move(result.fluidAmounts));
-            chunkStreaming_.markChunkLoaded(result.coord);
+                result->coord,
+                ensureChunkData(result->coord));
+            chunkStreaming_.markChunkLoaded(result->coord);
             ++uploadedCount;
         }
         return uploadedCount;
@@ -1854,24 +2733,30 @@ private:
     void processCompletedChunkBuilds()
     {
         processCompletedSubchunkBuilds();
-        processCompletedChunkUploads();
+        FrameProfiler ignoredProfile{};
+        processCompletedChunkUploads(ignoredProfile);
+    }
+
+    void registerLoadedChunkData(
+        ChunkCoord coord,
+        ChunkVoxelData voxels)
+    {
+        registerLoadedChunkData(coord, std::move(voxels.blockIds), std::move(voxels.fluidStates));
     }
 
     void registerLoadedChunkData(
         ChunkCoord coord,
         std::vector<std::uint16_t> blockIds,
-        std::vector<std::uint8_t> fluidIds,
-        std::vector<std::uint8_t> fluidAmounts)
+        std::vector<std::uint16_t> fluidStates)
     {
         if (blockIds.size() != kChunkBlockCount ||
-            fluidIds.size() != kChunkBlockCount ||
-            fluidAmounts.size() != kChunkBlockCount)
+            fluidStates.size() != kChunkBlockCount)
         {
             logger_.warn("Skipping loaded chunk registration with invalid voxel data");
             return;
         }
 
-        cacheChunkData(coord, {blockIds, fluidIds, fluidAmounts});
+        cacheChunkData(coord, {blockIds, fluidStates});
 
         std::lock_guard<std::mutex> lock(loadedChunksMutex_);
         bool dirty = false;
@@ -1883,8 +2768,7 @@ private:
         loadedChunks_[coord] = {
             coord,
             std::move(blockIds),
-            std::move(fluidIds),
-            std::move(fluidAmounts),
+            std::move(fluidStates),
             dirty,
         };
     }
@@ -1905,9 +2789,9 @@ private:
 
         if (chunkData->dirty)
         {
-            saveChunkToDisk(coord, {chunkData->blockIds, chunkData->fluidIds, chunkData->fluidAmounts});
+            saveChunkToDisk(coord, {chunkData->blockIds, chunkData->fluidStates});
         }
-        cacheChunkData(coord, {chunkData->blockIds, chunkData->fluidIds, chunkData->fluidAmounts});
+        cacheChunkData(coord, {chunkData->blockIds, chunkData->fluidStates});
     }
 
     void cacheChunkData(ChunkCoord coord, const ChunkVoxelData& voxels)
@@ -1941,7 +2825,7 @@ private:
 
         for (const LoadedChunkData& chunkData : chunksToSave)
         {
-            saveChunkToDisk(chunkData.coord, {chunkData.blockIds, chunkData.fluidIds, chunkData.fluidAmounts});
+            saveChunkToDisk(chunkData.coord, {chunkData.blockIds, chunkData.fluidStates});
         }
     }
 
@@ -2334,6 +3218,89 @@ private:
         deferUploadStagingBuffer(stagingBuffer);
     }
 
+    static std::uint32_t nextIndirectDrawCapacity(std::uint32_t currentCapacity, std::uint32_t requiredCapacity)
+    {
+        std::uint32_t capacity = std::max(currentCapacity, kInitialIndirectDrawCapacity);
+        while (capacity < requiredCapacity)
+        {
+            capacity *= 2;
+        }
+        return capacity;
+    }
+
+    void ensureIndirectDrawBufferCapacity(IndirectDrawBuffer& drawBuffer, std::uint32_t requiredCapacity)
+    {
+        if (requiredCapacity == 0 || drawBuffer.capacity >= requiredCapacity)
+        {
+            return;
+        }
+
+        if (drawBuffer.mappedMemory != nullptr)
+        {
+            vkUnmapMemory(device_, drawBuffer.buffer.memory);
+            drawBuffer.mappedMemory = nullptr;
+        }
+        resourceContext_.destroyBuffer(drawBuffer.buffer);
+        drawBuffer.capacity = nextIndirectDrawCapacity(drawBuffer.capacity, requiredCapacity);
+        drawBuffer.buffer = resourceContext_.createBuffer(
+            sizeof(VkDrawIndexedIndirectCommand) * drawBuffer.capacity,
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkMapMemory(
+            device_,
+            drawBuffer.buffer.memory,
+            0,
+            sizeof(VkDrawIndexedIndirectCommand) * drawBuffer.capacity,
+            0,
+            &drawBuffer.mappedMemory);
+    }
+
+    void uploadIndirectDrawBuffer(
+        IndirectDrawBuffer& drawBuffer,
+        const std::vector<VkDrawIndexedIndirectCommand>& commands)
+    {
+        drawBuffer.count = static_cast<std::uint32_t>(commands.size());
+        if (commands.empty())
+        {
+            return;
+        }
+
+        ensureIndirectDrawBufferCapacity(drawBuffer, drawBuffer.count);
+
+        std::memcpy(
+            drawBuffer.mappedMemory,
+            commands.data(),
+            sizeof(VkDrawIndexedIndirectCommand) * commands.size());
+    }
+
+    void updateIndirectDrawBuffers()
+    {
+        uploadIndirectDrawBuffer(blockIndirectDrawBuffers_[currentFrame_], visibleBlockDrawCommands_);
+        uploadIndirectDrawBuffer(fluidIndirectDrawBuffers_[currentFrame_], visibleFluidDrawCommands_);
+    }
+
+    void destroyIndirectDrawBuffers()
+    {
+        for (IndirectDrawBuffer& drawBuffer : blockIndirectDrawBuffers_)
+        {
+            if (drawBuffer.mappedMemory != nullptr)
+            {
+                vkUnmapMemory(device_, drawBuffer.buffer.memory);
+            }
+            resourceContext_.destroyBuffer(drawBuffer.buffer);
+            drawBuffer = {};
+        }
+        for (IndirectDrawBuffer& drawBuffer : fluidIndirectDrawBuffers_)
+        {
+            if (drawBuffer.mappedMemory != nullptr)
+            {
+                vkUnmapMemory(device_, drawBuffer.buffer.memory);
+            }
+            resourceContext_.destroyBuffer(drawBuffer.buffer);
+            drawBuffer = {};
+        }
+    }
+
     void uploadTexturePixels(Texture& texture, const std::vector<std::uint8_t>& pixels)
     {
         TextureUpload upload = textureManager_.uploadTexturePixels(texture, pixels);
@@ -2348,6 +3315,32 @@ private:
     void drawFrame()
     {
         FrameProfiler currentProfile = frameProfiler_;
+        currentProfile.chunkBuildTotalMs = 0.0;
+        currentProfile.chunkDataMs = 0.0;
+        currentProfile.chunkDataLoadedLookupMs = 0.0;
+        currentProfile.chunkDataCacheLookupMs = 0.0;
+        currentProfile.chunkDataWaitMs = 0.0;
+        currentProfile.chunkDataLoadGenerateMs = 0.0;
+        currentProfile.chunkDataCopyMs = 0.0;
+        currentProfile.chunkDataCacheStoreMs = 0.0;
+        currentProfile.chunkDiskLoadMs = 0.0;
+        currentProfile.chunkGenerateMs = 0.0;
+        currentProfile.chunkGenLockMs = 0.0;
+        currentProfile.chunkGenDensityGridMs = 0.0;
+        currentProfile.chunkGenBaseTerrainMs = 0.0;
+        currentProfile.chunkGenSurfaceMs = 0.0;
+        currentProfile.chunkGenPlantMs = 0.0;
+        currentProfile.chunkGenTreeMs = 0.0;
+        currentProfile.chunkGenOverrideMs = 0.0;
+        currentProfile.chunkGenVoxelCopyMs = 0.0;
+        currentProfile.chunkDiskSaveMs = 0.0;
+        currentProfile.chunkColumnMs = 0.0;
+        currentProfile.chunkMeshMs = 0.0;
+        currentProfile.chunkLoadedHits = 0;
+        currentProfile.chunkCacheHits = 0;
+        currentProfile.chunkWaitedLoads = 0;
+        currentProfile.chunkDiskLoaded = 0;
+        currentProfile.chunkGenerated = 0;
         const auto frameStart = std::chrono::steady_clock::now();
         auto mark = []()
         {
@@ -2364,7 +3357,8 @@ private:
         currentProfile.fenceWaitMs = elapsedMs(sectionStart);
 
         collectDeferredUploadCleanups(false);
-        collectDeferredChunkBufferDestroys(false);
+        collectDeferredMeshArenaFrees(false);
+        collectDeferredMeshBufferDestroys(false);
 
         std::uint32_t imageIndex = 0;
         sectionStart = mark();
@@ -2404,7 +3398,7 @@ private:
         currentProfile.subchunkDoneMs = elapsedMs(sectionStart);
 
         sectionStart = mark();
-        currentProfile.chunksUploaded = processCompletedChunkUploads();
+        currentProfile.chunksUploaded = processCompletedChunkUploads(currentProfile);
         currentProfile.chunkUploadMs = elapsedMs(sectionStart);
         currentProfile.chunksLoaded = static_cast<std::size_t>(currentProfile.chunksUploaded);
 
@@ -2414,14 +3408,26 @@ private:
         updateUniformBuffer();
         currentProfile.uniformMs = elapsedMs(sectionStart);
 
+        sectionStart = mark();
+        buildVisibleDrawLists();
+        currentProfile.visibilityMs = elapsedMs(sectionStart);
+
+        sectionStart = mark();
+        updateIndirectDrawBuffers();
+        currentProfile.indirectUploadMs = elapsedMs(sectionStart);
+
         frameProfiler_ = currentProfile;
         sectionStart = mark();
         updateDebugTextOverlay();
         currentProfile.debugTextMs = elapsedMs(sectionStart);
         frameProfiler_.debugTextMs = currentProfile.debugTextMs;
 
+        PendingScreenshot pendingScreenshot = consumeScreenshotRequest();
         sectionStart = mark();
-        recordCommandBuffer(commandBuffers_[currentFrame_], imageIndex);
+        recordCommandBuffer(
+            commandBuffers_[currentFrame_],
+            imageIndex,
+            pendingScreenshot.valid() ? pendingScreenshot.buffer.buffer : VK_NULL_HANDLE);
         currentProfile.recordMs = elapsedMs(sectionStart);
         sectionStart = mark();
 
@@ -2454,6 +3460,11 @@ private:
 
         result = vkQueuePresentKHR(presentQueue_, &presentInfo);
         currentProfile.submitPresentMs = elapsedMs(sectionStart);
+        if (pendingScreenshot.valid())
+        {
+            vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
+            finishScreenshot(pendingScreenshot);
+        }
         currentProfile.frameCpuMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - frameStart).count();
         frameProfiler_ = currentProfile;
@@ -2588,11 +3599,9 @@ private:
         const std::size_t voxelIndex = chunkBlockIndex(localX, y, localZ);
         loadedIt->second.blockIds[voxelIndex] = blockId;
         if (blockRegistry_.isCollision(blockId) &&
-            loadedIt->second.fluidIds.size() == kChunkBlockCount &&
-            loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+            loadedIt->second.fluidStates.size() == kChunkBlockCount)
         {
-            loadedIt->second.fluidIds[voxelIndex] = kNoFluidId;
-            loadedIt->second.fluidAmounts[voxelIndex] = 0;
+            loadedIt->second.fluidStates[voxelIndex] = kNoFluidState;
         }
         loadedIt->second.dirty = true;
 
@@ -2602,11 +3611,9 @@ private:
             if (cacheIt != chunkDataCache_.end() && cacheIt->second.valid())
             {
                 cacheIt->second.blockIds[voxelIndex] = loadedIt->second.blockIds[voxelIndex];
-                if (loadedIt->second.fluidIds.size() == kChunkBlockCount &&
-                    loadedIt->second.fluidAmounts.size() == kChunkBlockCount)
+                if (loadedIt->second.fluidStates.size() == kChunkBlockCount)
                 {
-                    cacheIt->second.fluidIds[voxelIndex] = loadedIt->second.fluidIds[voxelIndex];
-                    cacheIt->second.fluidAmounts[voxelIndex] = loadedIt->second.fluidAmounts[voxelIndex];
+                    cacheIt->second.fluidStates[voxelIndex] = loadedIt->second.fluidStates[voxelIndex];
                 }
             }
         }
@@ -2737,6 +3744,97 @@ private:
             minimum.z + static_cast<float>(kChunkSizeZ),
         };
         return isAabbVisibleInFrustum(frustum, minimum, maximum);
+    }
+
+    static bool isChunkVisible(const ViewFrustum& frustum, const ChunkMesh& mesh)
+    {
+        const Vec3 minimum{
+            static_cast<float>(mesh.chunkX * kChunkSizeX),
+            0.0f,
+            static_cast<float>(mesh.chunkZ * kChunkSizeZ),
+        };
+        const Vec3 maximum{
+            minimum.x + static_cast<float>(kChunkSizeX),
+            static_cast<float>(kChunkHeight),
+            minimum.z + static_cast<float>(kChunkSizeZ),
+        };
+        return isAabbVisibleInFrustum(frustum, minimum, maximum);
+    }
+
+    void buildVisibleDrawLists()
+    {
+        visibleBlockDrawCommands_.clear();
+        visibleFluidDrawCommands_.clear();
+
+        std::size_t visibleSubchunkDraws = 0;
+        std::size_t culledSubchunkDraws = 0;
+        for (const ChunkMesh& mesh : chunkMeshes_)
+        {
+            if (!isChunkVisible(currentViewFrustum_, mesh))
+            {
+                culledSubchunkDraws += mesh.subchunks.size() + mesh.fluidSubchunks.size();
+                continue;
+            }
+
+            if (mesh.indexCount > 0)
+            {
+                for (const SubchunkDraw& draw : mesh.subchunks)
+                {
+                    if (!isSubchunkVisible(currentViewFrustum_, draw))
+                    {
+                        ++culledSubchunkDraws;
+                        continue;
+                    }
+                    visibleBlockDrawCommands_.push_back(makeIndirectDrawCommand(draw));
+                    ++visibleSubchunkDraws;
+                }
+            }
+
+            if (mesh.fluidIndexCount > 0)
+            {
+                for (const SubchunkDraw& draw : mesh.fluidSubchunks)
+                {
+                    if (!isSubchunkVisible(currentViewFrustum_, draw))
+                    {
+                        ++culledSubchunkDraws;
+                        continue;
+                    }
+                    visibleFluidDrawCommands_.push_back(makeIndirectDrawCommand(draw));
+                    ++visibleSubchunkDraws;
+                }
+            }
+        }
+
+        visibleSubchunkDraws_ = visibleSubchunkDraws;
+        culledSubchunkDraws_ = culledSubchunkDraws;
+    }
+
+    void recordIndexedIndirectDraws(
+        VkCommandBuffer commandBuffer,
+        const IndirectDrawBuffer& drawBuffer) const
+    {
+        if (drawBuffer.buffer.buffer == VK_NULL_HANDLE || drawBuffer.count == 0)
+        {
+            return;
+        }
+
+        const std::uint32_t maxDrawCount = multiDrawIndirectEnabled_
+            ? std::max(physicalDeviceProperties_.limits.maxDrawIndirectCount, 1u)
+            : 1u;
+        std::uint32_t remaining = drawBuffer.count;
+        std::uint32_t firstCommand = 0;
+        while (remaining > 0)
+        {
+            const std::uint32_t batchCount = std::min(remaining, maxDrawCount);
+            vkCmdDrawIndexedIndirect(
+                commandBuffer,
+                drawBuffer.buffer.buffer,
+                sizeof(VkDrawIndexedIndirectCommand) * firstCommand,
+                batchCount,
+                sizeof(VkDrawIndexedIndirectCommand));
+            remaining -= batchCount;
+            firstCommand += batchCount;
+        }
     }
 
     void updateBlockSelection(bool force)
@@ -2943,10 +4041,31 @@ private:
         const double frameMs = 1000.0 / std::max(fps, 0.001);
         const int fpsInteger = std::clamp(static_cast<int>(std::lround(fps)), 0, 9999);
 
-        auto profilerLine = [](const wchar_t* label, double milliseconds)
+        auto heldPeak = [this, now](const std::wstring& key, double value)
+        {
+            HeldProfilerValue& held = bottomLeftHeldPeaks_[key];
+            if (held.lastPeakTime.time_since_epoch().count() == 0 ||
+                value >= held.value ||
+                std::chrono::duration<double>(now - held.lastPeakTime).count() > kProfilerPeakHoldSeconds)
+            {
+                held.value = value;
+                held.lastPeakTime = now;
+            }
+            return held.value;
+        };
+        auto profilerLine = [&](const wchar_t* label, double milliseconds)
+        {
+            const std::wstring key(label);
+            const double peakMilliseconds = heldPeak(key, milliseconds);
+            std::wostringstream line;
+            line << label << L": " << std::fixed << std::setprecision(3) << milliseconds
+                 << L"MS [" << peakMilliseconds << L"]";
+            return line.str();
+        };
+        auto countLine = [](const wchar_t* label, auto value)
         {
             std::wostringstream line;
-            line << label << L": " << std::fixed << std::setprecision(3) << milliseconds << L"MS";
+            line << label << L": " << value;
             return line.str();
         };
 
@@ -2985,7 +4104,7 @@ private:
                    << L" PIT " << std::setw(7) << pitchDegrees
                    << std::noshowpos << L" [" << directionNameForYaw(camera_.yaw) << L"]";
 
-        debugTextOverlay_.lines = {
+        const std::vector<std::wstring> defaultLeftLines = {
             fpsText.str(),
             positionText.str(),
             landformText.str(),
@@ -2995,25 +4114,71 @@ private:
         };
 
         const FrameProfiler profile = frameProfiler_;
-        debugTextOverlay_.bottomLeftLines = {
+        const std::vector<std::wstring> profilerLines = {
+            fpsText.str(),
             profilerLine(L"FRAME CPU", profile.frameCpuMs),
-            profilerLine(L"FENCE", profile.fenceWaitMs),
-            profilerLine(L"ACQUIRE", profile.acquireMs),
-            profilerLine(L"LOAD", profile.loadUpdateMs),
-            profilerLine(L"DONE", profile.subchunkDoneMs),
-            profilerLine(L"UPLOAD", profile.chunkUploadMs),
-            profilerLine(L"UNIFORM", profile.uniformMs),
-            profilerLine(L"DEBUG", profile.debugTextMs),
+            profilerLine(L"LOAD UPDATE", profile.loadUpdateMs),
+            countLine(L"QUEUE +", profile.chunksQueued),
+            countLine(L"UNLOAD -", profile.chunksUnloaded),
+            profilerLine(L"WORKER BUILD", profile.chunkBuildTotalMs),
+            profilerLine(L"  DATA 9CH", profile.chunkDataMs),
+            profilerLine(L"    LOADED LOOK", profile.chunkDataLoadedLookupMs),
+            profilerLine(L"    CACHE LOOK", profile.chunkDataCacheLookupMs),
+            profilerLine(L"    WAIT", profile.chunkDataWaitMs),
+            profilerLine(L"    MISS LOADGEN", profile.chunkDataLoadGenerateMs),
+            profilerLine(L"    COPY", profile.chunkDataCopyMs),
+            profilerLine(L"    CACHE STORE", profile.chunkDataCacheStoreMs),
+            profilerLine(L"  DISK LOAD", profile.chunkDiskLoadMs),
+            profilerLine(L"  GENERATE", profile.chunkGenerateMs),
+            profilerLine(L"    GEN LOCK", profile.chunkGenLockMs),
+            profilerLine(L"    DENSITY GRID", profile.chunkGenDensityGridMs),
+            profilerLine(L"    BASE TERRAIN", profile.chunkGenBaseTerrainMs),
+            profilerLine(L"    SURFACE", profile.chunkGenSurfaceMs),
+            profilerLine(L"    PLANT", profile.chunkGenPlantMs),
+            profilerLine(L"    TREE", profile.chunkGenTreeMs),
+            profilerLine(L"    OVERRIDE", profile.chunkGenOverrideMs),
+            profilerLine(L"    VOXEL COPY", profile.chunkGenVoxelCopyMs),
+            profilerLine(L"  DISK SAVE", profile.chunkDiskSaveMs),
+            profilerLine(L"  COLUMN", profile.chunkColumnMs),
+            profilerLine(L"  MESH", profile.chunkMeshMs),
+            countLine(L"  HIT L/C/W", std::to_wstring(profile.chunkLoadedHits) + L"/" +
+                std::to_wstring(profile.chunkCacheHits) + L"/" +
+                std::to_wstring(profile.chunkWaitedLoads)),
+            countLine(L"  DISK/GEN", std::to_wstring(profile.chunkDiskLoaded) + L"/" +
+                std::to_wstring(profile.chunkGenerated)),
+            profilerLine(L"MAIN DONE", profile.subchunkDoneMs),
+            profilerLine(L"GPU UPLOAD", profile.chunkUploadMs),
+            countLine(L"UPLOADED", profile.chunksUploaded),
+            profilerLine(L"VISIBILITY", profile.visibilityMs),
+            profilerLine(L"INDIRECT", profile.indirectUploadMs),
             profilerLine(L"RECORD", profile.recordMs),
             profilerLine(L"SUBMIT", profile.submitPresentMs),
         };
 
-        const bool shouldUpdateRightText =
-            now - debugTextOverlay_.rightLastUpdate >= std::chrono::milliseconds(500);
-        if (shouldUpdateRightText)
+        debugTextOverlay_.lines.clear();
+        debugTextOverlay_.bottomLeftLines.clear();
+
+        if (debugTextMode_ == DebugTextMode::Default)
         {
-            updateRightDebugText();
-            debugTextOverlay_.rightLastUpdate = now;
+            debugTextOverlay_.lines = defaultLeftLines;
+
+            const bool shouldUpdateRightText =
+                debugTextOverlay_.rightLines.empty() ||
+                now - debugTextOverlay_.rightLastUpdate >= std::chrono::milliseconds(500);
+            if (shouldUpdateRightText)
+            {
+                updateRightDebugText();
+                debugTextOverlay_.rightLastUpdate = now;
+            }
+        }
+        else if (debugTextMode_ == DebugTextMode::Profiler)
+        {
+            debugTextOverlay_.rightLines.clear();
+            debugTextOverlay_.lines = profilerLines;
+        }
+        else
+        {
+            debugTextOverlay_.rightLines.clear();
         }
 
         debugTextOverlay_.lastUpdate = now;
@@ -3071,15 +4236,27 @@ private:
             }
         }
 
-        std::size_t blockDrawCalls = 0;
-        for (const ChunkMesh& mesh : chunkMeshes_)
+        const auto indirectDrawCallCount = [this](std::size_t commandCount)
         {
-            blockDrawCalls += mesh.subchunks.size() + mesh.fluidSubchunks.size();
-        }
-        const std::size_t debugDrawCalls = debugTextVisible_ ? 1 : 0;
+            if (commandCount == 0)
+            {
+                return std::size_t{0};
+            }
+            const std::size_t maxDrawCount = multiDrawIndirectEnabled_
+                ? std::max(
+                    static_cast<std::size_t>(physicalDeviceProperties_.limits.maxDrawIndirectCount),
+                    std::size_t{1})
+                : std::size_t{1};
+            return (commandCount + maxDrawCount - 1) / maxDrawCount;
+        };
+        const std::size_t chunkDrawCalls =
+            indirectDrawCallCount(visibleBlockDrawCommands_.size()) +
+            indirectDrawCallCount(visibleFluidDrawCommands_.size());
+        const std::size_t debugDrawCalls = isDebugTextVisible() ? 1 : 0;
         const std::size_t playerDrawCalls = playerVertexCount_ > 0 && playerIndexCount_ > 0 ? 1 : 0;
         const std::size_t crosshairDrawCalls = crosshairVertexCount_ > 0 ? 1 : 0;
-        const std::size_t drawCalls = 1 + blockDrawCalls + playerDrawCalls + crosshairDrawCalls + debugDrawCalls;
+        const std::size_t drawCalls =
+            1 + chunkDrawCalls + playerDrawCalls + crosshairDrawCalls + debugDrawCalls;
         const std::size_t totalVertices = 12 + meshVertexCount_ + playerVertexCount_ + crosshairVertexCount_ + debugTextVertexCount_;
         const std::size_t totalIndices = meshIndexCount_ + playerIndexCount_;
         const std::size_t triangles = meshIndexCount_ / 3 + playerIndexCount_ / 3 + 4 + crosshairVertexCount_ / 3 + debugTextVertexCount_ / 3;
@@ -3094,6 +4271,7 @@ private:
             apiDebugLine_,
             driverDebugLine_,
             L"DRAWS: " + std::to_wstring(drawCalls),
+            L"INDIRECT CHUNK DRAWS: " + std::to_wstring(chunkDrawCalls),
             L"VISIBLE SUBCHUNKS: " + std::to_wstring(visibleSubchunkDraws_),
             L"CULLED SUBCHUNKS: " + std::to_wstring(culledSubchunkDraws_),
             L"CHUNKS: " + std::to_wstring(chunkStreaming_.loadedChunkCount()),
@@ -3102,7 +4280,8 @@ private:
             L"BUILD THREADS: " + std::to_wstring(chunkStreaming_.buildThreadCount()),
             L"BUILD JOBS: " + std::to_wstring(pendingBuilds),
             L"BUILD DONE: " + std::to_wstring(completedBuilds),
-            L"DEFERRED DESTROYS: " + std::to_wstring(deferredChunkBufferDestroys_.size()),
+            L"DEFERRED MESH FREES: " + std::to_wstring(deferredMeshArenaFrees_.size()),
+            L"DEFERRED MESH BUFFERS: " + std::to_wstring(deferredMeshBufferDestroys_.size()),
             L"DEFERRED UPLOADS: " + std::to_wstring(deferredUploadCleanups_.size()),
             L"VERTS: " + std::to_wstring(totalVertices),
             L"INDICES: " + std::to_wstring(totalIndices),
@@ -3172,7 +4351,91 @@ private:
         return dawnColor * (1.0f - blend) + dayColor * blend;
     }
 
-    void recordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex)
+    void recordSwapchainScreenshotCopy(
+        VkCommandBuffer commandBuffer,
+        std::uint32_t imageIndex,
+        VkBuffer destinationBuffer) const
+    {
+        if (destinationBuffer == VK_NULL_HANDLE || imageIndex >= swapchainImages_.size())
+        {
+            return;
+        }
+
+        VkImageMemoryBarrier toTransferSource{};
+        toTransferSource.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toTransferSource.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        toTransferSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toTransferSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSource.image = swapchainImages_[imageIndex];
+        toTransferSource.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toTransferSource.subresourceRange.baseMipLevel = 0;
+        toTransferSource.subresourceRange.levelCount = 1;
+        toTransferSource.subresourceRange.baseArrayLayer = 0;
+        toTransferSource.subresourceRange.layerCount = 1;
+        toTransferSource.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toTransferSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &toTransferSource);
+
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.bufferRowLength = 0;
+        copyRegion.bufferImageHeight = 0;
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.imageSubresource.mipLevel = 0;
+        copyRegion.imageSubresource.baseArrayLayer = 0;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageOffset = {0, 0, 0};
+        copyRegion.imageExtent = {swapchainExtent_.width, swapchainExtent_.height, 1};
+        vkCmdCopyImageToBuffer(
+            commandBuffer,
+            swapchainImages_[imageIndex],
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            destinationBuffer,
+            1,
+            &copyRegion);
+
+        VkImageMemoryBarrier toPresent{};
+        toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toPresent.image = swapchainImages_[imageIndex];
+        toPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toPresent.subresourceRange.baseMipLevel = 0;
+        toPresent.subresourceRange.levelCount = 1;
+        toPresent.subresourceRange.baseArrayLayer = 0;
+        toPresent.subresourceRange.layerCount = 1;
+        toPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toPresent.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &toPresent);
+    }
+
+    void recordCommandBuffer(
+        VkCommandBuffer commandBuffer,
+        std::uint32_t imageIndex,
+        VkBuffer screenshotDestinationBuffer)
     {
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -3219,34 +4482,13 @@ private:
             &blockDescriptorSet_,
             0,
             nullptr);
-        std::size_t visibleSubchunkDraws = 0;
-        std::size_t culledSubchunkDraws = 0;
-        for (const ChunkMesh& mesh : chunkMeshes_)
+        if (!visibleBlockDrawCommands_.empty())
         {
-            if (mesh.indexCount == 0)
-            {
-                continue;
-            }
-            VkBuffer vertexBuffers[] = {mesh.vertexBuffer.buffer};
+            VkBuffer vertexBuffers[] = {blockMeshArena_.vertexBuffer.buffer};
             VkDeviceSize offsets[] = {0};
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-            vkCmdBindIndexBuffer(commandBuffer, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-            for (const SubchunkDraw& draw : mesh.subchunks)
-            {
-                if (!isSubchunkVisible(currentViewFrustum_, draw))
-                {
-                    ++culledSubchunkDraws;
-                    continue;
-                }
-                ++visibleSubchunkDraws;
-                vkCmdDrawIndexed(
-                    commandBuffer,
-                    draw.range.indexCount,
-                    1,
-                    draw.range.firstIndex,
-                    draw.range.vertexOffset,
-                0);
-            }
+            vkCmdBindIndexBuffer(commandBuffer, blockMeshArena_.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            recordIndexedIndirectDraws(commandBuffer, blockIndirectDrawBuffers_[currentFrame_]);
         }
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fluidPipeline_);
@@ -3259,35 +4501,14 @@ private:
             &blockDescriptorSet_,
             0,
             nullptr);
-        for (const ChunkMesh& mesh : chunkMeshes_)
+        if (!visibleFluidDrawCommands_.empty())
         {
-            if (mesh.fluidIndexCount == 0)
-            {
-                continue;
-            }
-            VkBuffer vertexBuffers[] = {mesh.fluidVertexBuffer.buffer};
+            VkBuffer vertexBuffers[] = {fluidMeshArena_.vertexBuffer.buffer};
             VkDeviceSize offsets[] = {0};
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-            vkCmdBindIndexBuffer(commandBuffer, mesh.fluidIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-            for (const SubchunkDraw& draw : mesh.fluidSubchunks)
-            {
-                if (!isSubchunkVisible(currentViewFrustum_, draw))
-                {
-                    ++culledSubchunkDraws;
-                    continue;
-                }
-                ++visibleSubchunkDraws;
-                vkCmdDrawIndexed(
-                    commandBuffer,
-                    draw.range.indexCount,
-                    1,
-                    draw.range.firstIndex,
-                    draw.range.vertexOffset,
-                    0);
-            }
+            vkCmdBindIndexBuffer(commandBuffer, fluidMeshArena_.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            recordIndexedIndirectDraws(commandBuffer, fluidIndirectDrawBuffers_[currentFrame_]);
         }
-        visibleSubchunkDraws_ = visibleSubchunkDraws;
-        culledSubchunkDraws_ = culledSubchunkDraws;
 
         if (selectionVertexCount_ > 0)
         {
@@ -3344,7 +4565,7 @@ private:
             vkCmdDraw(commandBuffer, crosshairVertexCount_, 1, 0, 0);
         }
 
-        if (debugTextVisible_)
+        if (isDebugTextVisible())
         {
             vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, debugTextPipeline_);
             vkCmdBindDescriptorSets(
@@ -3362,6 +4583,7 @@ private:
             vkCmdDraw(commandBuffer, debugTextVertexCount_, 1, 0, 0);
         }
         vkCmdEndRenderPass(commandBuffer);
+        recordSwapchainScreenshotCopy(commandBuffer, imageIndex, screenshotDestinationBuffer);
 
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
         {
@@ -3382,7 +4604,8 @@ private:
 
         vkDeviceWaitIdle(device_);
         collectDeferredUploadCleanups(true);
-        collectDeferredChunkBufferDestroys(true);
+        collectDeferredMeshArenaFrees(true);
+        collectDeferredMeshBufferDestroys(true);
         cleanupSwapchain();
         createSwapchain();
         createRenderPass();
@@ -3485,6 +4708,7 @@ private:
         swapchain_ = resources.swapchain;
         swapchainImageFormat_ = resources.imageFormat;
         swapchainExtent_ = resources.extent;
+        swapchainScreenshotSupported_ = resources.supportsTransferSrc;
         swapchainImages_ = std::move(resources.images);
         swapchainImageViews_ = std::move(resources.imageViews);
     }
@@ -3567,9 +4791,9 @@ private:
         camera_.firstMouse = true;
     }
 
-    void collectDeferredChunkBufferDestroys(bool force)
+    void collectDeferredMeshArenaFrees(bool force)
     {
-        for (auto it = deferredChunkBufferDestroys_.begin(); it != deferredChunkBufferDestroys_.end();)
+        for (auto it = deferredMeshArenaFrees_.begin(); it != deferredMeshArenaFrees_.end();)
         {
             if (!force && it->retireFrame > frameCounter_)
             {
@@ -3577,11 +4801,24 @@ private:
                 continue;
             }
 
-            resourceContext_.destroyBuffer(it->vertexBuffer);
-            resourceContext_.destroyBuffer(it->indexBuffer);
-            resourceContext_.destroyBuffer(it->fluidVertexBuffer);
-            resourceContext_.destroyBuffer(it->fluidIndexBuffer);
-            it = deferredChunkBufferDestroys_.erase(it);
+            freeMeshArenaAllocation(blockMeshArena_, it->blockAllocation);
+            freeMeshArenaAllocation(fluidMeshArena_, it->fluidAllocation);
+            it = deferredMeshArenaFrees_.erase(it);
+        }
+    }
+
+    void collectDeferredMeshBufferDestroys(bool force)
+    {
+        for (auto it = deferredMeshBufferDestroys_.begin(); it != deferredMeshBufferDestroys_.end();)
+        {
+            if (!force && it->retireFrame > frameCounter_)
+            {
+                ++it;
+                continue;
+            }
+
+            resourceContext_.destroyBuffer(it->buffer);
+            it = deferredMeshBufferDestroys_.erase(it);
         }
     }
 
@@ -3615,11 +4852,9 @@ private:
                 continue;
             }
 
-            deferredChunkBufferDestroys_.push_back({
-                it->vertexBuffer,
-                it->indexBuffer,
-                it->fluidVertexBuffer,
-                it->fluidIndexBuffer,
+            deferredMeshArenaFrees_.push_back({
+                it->blockAllocation,
+                it->fluidAllocation,
                 frameCounter_ + static_cast<std::uint64_t>(kMaxFramesInFlight),
             });
             meshVertexCount_ -= std::min(
@@ -3634,15 +4869,30 @@ private:
 
     void destroyAllChunkMeshes()
     {
-        for (ChunkMesh& mesh : chunkMeshes_)
+        for (const ChunkMesh& mesh : chunkMeshes_)
         {
-            resourceContext_.destroyBuffer(mesh.vertexBuffer);
-            resourceContext_.destroyBuffer(mesh.indexBuffer);
-            resourceContext_.destroyBuffer(mesh.fluidVertexBuffer);
-            resourceContext_.destroyBuffer(mesh.fluidIndexBuffer);
+            freeMeshArenaAllocation(blockMeshArena_, mesh.blockAllocation);
+            freeMeshArenaAllocation(fluidMeshArena_, mesh.fluidAllocation);
         }
         chunkMeshes_.clear();
-        collectDeferredChunkBufferDestroys(true);
+        visibleBlockDrawCommands_.clear();
+        visibleFluidDrawCommands_.clear();
+        for (IndirectDrawBuffer& drawBuffer : blockIndirectDrawBuffers_)
+        {
+            drawBuffer.count = 0;
+        }
+        for (IndirectDrawBuffer& drawBuffer : fluidIndirectDrawBuffers_)
+        {
+            drawBuffer.count = 0;
+        }
+        collectDeferredMeshArenaFrees(true);
+        collectDeferredMeshBufferDestroys(true);
+        resourceContext_.destroyBuffer(blockMeshArena_.vertexBuffer);
+        resourceContext_.destroyBuffer(blockMeshArena_.indexBuffer);
+        resourceContext_.destroyBuffer(fluidMeshArena_.vertexBuffer);
+        resourceContext_.destroyBuffer(fluidMeshArena_.indexBuffer);
+        blockMeshArena_ = {};
+        fluidMeshArena_ = {};
         chunkStreaming_.reset();
         clearChunkDataCache();
         meshVertexCount_ = 0;

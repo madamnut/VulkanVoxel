@@ -3,6 +3,7 @@
 #include "core/Math.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <mutex>
@@ -17,6 +18,12 @@ constexpr int kTreeDecorationReach = 2;
 constexpr int kTreeSpawnChancePercent = 2;
 constexpr int kTreeMinTrunkHeight = 4;
 constexpr int kTreeTrunkHeightRange = 3;
+
+double elapsedMilliseconds(std::chrono::steady_clock::time_point begin)
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+}
 
 std::size_t checkedColumnIndex(
     int localPaddedX,
@@ -42,8 +49,7 @@ std::size_t checkedColumnIndex(
 
 GeneratedChunkColumn::GeneratedChunkColumn()
     : blockIds(kCellCount, kAirBlockId)
-    , fluidIds(kCellCount, kNoFluidId)
-    , fluidAmounts(kCellCount, 0)
+    , fluidStates(kCellCount, kNoFluidState)
 {
 }
 
@@ -69,43 +75,21 @@ std::uint16_t& GeneratedChunkColumn::blockAt(int localPaddedX, int y, int localP
     return blockIds[checkedColumnIndex(localPaddedX, y, localPaddedZ, blockIds.size())];
 }
 
-std::uint8_t GeneratedChunkColumn::fluidIdAt(int localPaddedX, int y, int localPaddedZ) const
+std::uint16_t GeneratedChunkColumn::fluidStateAt(int localPaddedX, int y, int localPaddedZ) const
 {
     if (localPaddedX < 0 || localPaddedX >= kWidth ||
         y < 0 || y >= kHeight ||
         localPaddedZ < 0 || localPaddedZ >= kDepth ||
-        fluidIds.size() != kCellCount)
+        fluidStates.size() != kCellCount)
     {
-        return kNoFluidId;
+        return kNoFluidState;
     }
-    return fluidIds[index(localPaddedX, y, localPaddedZ)];
+    return fluidStates[index(localPaddedX, y, localPaddedZ)];
 }
 
-std::uint8_t& GeneratedChunkColumn::fluidIdAt(int localPaddedX, int y, int localPaddedZ)
+std::uint16_t& GeneratedChunkColumn::fluidStateAt(int localPaddedX, int y, int localPaddedZ)
 {
-    return fluidIds[checkedColumnIndex(localPaddedX, y, localPaddedZ, fluidIds.size())];
-}
-
-std::uint8_t GeneratedChunkColumn::fluidAt(int localPaddedX, int y, int localPaddedZ) const
-{
-    if (localPaddedX < 0 || localPaddedX >= kWidth ||
-        y < 0 || y >= kHeight ||
-        localPaddedZ < 0 || localPaddedZ >= kDepth ||
-        fluidIds.size() != kCellCount ||
-        fluidAmounts.size() != kCellCount)
-    {
-        return 0;
-    }
-    if (fluidIds[index(localPaddedX, y, localPaddedZ)] == kNoFluidId)
-    {
-        return 0;
-    }
-    return fluidAmounts[index(localPaddedX, y, localPaddedZ)];
-}
-
-std::uint8_t& GeneratedChunkColumn::fluidAt(int localPaddedX, int y, int localPaddedZ)
-{
-    return fluidAmounts[checkedColumnIndex(localPaddedX, y, localPaddedZ, fluidAmounts.size())];
+    return fluidStates[checkedColumnIndex(localPaddedX, y, localPaddedZ, fluidStates.size())];
 }
 
 float WorldGenerator::DensityGrid::valueAt(int localCellX, int cellY, int localCellZ) const
@@ -362,7 +346,18 @@ float WorldGenerator::landformRawAt(int x, int z) const
 
 GeneratedChunkColumn WorldGenerator::generateChunkColumn(ChunkCoord coord) const
 {
+    return generateChunkColumn(coord, nullptr);
+}
+
+GeneratedChunkColumn WorldGenerator::generateChunkColumn(ChunkCoord coord, ChunkBuildProfile* profile) const
+{
+    auto sectionStart = std::chrono::steady_clock::now();
     std::shared_lock lock(generatorMutex_);
+    if (profile != nullptr)
+    {
+        profile->genLockMs += elapsedMilliseconds(sectionStart);
+    }
+
     const int chunkBaseX = coord.x * kChunkSizeX;
     const int chunkBaseZ = coord.z * kChunkSizeZ;
     const int columnMinX = chunkBaseX - GeneratedChunkColumn::kPadding;
@@ -373,15 +368,50 @@ GeneratedChunkColumn WorldGenerator::generateChunkColumn(ChunkCoord coord) const
     const int candidateMaxX = columnMaxX + kTreeDecorationReach;
     const int candidateMinZ = columnMinZ - kTreeDecorationReach;
     const int candidateMaxZ = columnMaxZ + kTreeDecorationReach;
+
+    sectionStart = std::chrono::steady_clock::now();
     const DensityGrid densityGrid = buildDensityGrid(candidateMinX, candidateMaxX, candidateMinZ, candidateMaxZ);
+    if (profile != nullptr)
+    {
+        profile->genDensityGridMs += elapsedMilliseconds(sectionStart);
+    }
 
     GeneratedChunkColumn column{};
+    sectionStart = std::chrono::steady_clock::now();
     const SurfaceGrid surfaceGrid =
         generateBaseTerrain(coord, densityGrid, candidateMinX, candidateMaxX, candidateMinZ, candidateMaxZ, column);
+    if (profile != nullptr)
+    {
+        profile->genBaseTerrainMs += elapsedMilliseconds(sectionStart);
+    }
+
+    sectionStart = std::chrono::steady_clock::now();
     applySurfaceMaterials(column);
+    if (profile != nullptr)
+    {
+        profile->genSurfaceMs += elapsedMilliseconds(sectionStart);
+    }
+
+    sectionStart = std::chrono::steady_clock::now();
     applyPlantDecorations(coord, surfaceGrid, column);
+    if (profile != nullptr)
+    {
+        profile->genPlantMs += elapsedMilliseconds(sectionStart);
+    }
+
+    sectionStart = std::chrono::steady_clock::now();
     applyTreeDecorations(coord, surfaceGrid, column);
+    if (profile != nullptr)
+    {
+        profile->genTreeMs += elapsedMilliseconds(sectionStart);
+    }
+
+    sectionStart = std::chrono::steady_clock::now();
     applyBlockOverrides(coord, column);
+    if (profile != nullptr)
+    {
+        profile->genOverrideMs += elapsedMilliseconds(sectionStart);
+    }
     return column;
 }
 
@@ -403,31 +433,36 @@ std::vector<std::uint16_t> WorldGenerator::generateChunkBlocks(ChunkCoord coord)
     return blockIds;
 }
 
-std::vector<std::uint8_t> WorldGenerator::generateChunkFluids(ChunkCoord coord) const
+std::vector<std::uint16_t> WorldGenerator::generateChunkFluids(ChunkCoord coord) const
 {
     const GeneratedChunkColumn column = generateChunkColumn(coord);
-    std::vector<std::uint8_t> fluidAmounts(kChunkBlockCount);
+    std::vector<std::uint16_t> fluidStates(kChunkBlockCount);
     for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
     {
         for (int localX = 0; localX < kChunkSizeX; ++localX)
         {
             for (int y = 0; y < kChunkHeight; ++y)
             {
-                fluidAmounts[chunkBlockIndex(localX, y, localZ)] =
-                    column.fluidAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding);
+                fluidStates[chunkBlockIndex(localX, y, localZ)] =
+                    column.fluidStateAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding);
             }
         }
     }
-    return fluidAmounts;
+    return fluidStates;
 }
 
 ChunkVoxelData WorldGenerator::generateChunkVoxels(ChunkCoord coord) const
 {
-    const GeneratedChunkColumn column = generateChunkColumn(coord);
+    return generateChunkVoxels(coord, nullptr);
+}
+
+ChunkVoxelData WorldGenerator::generateChunkVoxels(ChunkCoord coord, ChunkBuildProfile* profile) const
+{
+    const GeneratedChunkColumn column = generateChunkColumn(coord, profile);
     ChunkVoxelData voxels{};
     voxels.blockIds.resize(kChunkBlockCount);
-    voxels.fluidIds.resize(kChunkBlockCount);
-    voxels.fluidAmounts.resize(kChunkBlockCount);
+    voxels.fluidStates.resize(kChunkBlockCount);
+    const auto sectionStart = std::chrono::steady_clock::now();
     for (int localZ = 0; localZ < kChunkSizeZ; ++localZ)
     {
         for (int localX = 0; localX < kChunkSizeX; ++localX)
@@ -437,12 +472,14 @@ ChunkVoxelData WorldGenerator::generateChunkVoxels(ChunkCoord coord) const
                 const std::size_t targetIndex = chunkBlockIndex(localX, y, localZ);
                 voxels.blockIds[targetIndex] =
                     column.blockAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding);
-                voxels.fluidIds[targetIndex] =
-                    column.fluidIdAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding);
-                voxels.fluidAmounts[targetIndex] =
-                    column.fluidAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding);
+                voxels.fluidStates[targetIndex] =
+                    column.fluidStateAt(localX + GeneratedChunkColumn::kPadding, y, localZ + GeneratedChunkColumn::kPadding);
             }
         }
+    }
+    if (profile != nullptr)
+    {
+        profile->genVoxelCopyMs += elapsedMilliseconds(sectionStart);
     }
     return voxels;
 }
@@ -502,8 +539,7 @@ WorldGenerator::SurfaceGrid WorldGenerator::generateBaseTerrain(
                 }
                 else if (y <= kInitialWaterLevel)
                 {
-                    column.fluidIdAt(localPaddedX, y, localPaddedZ) = kWaterFluidId;
-                    column.fluidAt(localPaddedX, y, localPaddedZ) = kMaxFluidAmount;
+                    column.fluidStateAt(localPaddedX, y, localPaddedZ) = kWaterFullFluidState;
                 }
             }
 
@@ -808,8 +844,7 @@ void WorldGenerator::applySurfaceMaterials(GeneratedChunkColumn& column) const
 
                 if (!foundHighestSolid)
                 {
-                    blockId = column.fluidIdAt(localPaddedX, y + 1, localPaddedZ) == kWaterFluidId &&
-                        column.fluidAt(localPaddedX, y + 1, localPaddedZ) > 0 ?
+                    blockId = isWaterFluidState(column.fluidStateAt(localPaddedX, y + 1, localPaddedZ)) ?
                         kDirtBlockId :
                         kGrassBlockId;
                     foundHighestSolid = true;
@@ -855,8 +890,7 @@ void WorldGenerator::applyPlantDecorations(
             if (column.blockAt(localPaddedX, y, localPaddedZ) != kGrassBlockId ||
                 y + 1 >= kChunkHeight ||
                 column.blockAt(localPaddedX, y + 1, localPaddedZ) != kAirBlockId ||
-                column.fluidIdAt(localPaddedX, y + 1, localPaddedZ) != kNoFluidId ||
-                column.fluidAt(localPaddedX, y + 1, localPaddedZ) != 0)
+                column.fluidStateAt(localPaddedX, y + 1, localPaddedZ) != kNoFluidState)
             {
                 continue;
             }
@@ -937,8 +971,7 @@ void WorldGenerator::placeTreeInColumn(
         }
         const std::uint16_t blockId = column.blockAt(localPaddedX, y, localPaddedZ);
         if ((blockId != kAirBlockId && blockId != kPlantBlockId) ||
-            column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId ||
-            column.fluidAt(localPaddedX, y, localPaddedZ) != 0)
+            column.fluidStateAt(localPaddedX, y, localPaddedZ) != kNoFluidState)
         {
             return;
         }
@@ -969,8 +1002,7 @@ void WorldGenerator::placeTreeInColumn(
         {
             return;
         }
-        if (column.fluidIdAt(localPaddedX, y, localPaddedZ) != kNoFluidId ||
-            column.fluidAt(localPaddedX, y, localPaddedZ) != 0)
+        if (column.fluidStateAt(localPaddedX, y, localPaddedZ) != kNoFluidState)
         {
             return;
         }
@@ -1032,8 +1064,7 @@ void WorldGenerator::applyBlockOverrides(ChunkCoord coord, GeneratedChunkColumn&
         column.blockAt(localPaddedX, blockOverride.y, localPaddedZ) = blockOverride.blockId;
         if (blockOverride.blockId != kAirBlockId)
         {
-            column.fluidIdAt(localPaddedX, blockOverride.y, localPaddedZ) = kNoFluidId;
-            column.fluidAt(localPaddedX, blockOverride.y, localPaddedZ) = 0;
+            column.fluidStateAt(localPaddedX, blockOverride.y, localPaddedZ) = kNoFluidState;
         }
     }
 }

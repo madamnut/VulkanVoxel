@@ -54,17 +54,14 @@ struct GeneratedChunkColumn
         static_cast<std::size_t>(kWidth) * kHeight * kDepth;
 
     std::vector<std::uint16_t> blockIds;
-    std::vector<std::uint8_t> fluidIds;
-    std::vector<std::uint8_t> fluidAmounts;
+    std::vector<std::uint16_t> fluidStates;
 
     GeneratedChunkColumn();
     static std::size_t index(int localPaddedX, int y, int localPaddedZ);
     std::uint16_t blockAt(int localPaddedX, int y, int localPaddedZ) const;
     std::uint16_t& blockAt(int localPaddedX, int y, int localPaddedZ);
-    std::uint8_t fluidIdAt(int localPaddedX, int y, int localPaddedZ) const;
-    std::uint8_t& fluidIdAt(int localPaddedX, int y, int localPaddedZ);
-    std::uint8_t fluidAt(int localPaddedX, int y, int localPaddedZ) const;
-    std::uint8_t& fluidAt(int localPaddedX, int y, int localPaddedZ);
+    std::uint16_t fluidStateAt(int localPaddedX, int y, int localPaddedZ) const;
+    std::uint16_t& fluidStateAt(int localPaddedX, int y, int localPaddedZ);
 };
 
 class WorldGenerator
@@ -86,9 +83,11 @@ public:
     float landformRawAt(int x, int z) const;
     float landformCenterOffsetAt(int x, int z) const;
     GeneratedChunkColumn generateChunkColumn(ChunkCoord coord) const;
+    GeneratedChunkColumn generateChunkColumn(ChunkCoord coord, ChunkBuildProfile* profile) const;
     std::vector<std::uint16_t> generateChunkBlocks(ChunkCoord coord) const;
-    std::vector<std::uint8_t> generateChunkFluids(ChunkCoord coord) const;
+    std::vector<std::uint16_t> generateChunkFluids(ChunkCoord coord) const;
     ChunkVoxelData generateChunkVoxels(ChunkCoord coord) const;
+    ChunkVoxelData generateChunkVoxels(ChunkCoord coord, ChunkBuildProfile* profile) const;
     void setBlockIdAt(int x, int y, int z, std::uint16_t blockId);
 
 private:

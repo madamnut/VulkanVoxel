@@ -8,7 +8,6 @@ struct WorldConfig
 {
     int chunkLoadRadius = 5;
     int chunkUploadsPerFrame = 1;
-    int chunkBuildThreads = 4;
     TerrainDensityConfig terrainDensity{};
 };
 

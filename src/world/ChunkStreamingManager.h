@@ -10,7 +10,9 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -33,7 +35,7 @@ public:
 
     void setLoadRadius(int loadRadius);
     void setBuildThreadCount(int buildThreadCount);
-    void setChunkBuildCallback(std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> callback);
+    void setChunkBuildCallback(std::function<std::shared_ptr<ChunkBuildResult>(ChunkCoord, std::uint64_t)> callback);
     void setBuildErrorCallback(std::function<void(ChunkCoord, const std::string&)> callback);
     int loadRadius() const;
     int buildThreadCount() const;
@@ -48,7 +50,7 @@ public:
         const std::function<void(ChunkCoord)>& unloadChunk);
 
     std::size_t processCompletedSubchunkBuilds();
-    bool popCompletedChunkBuild(ChunkBuildResult& result);
+    std::shared_ptr<ChunkBuildResult> popCompletedChunkBuild();
     bool shouldAcceptCompletedChunk(ChunkCoord coord) const;
     void markChunkLoaded(ChunkCoord coord);
     bool isChunkLoaded(ChunkCoord coord) const;
@@ -70,7 +72,7 @@ private:
     };
 
     ChunkMesher& chunkMesher_;
-    std::function<ChunkBuildResult(ChunkCoord, std::uint64_t)> chunkBuildCallback_;
+    std::function<std::shared_ptr<ChunkBuildResult>(ChunkCoord, std::uint64_t)> chunkBuildCallback_;
     std::function<void(ChunkCoord, const std::string&)> buildErrorCallback_;
     int loadRadius_ = 5;
     int buildThreadCount_ = 4;
@@ -81,7 +83,7 @@ private:
     std::size_t cancelQueuedChunksOutsideDesiredLocked();
     bool isChunkInLoadRange(ChunkCoord coord, int centerChunkX, int centerChunkZ) const;
     bool isChunkInCurrentLoadRangeLocked(ChunkCoord coord) const;
-    ChunkBuildResult assembleChunkMesh(ChunkCoord coord, PendingChunkMesh& pendingMesh) const;
+    std::shared_ptr<ChunkBuildResult> assembleChunkMesh(ChunkCoord coord, PendingChunkMesh& pendingMesh) const;
 
     std::unordered_set<ChunkCoord, ChunkCoordHash> desiredChunks_;
     std::unordered_set<ChunkCoord, ChunkCoordHash> loadedChunks_;
@@ -92,7 +94,7 @@ private:
     std::condition_variable cv_;
     std::vector<ChunkBuildRequest> pendingBuilds_;
     std::deque<SubchunkBuildResult> completedSubchunks_;
-    std::deque<ChunkBuildResult> completedChunks_;
+    std::deque<std::shared_ptr<ChunkBuildResult>> completedChunks_;
     bool workerRunning_ = false;
     std::uint64_t buildGeneration_ = 0;
     int priorityCenterChunkX_ = 0;

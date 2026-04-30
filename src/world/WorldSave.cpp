@@ -447,8 +447,7 @@ std::vector<std::uint8_t> WorldSave::encodeRle(const ChunkVoxelData& voxels)
     struct Run
     {
         std::uint16_t blockId = kAirBlockId;
-        std::uint8_t fluidId = kNoFluidId;
-        std::uint8_t fluidAmount = 0;
+        std::uint16_t fluidState = kNoFluidState;
         std::uint32_t count = 0;
     };
 
@@ -457,24 +456,21 @@ std::vector<std::uint8_t> WorldSave::encodeRle(const ChunkVoxelData& voxels)
     for (std::size_t i = 0; i < voxels.blockIds.size(); ++i)
     {
         const std::uint16_t blockId = voxels.blockIds[i];
-        std::uint8_t fluidId = voxels.fluidIds[i];
-        std::uint8_t fluidAmount = std::min(voxels.fluidAmounts[i], kMaxFluidAmount);
-        if (blockId != kAirBlockId || fluidId != kWaterFluidId || fluidAmount == 0)
+        std::uint16_t fluidState = voxels.fluidStates[i];
+        if (blockId != kAirBlockId)
         {
-            fluidId = kNoFluidId;
-            fluidAmount = 0;
+            fluidState = kNoFluidState;
         }
 
         if (!runs.empty() &&
             runs.back().blockId == blockId &&
-            runs.back().fluidId == fluidId &&
-            runs.back().fluidAmount == fluidAmount)
+            runs.back().fluidState == fluidState)
         {
             ++runs.back().count;
         }
         else
         {
-            runs.push_back({blockId, fluidId, fluidAmount, 1});
+            runs.push_back({blockId, fluidState, 1});
         }
     }
 
@@ -482,8 +478,7 @@ std::vector<std::uint8_t> WorldSave::encodeRle(const ChunkVoxelData& voxels)
     for (const Run& run : runs)
     {
         appendU16(bytes, run.blockId);
-        bytes.push_back(run.fluidId);
-        bytes.push_back(run.fluidAmount);
+        appendU16(bytes, run.fluidState);
         appendU32(bytes, run.count);
     }
     return bytes;
@@ -495,26 +490,12 @@ ChunkVoxelData WorldSave::decodeRle(const std::vector<std::uint8_t>& bytes)
     const std::uint32_t runCount = readU32(bytes, offset);
     ChunkVoxelData voxels{};
     voxels.blockIds.reserve(kChunkBlockCount);
-    voxels.fluidIds.reserve(kChunkBlockCount);
-    voxels.fluidAmounts.reserve(kChunkBlockCount);
+    voxels.fluidStates.reserve(kChunkBlockCount);
 
     for (std::uint32_t i = 0; i < runCount; ++i)
     {
         const std::uint16_t blockId = readU16(bytes, offset);
-        if (offset >= bytes.size())
-        {
-            throw std::runtime_error("RLE stream is truncated.");
-        }
-        std::uint8_t fluidId = bytes[offset++];
-        if (fluidId != kNoFluidId && fluidId != kWaterFluidId)
-        {
-            throw std::runtime_error("RLE stream contains an unknown fluid id.");
-        }
-        if (offset >= bytes.size())
-        {
-            throw std::runtime_error("RLE stream is truncated.");
-        }
-        const std::uint8_t fluidAmount = bytes[offset++];
+        std::uint16_t fluidState = readU16(bytes, offset);
         const std::uint32_t count = readU32(bytes, offset);
         if (count == 0)
         {
@@ -524,16 +505,12 @@ ChunkVoxelData WorldSave::decodeRle(const std::vector<std::uint8_t>& bytes)
         {
             throw std::runtime_error("RLE stream expands past chunk size.");
         }
-        if (blockId != kAirBlockId || fluidId == kNoFluidId || fluidAmount == 0)
+        if (blockId != kAirBlockId)
         {
-            fluidId = kNoFluidId;
+            fluidState = kNoFluidState;
         }
         voxels.blockIds.insert(voxels.blockIds.end(), count, blockId);
-        voxels.fluidIds.insert(voxels.fluidIds.end(), count, fluidId);
-        voxels.fluidAmounts.insert(
-            voxels.fluidAmounts.end(),
-            count,
-            fluidId == kNoFluidId ? 0 : std::min(fluidAmount, kMaxFluidAmount));
+        voxels.fluidStates.insert(voxels.fluidStates.end(), count, fluidState);
     }
 
     if (!voxels.valid())
